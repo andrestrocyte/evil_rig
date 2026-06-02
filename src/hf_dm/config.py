@@ -57,6 +57,13 @@ class CameraConfig:
     exposure_us: int = 10_000
     record_video: bool = True
     video_notes: str = "Align external recorder to StreamDIO camera TTL; timestamps saved in session npz."
+    backend: str = "external"
+    serial_number: str | None = None
+    gain_db: float | None = None
+    gamma: float | None = None
+    pixel_format: str = "Mono8"
+    acquisition_timeout_ms: int = 1000
+    save_dir: str = "data/videos"
 
 
 @dataclass
@@ -131,6 +138,31 @@ class SessionConfig:
                 frequency_hz=int(camera_raw.get("frequency_hz", 30)),
                 exposure_us=int(camera_raw.get("exposure_us", 10_000)),
                 record_video=bool(camera_raw.get("record_video", True)),
+                video_notes=str(
+                    camera_raw.get(
+                        "video_notes",
+                        "Align external recorder to StreamDIO camera TTL; timestamps saved in session npz.",
+                    )
+                ),
+                backend=str(camera_raw.get("backend", "external")),
+                serial_number=(
+                    str(camera_raw["serial_number"])
+                    if camera_raw.get("serial_number") not in (None, "")
+                    else None
+                ),
+                gain_db=(
+                    float(camera_raw["gain_db"])
+                    if camera_raw.get("gain_db") not in (None, "")
+                    else None
+                ),
+                gamma=(
+                    float(camera_raw["gamma"])
+                    if camera_raw.get("gamma") not in (None, "")
+                    else None
+                ),
+                pixel_format=str(camera_raw.get("pixel_format", "Mono8")),
+                acquisition_timeout_ms=int(camera_raw.get("acquisition_timeout_ms", 1000)),
+                save_dir=str(camera_raw.get("save_dir", "data/videos")),
             ),
             results_dir=str(raw.get("results_dir", "data/sessions")),
             white_noise_continuous=bool(raw.get("white_noise_continuous", True)),

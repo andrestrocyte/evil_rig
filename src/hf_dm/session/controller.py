@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 import random
 import time
+from pathlib import Path
 from typing import Literal
 
 from bpod_core.bpod import Bpod
 
 from hf_dm.config import SessionConfig, TrainingPhase
+from hf_dm.camera.spinnaker import HeadlessSpinnakerRecorder
 from hf_dm.hardware.discovery import connect_bpod_core
 from hf_dm.data.recorder import SessionRecorder, SessionSummary, TrialRecord
 from hf_dm.display.pygame_display import TaskDisplay
@@ -31,6 +33,7 @@ class HFDecisionSession:
         self.wheel = WheelAccumulator(config.wheel)
         self.display: TaskDisplay | None = None
         self.recorder: SessionRecorder | None = None
+        self.camera_recorder: HeadlessSpinnakerRecorder | None = None
         self._last_wheel_movement_mono = time.monotonic()
         self._consecutive_failures = 0
 
@@ -55,8 +58,9 @@ class HFDecisionSession:
         self.dio.start_streaming(callback=self.wheel.handle_event)
 
         self.display = TaskDisplay(self.config.display)
-        out = __import__("pathlib", fromlist=["Path"]).Path(self.config.results_dir)
+        out = Path(self.config.results_dir)
         self.recorder = SessionRecorder(out, self.config.subject_id, self.config.phase.value)
+        self._start_optional_video_recording()
         self.recorder.log_event(
             "hardware_connected",
             {
@@ -64,14 +68,88 @@ class HFDecisionSession:
                 "dio_config": self.dio.config_port,
                 "dio_stream": self.dio.stream_port,
                 "camera_hz": self.config.camera.frequency_hz,
+                "camera_backend": self.config.camera.backend,
             },
         )
 
     def close(self) -> None:
+        self._stop_optional_video_recording()
         if self.dio is not None:
             self.dio.close()
         if self.bpod is not None:
             self.bpod.close()
+
+    def _start_optional_video_recording(self) -> None:
+        if self.recorder is None:
+            return
+        camera_cfg = self.config.camera
+        if not camera_cfg.record_video:
+            self.recorder.log_event("video_recording_skipped", {"reason": "record_video_false"})
+            return
+        if camera_cfg.backend != "spinnaker":
+            self.recorder.log_event(
+                "video_recording_external",
+                {
+                    "backend": camera_cfg.backend,
+                    "notes": camera_cfg.video_notes,
+                },
+            )
+            return
+
+        try:
+            recorder = HeadlessSpinnakerRecorder(
+                out_dir=Path(camera_cfg.save_dir),
+                subject_id=self.config.subject_id,
+                phase=self.config.phase.value,
+                serial_number=camera_cfg.serial_number,
+                fps=camera_cfg.frequency_hz,
+                exposure_us=camera_cfg.exposure_us,
+                pixel_format=camera_cfg.pixel_format,
+                gain_db=camera_cfg.gain_db,
+                gamma=camera_cfg.gamma,
+                acquisition_timeout_ms=camera_cfg.acquisition_timeout_ms,
+            )
+            session_dir = recorder.start()
+            self.camera_recorder = recorder
+            self.recorder.log_event(
+                "video_recording_started",
+                {
+                    "backend": "spinnaker",
+                    "save_dir": str(session_dir),
+                    "serial_number": camera_cfg.serial_number,
+                    "pixel_format": camera_cfg.pixel_format,
+                },
+            )
+        except Exception as exc:
+            logger.exception("Failed to start headless Spinnaker recording")
+            self.recorder.log_event(
+                "video_recording_error",
+                {
+                    "backend": "spinnaker",
+                    "stage": "start",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+
+    def _stop_optional_video_recording(self) -> None:
+        if self.camera_recorder is None:
+            return
+        assert self.recorder is not None
+        try:
+            summary = self.camera_recorder.stop()
+            self.recorder.log_event("video_recording_stopped", summary)
+        except Exception as exc:
+            logger.exception("Failed to stop headless Spinnaker recording")
+            self.recorder.log_event(
+                "video_recording_error",
+                {
+                    "backend": "spinnaker",
+                    "stage": "stop",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+        finally:
+            self.camera_recorder = None
 
     def run(self) -> SessionSummary:
         assert self.bpod is not None and self.relay is not None and self.display is not None

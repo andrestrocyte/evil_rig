@@ -63,6 +63,29 @@ pip install -e .
 
 Requires Python ≥ 3.10, Windows rig (same as bringups), Bpod State Machine 2+.
 
+### Optional: headless Spinnaker recording (no SpinView)
+
+If you want this task to start/stop FLIR recording directly, install the **Spinnaker SDK** and its
+`PySpin` Python bindings, then set `camera.backend: spinnaker` in your YAML.
+
+Example:
+
+```yaml
+camera:
+  frequency_hz: 30
+  exposure_us: 10000
+  record_video: true
+  backend: spinnaker
+  serial_number: null      # optional: choose a specific camera
+  pixel_format: Mono8
+  acquisition_timeout_ms: 1000
+  save_dir: data/videos
+```
+
+With this enabled, the session writes a frame sequence and `recording_summary.json` under
+`data/videos/<subject>_<phase>_<timestamp>_spinnaker/` and logs start/stop/error events into the
+session JSON. If `backend` is not `spinnaker`, behavior is unchanged (external recorder workflow).
+
 ## Run
 
 ```bash
