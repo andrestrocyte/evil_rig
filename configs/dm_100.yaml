@@ -1,0 +1,25 @@
+subject_id: mouse01
+phase: decision_making
+n_trials: 100
+random_seed: 43
+
+ports:
+  bpod_port: AUTO
+  dio_config_port: AUTO
+  dio_stream_port: AUTO
+  baudrate: 1312500
+
+timing:
+  quiescence_s: 2.0
+  inter_trial_min_s: 3.0
+  choice_timeout_s: 15.0
+
+reward:
+  matched_pump_s: 0.08
+  opposite_pump_s: 0.04
+
+engagement:
+  idle_timeout_s: 60.0
+  max_consecutive_failures: 10
+
+results_dir: data/sessions

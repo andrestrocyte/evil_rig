@@ -1,0 +1,61 @@
+"""
+Hardware constants aligned with MM_PyBpod2 bringup notebooks.
+
+References (repo: MM_PyBpod2/examples/):
+  - rotary_encoder_bringup.ipynb
+  - screen_bringup_shape_force_discount.ipynb
+  - camera_bringup_pin32_ttl.ipynb
+  - speaker_bringup_pin27_whitenoise.ipynb
+"""
+
+from dataclasses import dataclass
+
+
+# StreamDIO discovery bytes (stream_dio_protocol.py)
+STREAMDIO_CONFIG_DISCOVERY = 222
+STREAMDIO_STREAM_DISCOVERY = 223
+
+# Serial / USB defaults (all bringups)
+DEFAULT_BAUDRATE = 1_312_500
+
+# Rotary encoder + force (rotary_encoder_bringup.ipynb)
+PULSE_INPUT_CHANNEL = 1          # DI01 / pin 2
+DIRECTION_INPUT_CHANNEL = 3    # DI03 / pin 4
+FORCE_ANALOG_CHANNEL = 13      # AI13 / Teensy pin 14
+FORCE_ANALOG_PIN = 14
+FORCE_ANALOG_SAMPLE_INTERVAL_US = 1000
+INPUT_REFRACTORY_PERIOD_US = 300
+
+# Force-direction + pump outputs (screen_bringup_shape_force_discount.ipynb)
+PUMP_OUTPUT_CHANNEL = 1        # pin 23
+CW_FORCE_OUTPUT_CHANNEL = 3    # pin 21
+CCW_FORCE_OUTPUT_CHANNEL = 5   # pin 19
+
+# Speaker gate on Teensy pin 27 (speaker_bringup_pin27_whitenoise.ipynb)
+SPEAKER_GATE_PIN = 27
+SPEAKER_GATE_OPCODE = 89         # ord('Y')
+SERIAL_GATE_ON_MESSAGE_ID = 210
+SERIAL_GATE_OFF_MESSAGE_ID = 211
+
+# Camera TTL via StreamDIO (camera_bringup_pin32_ttl.ipynb defaults)
+DEFAULT_CAMERA_FREQUENCY_HZ = 30
+DEFAULT_CAMERA_EXPOSURE_US = 10_000
+
+# Wheel kinematics (screen_shape_force_discount_task.py)
+DEFAULT_WHEEL_RADIUS_MM = 31.5
+DEFAULT_ENCODER_TICKS_PER_REV = 1024
+DEFAULT_GAIN_DEG_PER_MM = 8.0
+
+# Bpod serial relay channel (all bringups)
+DEFAULT_BPOD_SERIAL_CHANNEL = 1
+
+
+@dataclass(frozen=True)
+class BringupPorts:
+    """COM port selection; use AUTO in the field like the notebooks."""
+
+    bpod_port: str = "AUTO"
+    dio_config_port: str = "AUTO"
+    dio_stream_port: str = "AUTO"
+    baudrate: int = DEFAULT_BAUDRATE
+    bpod_serial_channel: int = DEFAULT_BPOD_SERIAL_CHANNEL

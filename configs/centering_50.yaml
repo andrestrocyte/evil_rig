@@ -1,0 +1,39 @@
+subject_id: mouse01
+phase: centering
+n_trials: 50
+random_seed: 1
+centering_threshold_deg: 8.0
+
+ports:
+  bpod_port: AUTO
+  dio_config_port: AUTO
+  dio_stream_port: AUTO
+  baudrate: 1312500
+  bpod_serial_channel: 1
+
+timing:
+  quiescence_s: 2.0
+  inter_trial_min_s: 3.0
+  choice_timeout_s: 15.0
+  timeout_noise_s: 2.0
+
+reward:
+  matched_pump_s: 0.08
+  opposite_pump_s: 0.04
+
+display:
+  choice_distance_deg: 35.0
+  pre_trial_black_s: 2.0
+  feedback_hold_s: 0.6
+
+engagement:
+  idle_timeout_s: 60.0
+  max_consecutive_failures: 10
+
+camera:
+  frequency_hz: 30
+  exposure_us: 10000
+  record_video: true
+
+results_dir: data/sessions
+white_noise_continuous: true
