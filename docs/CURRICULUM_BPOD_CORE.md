@@ -1,121 +1,119 @@
 # Curriculum: mastering bpod-core through `bpod-hf-dm`
 
-Goal: understand **typed FSM design**, **hardware execution**, and **host supervision** well enough to extend this task without reverting to ad-hoc `pybpodapi` scripts.
+Goal: understand bpod-core session control and StreamDIO host supervision well enough to extend this task without returning to ad-hoc `pybpodapi` scripts.
 
-Estimated time: **2–3 weeks** part-time on the rig.
+Estimated time: 2-3 weeks part-time on the rig.
 
----
+## Week 1 - bpod-core foundations
 
-## Week 1 — bpod-core foundations
-
-### Day 1–2: Mental model
+### Day 1-2: Mental model
 
 Read in order:
 
 1. [bpod-core state machine docs](https://int-brain-lab.github.io/bpod-core/state_machines/index.html)
-2. `bpod-core/examples/state_machines/two_choice.py` — canonical discrete choice
-3. [IBLRIG overview](https://int-brain-lab.github.io/iblrig/) — how IBL maps behavior to FSM + Bonsai (we replace Bonsai with pygame + StreamDIO)
+2. `bpod-core/examples/state_machines/two_choice.py` for canonical discrete choices
+3. [IBLRIG overview](https://int-brain-lab.github.io/iblrig/) for how behavior, acquisition, and stimuli are separated
 
-**Exercise:** Draw on paper how `two_choice.py` maps `Port1_High` / `Port2_High` to states. Compare to our softcode bridge (`hf_dm/fsm/softcodes.py`).
+Exercise: Draw how a discrete port event maps to states in bpod-core, then contrast it with this task's continuous wheel loop.
 
-### Day 3–4: API surface
+### Day 3-4: API surface
 
-Study `bpod-core/bpod_core/bpod/__init__.py`:
+Study `bpod-core/bpod_core/bpod/__init__.py` and the output APIs:
 
-- `Bpod.run(fsm)` / `Bpod.wait()` — non-blocking trial execution
-- `send_softcode(n)` — host-injected events
-- `Module.load_serial_message` — breakout byte protocol
-- `get_data()` — Polars trial log with Bpod timestamps
+- `Bpod(...)` connection and session clock reset
+- `bpod.outputs["Serial1"].override(byte)` for optional/reference relay experiments
+- `Module.load_serial_message(...)` for optional FSM templates
+- `Bpod.run(fsm)` starts the active trial without blocking the display loop
+- `Bpod.send_softcode(...)` reports quiescence movement and committed choices
+- `Bpod.set_softcode_handler(...)` lets state entries trigger verified host outputs
+- `Bpod.get_data(...)` stores the exact completed trial record
 
-**Exercise:** Run `examples/minimal_examples/run_global_timer.py` on hardware; inspect `get_data()` columns.
+Important: the active decision-making trial is a real bpod-core FSM. Bpod owns all state timers and
+branches, while the Python loop remains free to render and read StreamDIO continuously.
 
-### Day 5: Validation & compilation
+### Day 5: Validation and compilation
 
-Read `bpod_core/fsm.py` (`check`, `add_state`) and skim `bpod_core/bpod/_threads.py`:
+Read `bpod_core/fsm.py` (`check`, `add_state`) and skim `bpod_core/bpod/_threads.py`.
 
-- Why `Tup` is special
-- How `>exit` and `>back` work
-- What `EventThread` reconstructs from opcode stream
+Exercise: Run the FSM template tests and inspect the generated graph, but remember those templates are reference material. The live task path is in `hf_dm/session/controller.py`.
 
-**Exercise:** Intentionally break `hf_dm/fsm/builders.py` (invalid action name); run `fsm.check()` and read the error.
-
----
-
-## Week 2 — This repository
+## Week 2 - This repository
 
 ### Day 1: Hardware layer
 
 | File | Learn |
 |------|-------|
 | `hf_dm/hardware/bringup_constants.py` | Single source of pin truth |
-| `hf_dm/hardware/discovery.py` | AUTO COM logic from bringups |
+| `hf_dm/hardware/discovery.py` | AUTO COM discovery and firmware event allocation from bringups |
 
-**Exercise:** Run MM bringup notebooks; confirm constants match printed channel numbers.
+Exercise: Run the MM bringup notebooks and confirm constants match printed channel numbers.
+
+The bringup step installs the same complete module/USB event allocation in firmware and bpod-core.
+This is required for host SoftCodes to trigger transitions and for completed Bpod state rows to
+decode without an event-index shift.
 
 ### Day 2: StreamDIO adapter
 
 | File | Learn |
 |------|-------|
 | `hf_dm/streamdio/client.py` | Wrapper over `StreamDIOProtocol` |
-| `hf_dm/streamdio/wheel.py` | Pulse/direction → signed position |
+| `hf_dm/streamdio/wheel.py` | Pulse/direction to signed position |
 
-**Exercise:** Log 10 s of events; verify `deg_per_pulse` matches hand-turn.
+The adapter also prevents a bringup-driver startup race by obtaining the stream timestamp before
+streaming begins. It suppresses per-sample console logging while preserving every raw event in the
+session NPZ.
 
-### Day 3: FSM templates
+Exercise: Log 10 seconds of events; verify `deg_per_pulse` against a hand turn and inspect the
+`streamdio_events` NPZ array.
+
+### Day 3: Verified StreamDIO outputs
 
 | File | Learn |
 |------|-------|
-| `hf_dm/fsm/relay.py` | Serial message IDs = bringup bytes |
-| `hf_dm/fsm/builders.py` | One FSM per phase (choice, reward, ITI, punish) |
+| `hf_dm/streamdio/outputs.py` | Active pump, effort, cap-touch power, and speaker control |
+| `hf_dm/fsm/relay.py` | Bringup-compatible Bpod Serial-module messages, including pin-27 gate |
+| `hf_dm/fsm/builders.py` | Active Bpod decision-trial FSM |
+| `hf_dm/fsm/runtime.py` | Thread-safe bridge between Bpod states and the host loop |
 
-**Exercise:** `fsm.to_file("trial.pdf")` after `build_choice_epoch_fsm`; visualize graph.
+Exercise: Run the hardware self-test and inspect `output_actual` events for pump, both effort
+directions, and cap-touch power. Every changed physical output must have a USB acknowledgement and a
+firmware `dio_output` event.
 
 ### Day 4: Session supervisor
 
 | File | Learn |
 |------|-------|
-| `hf_dm/session/controller.py` | Full trial timeline |
-| `hf_dm/data/recorder.py` | NPZ schema |
+| `hf_dm/session/controller.py` | Full trial timeline and live choice loop |
+| `hf_dm/data/recorder.py` | NPZ/JSON schema |
 
-**Exercise:** Dry-run with `n_trials: 2` in YAML; inspect `.json` event list.
+Exercise: Run `--simulate --simulate-headless --simulate-trials 3` and inspect `bpod_trials` in the
+JSON. The rewarded branch should read `Quiescence`, `ChoiceWindow`, `ChoiceBlank*`, `Reward*`,
+`PostReward*`; timeout should read `Quiescence`, `ChoiceWindow`, `TimeoutNoise`, `PostTimeout`.
 
-### Day 5: Display & audio
+Then run `--hardware-self-test` with the rig clear. It drives matched, opposite, and timeout choices
+through the production loop while activating real outputs. Verify zero choice-loop stalls, precise
+80/40 ms pump durations, timeout noise, all-off cleanup, and matching camera TTL/frame counts.
+
+### Day 5: Display, audio, camera
 
 | File | Learn |
 |------|-------|
-| `hf_dm/display/pygame_display.py` | Stimulus only on host |
-| `hf_dm/audio/white_noise.py` | PC noise + FSM gate |
+| `hf_dm/display/pygame_display.py` | Equal-pixel lateral star/circle options moving to center |
+| `hf_dm/audio/white_noise.py` | Continuous soundcard white noise from the speaker bringup |
+| Bpod Serial-module action | Hardware gate on Teensy pin 27 |
+| `hf_dm/camera/spinnaker.py` | Headless PySpin/C API recorder with external-trigger configuration |
 
----
+## Key design decision
 
-## Week 3 — Integration & IBL comparison
+The task is hybrid by design. Bpod-core owns the discrete trial contract: quiescence, choice timeout,
+accepted high/low branch, blank state, pump state, timeout gate, and exit. Python never blocks on
+`Bpod.wait()` while the trial is active; it keeps the screen and wheel loop at 60 Hz and sends only
+small SoftCode events. State-entry SoftCodes trigger the verified direct StreamDIO pump/force path,
+and Bpod's Serial action directly gates audible timeout noise.
 
-### Compare paradigms
+StreamDIO owns wheel, force ADC, licks, camera TTL history, and physical pump/effort output events.
+pygame owns the screen. The recorder timestamps and stores all three domains, including the exact
+bpod-core event rows.
 
-| IBL / IBLRIG | bpod-hf-dm |
-|--------------|------------|
-| Port left/right choice | Wheel position threshold (continuous) |
-| Fixed reward time | Matched vs opposite pump (effort discount) |
-| Bonsai stimuli | pygame + force cue on breakout |
-| Bpod FSM only | Bpod FSM + StreamDIO parallel |
-
-### Extension projects (ordered)
-
-1. Add **biased block structure** (70/30 left/right) via trial generator in config
-2. Log **Bpod `get_data()`** alongside NPZ for alignment with core timestamps
-3. Add **condition** in FSM for hardware line triggering (advanced)
-4. Port **stimulus side** to Bonsai while keeping FSM identical
-
-### Mastery checklist
-
-- [ ] Explain why wheel quiescence cannot live purely inside Bpod FSM without rotary module events
-- [ ] Add a new FSM state (e.g. longer timeout noise) without touching StreamDIO code
-- [ ] Change reward asymmetry in YAML only
-- [ ] Diagnose COM port conflict using discovery helpers
-- [ ] Align one session video frame to `camera_ttl_timestamps_us` in NPZ
-
----
-
-## Key design decision (documented)
-
-**Continuous wheel → discrete FSM** via softcodes is deliberate: StreamDIO runs on Teensy USB parallel to Bpod, matching your bringup stack. All **timed outputs** (pump, force, speaker, ITI) stay in bpod-core FSM for microsecond-scheduled hardware; all **position integration** stays on the host with logged timestamps — standard in IBL-style rigs that combine FSM + external acquisition.
+All host deadlines and monotonic timestamps use `time.perf_counter()`. On this Windows rig,
+`time.monotonic()` resolves only every 15.625 ms and must not be used for reward timing.

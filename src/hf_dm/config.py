@@ -9,7 +9,13 @@ from typing import Any
 
 import yaml
 
-from hf_dm.hardware.bringup_constants import BringupPorts, DEFAULT_BAUDRATE
+from hf_dm.hardware.bringup_constants import (
+    BringupPorts,
+    CAP_TOUCH_POWER_OUTPUT_CHANNEL,
+    DEFAULT_BAUDRATE,
+    LICK_INPUT_CHANNEL,
+    SPEAKER_NOISE_SAMPLE_INTERVAL_US,
+)
 from hf_dm.streamdio.wheel import WheelKinematics
 
 
@@ -20,29 +26,70 @@ class TrainingPhase(str, Enum):
 
 @dataclass
 class DisplayConfig:
+    width: int | None = None
+    height: int | None = None
+    distance_mm: float = 100.0
+    pixel_size_mm: float = 0.114
     choice_distance_deg: float = 35.0
+    choice_center_threshold_deg: float = 1.0
     rotated_choice_axis: bool = True
     display_index: int | None = 1
+    auto_size_to_display: bool = True
+    window_x: int | None = None
+    window_y: int | None = None
+    fullscreen: bool = False
+    noframe: bool = True
     fps: int = 60
-    pre_trial_black_s: float = 2.0
+    pre_trial_black_s: float = 0.0
     feedback_hold_s: float = 0.6
+    background_rgb: tuple[int, int, int] = (0, 0, 0)
+    cue_rgb: tuple[int, int, int] = (245, 245, 245)
+    target_rgb: tuple[int, int, int] = (80, 80, 80)
     matched_rgb: tuple[int, int, int] = (72, 198, 135)
     unmatched_rgb: tuple[int, int, int] = (88, 180, 255)
     timeout_rgb: tuple[int, int, int] = (235, 94, 94)
+    shape_radius_px: int = 90
+    target_radius_px: int = 120
+    show_debug_overlay: bool = False
+
+    @property
+    def axis(self) -> str:
+        return "vertical" if self.rotated_choice_axis else "horizontal"
 
 
 @dataclass
 class TimingConfig:
-    quiescence_s: float = 2.0
+    quiescence_s: float = 3.0
     inter_trial_min_s: float = 3.0
-    choice_timeout_s: float = 15.0
+    choice_timeout_s: float = 20.0
+    choice_blank_s: float = 1.0
+    post_reward_s: float = 1.0
     timeout_noise_s: float = 2.0
+    post_timeout_s: float = 1.0
+    choice_loop_stall_s: float = 0.1
 
 
 @dataclass
 class RewardConfig:
     matched_pump_s: float = 0.08
     opposite_pump_s: float = 0.04
+
+
+@dataclass
+class LickConfig:
+    channels: tuple[int, ...] = (LICK_INPUT_CHANNEL,)
+    high_only: bool = True
+    power_output_channel: int = CAP_TOUCH_POWER_OUTPUT_CHANNEL
+    power_required: bool = True
+
+
+@dataclass
+class SpeakerConfig:
+    sample_interval_us: int = SPEAKER_NOISE_SAMPLE_INTERVAL_US
+    frequency_hz: float = 6000.0
+    volume: float = 1.0
+    gate_active_high: bool = True
+    required: bool = True
 
 
 @dataclass
@@ -56,8 +103,9 @@ class CameraConfig:
     frequency_hz: int = 30
     exposure_us: int = 10_000
     record_video: bool = True
+    required: bool = True
     video_notes: str = "Align external recorder to StreamDIO camera TTL; timestamps saved in session npz."
-    backend: str = "external"
+    backend: str = "spinnaker"
     serial_number: str | None = None
     gain_db: float | None = None
     gamma: float | None = None
@@ -73,16 +121,17 @@ class SessionConfig:
     n_trials: int = 50
     random_seed: int | None = None
     centering_threshold_deg: float = 8.0
-  # centering phase: reward when |position| below this
+    # Centering phase: reward when |position| is below this threshold.
     ports: BringupPorts = field(default_factory=BringupPorts)
     wheel: WheelKinematics = field(default_factory=WheelKinematics)
     display: DisplayConfig = field(default_factory=DisplayConfig)
     timing: TimingConfig = field(default_factory=TimingConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
+    licks: LickConfig = field(default_factory=LickConfig)
+    speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     engagement: EngagementConfig = field(default_factory=EngagementConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
     results_dir: str = "data/sessions"
-    white_noise_continuous: bool = True
 
     @staticmethod
     def from_yaml(path: Path | str) -> SessionConfig:
@@ -99,10 +148,31 @@ class SessionConfig:
         )
         timing_raw = raw.get("timing", {})
         reward_raw = raw.get("reward", {})
+        lick_raw = raw.get("licks", raw.get("cap_touch", {}))
+        speaker_raw = raw.get("speaker", {})
         display_raw = raw.get("display", {})
         engagement_raw = raw.get("engagement", {})
         camera_raw = raw.get("camera", {})
         wheel_raw = raw.get("wheel", {})
+
+        def channels(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+            value = lick_raw.get(name, default)
+            if isinstance(value, str):
+                value = [part.strip() for part in value.split(",") if part.strip()]
+            if isinstance(value, int):
+                value = [value]
+            if not isinstance(value, (list, tuple)):
+                return default
+            return tuple(max(1, int(part)) for part in value)
+
+        def rgb(name: str, default: tuple[int, int, int]) -> tuple[int, int, int]:
+            value = display_raw.get(name, default)
+            if isinstance(value, str):
+                value = [part.strip() for part in value.split(",")]
+            if not isinstance(value, (list, tuple)) or len(value) != 3:
+                return default
+            return tuple(max(0, min(255, int(part))) for part in value)
+
         return SessionConfig(
             subject_id=str(raw.get("subject_id", "mouse01")),
             phase=phase,
@@ -113,22 +183,93 @@ class SessionConfig:
             wheel=WheelKinematics(
                 wheel_radius_mm=float(wheel_raw.get("wheel_radius_mm", 31.5)),
                 encoder_ticks_per_rev=int(wheel_raw.get("encoder_ticks_per_rev", 1024)),
-                gain_deg_per_mm=float(wheel_raw.get("gain_deg_per_mm", 8.0)),
+                gain_deg_per_mm=float(wheel_raw.get("gain_deg_per_mm", 4.0)),
             ),
             display=DisplayConfig(
+                width=(
+                    int(display_raw["width"])
+                    if display_raw.get("width") not in (None, "")
+                    else None
+                ),
+                height=(
+                    int(display_raw["height"])
+                    if display_raw.get("height") not in (None, "")
+                    else None
+                ),
+                distance_mm=float(display_raw.get("distance_mm", 100.0)),
+                pixel_size_mm=float(display_raw.get("pixel_size_mm", 0.114)),
                 choice_distance_deg=float(display_raw.get("choice_distance_deg", 35.0)),
-                pre_trial_black_s=float(display_raw.get("pre_trial_black_s", 2.0)),
+                choice_center_threshold_deg=float(
+                    display_raw.get("choice_center_threshold_deg", 1.0)
+                ),
+                rotated_choice_axis=bool(display_raw.get("rotated_choice_axis", True)),
+                display_index=(
+                    int(display_raw["display_index"])
+                    if display_raw.get("display_index") not in (None, "")
+                    else None
+                ),
+                auto_size_to_display=bool(display_raw.get("auto_size_to_display", True)),
+                window_x=(
+                    int(display_raw["window_x"])
+                    if display_raw.get("window_x") not in (None, "")
+                    else None
+                ),
+                window_y=(
+                    int(display_raw["window_y"])
+                    if display_raw.get("window_y") not in (None, "")
+                    else None
+                ),
+                fullscreen=bool(display_raw.get("fullscreen", False)),
+                noframe=bool(display_raw.get("noframe", True)),
+                fps=int(display_raw.get("fps", 60)),
+                pre_trial_black_s=float(display_raw.get("pre_trial_black_s", 0.0)),
                 feedback_hold_s=float(display_raw.get("feedback_hold_s", 0.6)),
+                background_rgb=rgb("background_rgb", (0, 0, 0)),
+                cue_rgb=rgb("cue_rgb", (245, 245, 245)),
+                target_rgb=rgb("target_rgb", (80, 80, 80)),
+                matched_rgb=rgb("matched_rgb", (72, 198, 135)),
+                unmatched_rgb=rgb("unmatched_rgb", (88, 180, 255)),
+                timeout_rgb=rgb("timeout_rgb", (235, 94, 94)),
+                shape_radius_px=int(display_raw.get("shape_radius_px", 90)),
+                target_radius_px=int(display_raw.get("target_radius_px", 120)),
+                show_debug_overlay=bool(display_raw.get("show_debug_overlay", False)),
             ),
             timing=TimingConfig(
-                quiescence_s=float(timing_raw.get("quiescence_s", 2.0)),
+                quiescence_s=float(timing_raw.get("quiescence_s", 3.0)),
                 inter_trial_min_s=float(timing_raw.get("inter_trial_min_s", 3.0)),
-                choice_timeout_s=float(timing_raw.get("choice_timeout_s", 15.0)),
+                choice_timeout_s=float(timing_raw.get("choice_timeout_s", 20.0)),
+                choice_blank_s=float(timing_raw.get("choice_blank_s", 1.0)),
+                post_reward_s=float(timing_raw.get("post_reward_s", 1.0)),
                 timeout_noise_s=float(timing_raw.get("timeout_noise_s", 2.0)),
+                post_timeout_s=float(timing_raw.get("post_timeout_s", 1.0)),
+                choice_loop_stall_s=float(timing_raw.get("choice_loop_stall_s", 0.1)),
             ),
             reward=RewardConfig(
                 matched_pump_s=float(reward_raw.get("matched_pump_s", 0.08)),
                 opposite_pump_s=float(reward_raw.get("opposite_pump_s", 0.04)),
+            ),
+            licks=LickConfig(
+                channels=channels(
+                    "channels",
+                    channels("digital_channels", (LICK_INPUT_CHANNEL,)),
+                ),
+                high_only=bool(lick_raw.get("high_only", True)),
+                power_output_channel=int(
+                    lick_raw.get("power_output_channel", CAP_TOUCH_POWER_OUTPUT_CHANNEL)
+                ),
+                power_required=bool(lick_raw.get("power_required", True)),
+            ),
+            speaker=SpeakerConfig(
+                sample_interval_us=int(
+                    speaker_raw.get(
+                        "sample_interval_us",
+                        SPEAKER_NOISE_SAMPLE_INTERVAL_US,
+                    )
+                ),
+                frequency_hz=float(speaker_raw.get("frequency_hz", 6000.0)),
+                volume=float(speaker_raw.get("volume", 1.0)),
+                gate_active_high=bool(speaker_raw.get("gate_active_high", True)),
+                required=bool(speaker_raw.get("required", True)),
             ),
             engagement=EngagementConfig(
                 idle_timeout_s=float(engagement_raw.get("idle_timeout_s", 60.0)),
@@ -138,13 +279,14 @@ class SessionConfig:
                 frequency_hz=int(camera_raw.get("frequency_hz", 30)),
                 exposure_us=int(camera_raw.get("exposure_us", 10_000)),
                 record_video=bool(camera_raw.get("record_video", True)),
+                required=bool(camera_raw.get("required", True)),
                 video_notes=str(
                     camera_raw.get(
                         "video_notes",
                         "Align external recorder to StreamDIO camera TTL; timestamps saved in session npz.",
                     )
                 ),
-                backend=str(camera_raw.get("backend", "external")),
+                backend=str(camera_raw.get("backend", "spinnaker")),
                 serial_number=(
                     str(camera_raw["serial_number"])
                     if camera_raw.get("serial_number") not in (None, "")
@@ -165,5 +307,4 @@ class SessionConfig:
                 save_dir=str(camera_raw.get("save_dir", "data/videos")),
             ),
             results_dir=str(raw.get("results_dir", "data/sessions")),
-            white_noise_continuous=bool(raw.get("white_noise_continuous", True)),
         )

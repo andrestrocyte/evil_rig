@@ -26,6 +26,12 @@ FORCE_ANALOG_PIN = 14
 FORCE_ANALOG_SAMPLE_INTERVAL_US = 1000
 INPUT_REFRACTORY_PERIOD_US = 300
 
+# Capacitive touch (cap_touch_bringup_pin15_power_pin14_touch.ipynb)
+CAP_TOUCH_POWER_OUTPUT_CHANNEL = 13  # output channel 13 / physical pin 15
+CAP_TOUCH_INPUT_CHANNEL = 14         # input channel 14 / physical pin 25
+CAP_TOUCH_INPUT_PIN = 25
+LICK_INPUT_CHANNEL = CAP_TOUCH_INPUT_CHANNEL
+
 # Force-direction + pump outputs (screen_bringup_shape_force_discount.ipynb)
 PUMP_OUTPUT_CHANNEL = 1        # pin 23
 CW_FORCE_OUTPUT_CHANNEL = 3    # pin 21
@@ -36,6 +42,7 @@ SPEAKER_GATE_PIN = 27
 SPEAKER_GATE_OPCODE = 89         # ord('Y')
 SERIAL_GATE_ON_MESSAGE_ID = 210
 SERIAL_GATE_OFF_MESSAGE_ID = 211
+SPEAKER_NOISE_SAMPLE_INTERVAL_US = 100
 
 # Camera TTL via StreamDIO (camera_bringup_pin32_ttl.ipynb defaults)
 DEFAULT_CAMERA_FREQUENCY_HZ = 30
@@ -44,7 +51,7 @@ DEFAULT_CAMERA_EXPOSURE_US = 10_000
 # Wheel kinematics (screen_shape_force_discount_task.py)
 DEFAULT_WHEEL_RADIUS_MM = 31.5
 DEFAULT_ENCODER_TICKS_PER_REV = 1024
-DEFAULT_GAIN_DEG_PER_MM = 8.0
+DEFAULT_GAIN_DEG_PER_MM = 4.0
 
 # Bpod serial relay channel (all bringups)
 DEFAULT_BPOD_SERIAL_CHANNEL = 1

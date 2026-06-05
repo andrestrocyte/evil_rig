@@ -1,115 +1,101 @@
 # Curriculum: training mice on the HF effort decision task
 
-Aligned with IBL-style **staged training** ([IBLRIG](https://int-brain-lab.github.io/iblrig/)) and your force-discount logic (longer pump when choice matches effort cue).
+Aligned with staged IBL-style training and the force-discount logic: the star is always the
+high-effort/high-reward option and the circle is always the low-effort/low-reward option.
 
----
+## Stage 0 - Habituation
 
-## Stage 0 — Habituation (outside this repo)
+- Head-fix, water schedule, and rig entry
+- Let the mouse explore the wheel without contingencies
+- Confirm pump delivery with `MM_PyBpod2/examples/pump_bringup.ipynb`
 
-- Head-fix, water restriction schedule, rig entry
-- Let mouse explore wheel without contingencies
-- Confirm pump delivers reliably (use `MM_PyBpod2/examples/pump_bringup.ipynb`)
+## Stage 1 - Centering for reward (`centering_50.yaml`)
 
----
+Trials: 50
 
-## Stage 1 — Centering for reward (`centering_50.yaml`)
+Each trial starts the cue at a random lateral target. The arrow points toward the center target and
+the screen follows the wheel continuously. Water is delivered immediately when the cue enters
+`centering_threshold_deg`; a timeout produces the configured white-noise punishment.
 
-**Config:** `configs/centering_50.yaml`  
-**Trials:** 50  
-**Criterion:** mouse receives water when wheel position within **±8°** of center after 2 s quiescence.
+Success criteria:
 
-**Success criteria (per session)**
+- At least 60% centered trials with reward
+- No signs of stress
+- Session not ended by idle timeout
 
-- ≥ 60% centered trials with reward
-- No signs of stress (grooming freeze, escape attempts)
-- Engagement: session not ended by idle timeout
+If failing: widen `centering_threshold_deg` to 12 and consider a slightly longer `matched_pump_s`.
 
-**If failing:** widen `centering_threshold_deg` to 12; increase `matched_pump_s` slightly.
+## Stage 2 - Full task, short (`dm_50.yaml`)
 
----
+Trials: 50
 
-## Stage 2 — Full task, short (`dm_50.yaml`)
+Full contingencies:
 
-**Trials:** 50  
-**Full contingencies:**
+- Star and circle start on opposite lateral sides; their side is randomized every trial
+- Star and circle have exactly equal lit-pixel counts
+- Turning right moves only the left option toward center; turning left moves only the right option
+- Star choice: high effort and `0.08 s` pump by default
+- Circle choice: low effort and `0.04 s` pump by default
+- Bpod requires 3 s quiescence and owns the 20 s choice timeout
+- Timeout: Bpod pin-27 gate passes continuous soundcard white noise for `2 s` by default
 
-- Random CW/CCW force cue (triangle orientation)
-- Turn wheel to either side (±35°)
-- **Matched direction → 0.08 s pump** (high effort / correct side)
-- **Opposite → 0.04 s pump**
-- Timeout → white noise (2 s gated)
+Success criteria:
 
-**Success criteria**
+- At least 50% responded trials
+- At least 55% matched on responded trials
+- Mean response time under 12 seconds
 
-- ≥ 50% responded trials
-- ≥ 55% matched on responded trials (slightly above chance on effort task)
-- Mean RT < 12 s
+## Stage 3 - Standard volume (`dm_100.yaml`)
 
----
+Trials: 100
 
-## Stage 3 — Standard volume (`dm_100.yaml`)
-
-**Trials:** 100  
-
-Track in NPZ:
+Track in NPZ/JSON:
 
 - `matched` rate over blocks of 20 trials
-- `force_mean` during cue epoch (effort proxy)
-- `response_time_s` drift (fatigue)
+- `force_mean` during the cue epoch
+- `response_time_s` drift as a fatigue marker
+- `choice_loop_max_frame_s` and `choice_loop_stall_count` for display/task stalls
 
-**Intervention triggers**
+Intervention triggers:
 
-- Matched rate drops > 15% across blocks → refresh centering session
-- 10 consecutive timeouts → session auto-ends (engagement rule)
+- Matched rate drops by more than 15% across blocks: refresh centering
+- 10 consecutive timeouts: session auto-ends by engagement rule
 
----
+## Stage 4 - Full session (`dm_200.yaml`)
 
-## Stage 4 — Full session (`dm_200.yaml`)
-
-**Trials:** 200  
+Trials: 200
 
 Use for stable psychometrics and video alignment.
 
-**Analysis suggestions**
-
 ```python
 import numpy as np
+
 d = np.load("data/sessions/....npz", allow_pickle=True)
 trials = d["trials"]
 matched = trials["matched"][trials["responded"]]
 print(matched.mean(), trials["response_time_s"].mean())
 ```
 
----
-
-## Engagement rules (implemented)
-
-| Rule | Parameter | Default |
-|------|-----------|---------|
-| No wheel movement | `engagement.idle_timeout_s` | 60 s |
-| Consecutive timeouts | `engagement.max_consecutive_failures` | 10 |
-
-Session `end_reason` in JSON records which rule fired.
-
----
-
 ## Daily rig checklist
 
-1. Run rotary + camera bringup notebooks if any hardware change
-2. `hf-dm-run --config configs/dm_50.yaml` (or stage-appropriate)
-3. Verify `.npz` + `.json` in `data/sessions/`
-4. Start external video recorder synced to camera TTL (see camera bringup)
-5. Note `session_end` reason before unhead-fixing
-
----
+1. Run no-trial hardware preflight:
+   `python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration 2`
+2. Confirm the preflight has zero errors/overruns and matching camera TTL/frame counts.
+3. After code/hardware changes, run the real-output diagnostic with the rig clear:
+   `python -m hf_dm.cli --config configs/dm_50.yaml --hardware-self-test`
+4. Confirm no old Python, PyBpod, notebook, or serial-monitor process owns COM7/COM8.
+5. Run the stage config:
+   `python -m hf_dm.cli --config configs/dm_50.yaml`
+6. Verify `.npz`/`.json` in `data/sessions/` and video/timestamps in `data/videos/`.
+7. Check `choice_loop_stall_count`, licks, raw force/wheel events, camera TTLs, and `session_end`.
 
 ## Suggested calendar
 
 | Week | Sessions | Config |
 |------|----------|--------|
-| 1 | 3–5 | `centering_50.yaml` |
-| 2 | 4–6 | `dm_50.yaml` |
-| 3–4 | 6–10 | `dm_100.yaml` |
+| 1 | 3-5 | `centering_50.yaml` |
+| 2 | 4-6 | `dm_50.yaml` |
+| 3-4 | 6-10 | `dm_100.yaml` |
 | 5+ | data collection | `dm_200.yaml` |
 
 Adjust by lab welfare guidelines and individual mouse progress.

@@ -1,4 +1,4 @@
-"""Wheel pulse integration — same logic as screen_shape_force_discount_task."""
+"""Wheel pulse integration: same logic as screen_shape_force_discount_task."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ class WheelAccumulator:
         self.cfg = kinematics or WheelKinematics()
         self.lock = threading.Lock()
         self.direction_is_high = False
-        self.last_pulse_monotonic = time.monotonic()
+        self.last_pulse_monotonic = time.perf_counter()
         self.reset_trial()
 
     def reset_trial(self) -> None:
@@ -56,7 +56,7 @@ class WheelAccumulator:
             self.force_last: float | None = None
             self.force_min: float | None = None
             self.force_max: float | None = None
-            self.last_pulse_monotonic = time.monotonic()
+            self.last_pulse_monotonic = time.perf_counter()
 
     def handle_event(
         self,
@@ -78,7 +78,7 @@ class WheelAccumulator:
                         self.cw_pulses += 1
                     else:
                         self.ccw_pulses += 1
-                    self.last_pulse_monotonic = time.monotonic()
+                    self.last_pulse_monotonic = time.perf_counter()
             elif event_type == "analog_input" and channel == self.cfg.force_channel:
                 numeric_value = float(value)
                 self.force_samples += 1
@@ -105,7 +105,7 @@ class WheelAccumulator:
                 "force_mean": force_mean,
                 "force_min": self.force_min,
                 "force_max": self.force_max,
-                "quiescent_for_s": time.monotonic() - self.last_pulse_monotonic,
+                "quiescent_for_s": time.perf_counter() - self.last_pulse_monotonic,
             }
 
     def signed_position_deg(self) -> float:

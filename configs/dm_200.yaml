@@ -10,16 +10,63 @@ ports:
   baudrate: 1312500
 
 timing:
-  quiescence_s: 2.0
+  quiescence_s: 3.0
   inter_trial_min_s: 3.0
-  choice_timeout_s: 15.0
+  choice_timeout_s: 20.0
+  choice_blank_s: 1.0
+  post_reward_s: 1.0
+  timeout_noise_s: 2.0
+  post_timeout_s: 1.0
+  choice_loop_stall_s: 0.1
+
+wheel:
+  gain_deg_per_mm: 4.0
 
 reward:
   matched_pump_s: 0.08
   opposite_pump_s: 0.04
 
+licks:
+  channels: [14]
+  high_only: true
+  power_output_channel: 13
+  power_required: true
+
+speaker:
+  sample_interval_us: 100
+  frequency_hz: 6000.0
+  volume: 1.0
+  gate_active_high: true
+  required: true
+
+display:
+  width:
+  height:
+  distance_mm: 100.0
+  pixel_size_mm: 0.114
+  choice_distance_deg: 35.0
+  choice_center_threshold_deg: 1.0
+  rotated_choice_axis: true
+  display_index: 1
+  auto_size_to_display: true
+  window_x:
+  window_y:
+  fullscreen: false
+  noframe: true
+  fps: 60
+  pre_trial_black_s: 0.0
+  feedback_hold_s: 0.6
+
 engagement:
   idle_timeout_s: 60.0
   max_consecutive_failures: 10
+
+camera:
+  frequency_hz: 30
+  exposure_us: 10000
+  record_video: true
+  required: true
+  backend: spinnaker
+  save_dir: data/videos
 
 results_dir: data/sessions
