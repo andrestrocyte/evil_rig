@@ -1,41 +1,60 @@
-"""Continuous white noise + Bpod gate (speaker_bringup_pin27_whitenoise.ipynb pattern)."""
+"""Continuous PC white noise for the pin-27 hardware gate."""
 
 from __future__ import annotations
 
 import logging
-import sys
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
-def _ensure_sound_module() -> None:
-    for root in (Path.home() / "MM_PyBpod2" / "src", Path(__file__).resolve().parents[4] / "MM_PyBpod2" / "src"):
-        if root.is_dir() and str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-
-
 class WhiteNoisePlayer:
-    """Optional PC audio; FSM gates pin 27 via serial relay during timeout."""
+    """Bringup-exact SoundControl lifecycle for continuous gated white noise."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, frequency_hz: float = 6000.0, volume: float = 1.0) -> None:
+        self.frequency_hz = float(frequency_hz)
+        self.volume = float(volume)
         self._control = None
+        self._status: dict = {}
 
     def start_continuous(self) -> bool:
-        _ensure_sound_module()
         try:
-            from pybpod_soundcard_module.soundcontrol import SoundControl
+            from pybpod_soundcard_module import SoundControl
 
-            self._control = SoundControl()
-            return bool(self._control.start_continuous_white_noise(volume=1.0))
+            control = SoundControl.create_from_protocol(
+                sound_frequency=self.frequency_hz,
+                sound_volume=self.volume,
+                sound_type="white_noise",
+            )
+            if control is None:
+                raise RuntimeError("SoundControl.create_from_protocol returned None")
+            if not control.start_continuous_playback_from_protocol():
+                control.stop_and_cleanup()
+                raise RuntimeError("continuous white-noise playback did not start")
+            self._control = control
+            self._status = dict(control.get_status())
+            if not self._status.get("continuous_playback_active", False):
+                raise RuntimeError(f"unexpected SoundControl status: {self._status}")
+            return True
         except Exception as exc:
-            logger.warning("White noise PC playback unavailable: %s", exc)
+            logger.exception("White noise PC playback unavailable: %s", exc)
+            self._control = None
+            self._status = {}
             return False
+
+    @property
+    def status(self) -> dict:
+        if self._control is not None:
+            try:
+                self._status = dict(self._control.get_status())
+            except Exception:
+                pass
+        return dict(self._status)
 
     def stop(self) -> None:
         if self._control is not None:
             try:
-                self._control.stop_continuous_playback()
+                self._control.stop_and_cleanup()
             except Exception:
                 pass
             self._control = None
+        self._status = {}

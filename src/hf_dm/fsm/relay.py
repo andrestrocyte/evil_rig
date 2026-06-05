@@ -1,7 +1,8 @@
-"""Serial relay setup on Bpod (breakout board bytes — same as bringup notebooks)."""
+"""Serial relay setup on Bpod (breakout board bytes, same as bringup notebooks)."""
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from bpod_core.bpod import Bpod
@@ -16,6 +17,16 @@ from hf_dm.hardware.bringup_constants import (
 )
 
 
+def wait_until_perf_counter(deadline_s: float, spin_window_s: float = 0.025) -> None:
+    """Wait to a high-resolution monotonic deadline."""
+    while True:
+        remaining_s = float(deadline_s) - time.perf_counter()
+        if remaining_s <= 0.0:
+            return
+        if remaining_s > spin_window_s:
+            time.sleep(remaining_s - spin_window_s)
+
+
 @dataclass(frozen=True)
 class RelayMessageIds:
     pump_on: int = 1
@@ -28,9 +39,18 @@ class RelayMessageIds:
     speaker_gate_off: int = SERIAL_GATE_OFF_MESSAGE_ID
 
 
-def _serial_module_name(bpod: Bpod) -> str:
+def _serial_module_name(bpod: Bpod, serial_channel_index: int) -> str:
     for name, module in bpod.modules.items():
-        if module.is_connected and name.startswith("Serial"):
+        if module.is_connected and module.index == serial_channel_index:
+            return name
+
+    if serial_channel_index != 0:
+        raise RuntimeError(
+            f"No connected Bpod serial module on module port {serial_channel_index + 1}"
+        )
+
+    for name, module in bpod.modules.items():
+        if module.is_connected:
             return name
     connected = [n for n, m in bpod.modules.items() if m.is_connected]
     if not connected:
@@ -41,13 +61,20 @@ def _serial_module_name(bpod: Bpod) -> str:
 class SerialRelay:
     """Preload serial messages and expose FSM action names for bpod-core."""
 
-    def __init__(self, bpod: Bpod, serial_channel_index: int = 0):
+    def __init__(
+        self,
+        bpod: Bpod,
+        serial_channel_index: int = 0,
+        *,
+        speaker_gate_active_high: bool = True,
+    ):
         self.bpod = bpod
-        self.module_name = _serial_module_name(bpod)
+        self.module_name = _serial_module_name(bpod, serial_channel_index)
         self.module = bpod.modules[self.module_name]
         self.module.set_relay(True)
         self.ids = RelayMessageIds()
         self._serial_channel_index = serial_channel_index
+        self.speaker_gate_active_high = bool(speaker_gate_active_high)
         self._load_messages()
 
     def _load_messages(self) -> None:
@@ -59,8 +86,14 @@ class SerialRelay:
             (self.ids.cw_force_off, [CW_FORCE_OUTPUT_CHANNEL, 0]),
             (self.ids.ccw_force_on, [CCW_FORCE_OUTPUT_CHANNEL, 1]),
             (self.ids.ccw_force_off, [CCW_FORCE_OUTPUT_CHANNEL, 0]),
-            (self.ids.speaker_gate_on, [SPEAKER_GATE_OPCODE, 1]),
-            (self.ids.speaker_gate_off, [SPEAKER_GATE_OPCODE, 0]),
+            (
+                self.ids.speaker_gate_on,
+                [SPEAKER_GATE_OPCODE, 1 if self.speaker_gate_active_high else 0],
+            ),
+            (
+                self.ids.speaker_gate_off,
+                [SPEAKER_GATE_OPCODE, 0 if self.speaker_gate_active_high else 1],
+            ),
         ]
         for msg_id, payload in pairs:
             m.load_serial_message(msg_id, bytes(payload))
@@ -71,3 +104,54 @@ class SerialRelay:
 
     def act(self, message_id: int) -> dict[str, int]:
         return {self.module_name: message_id}
+
+    def send_bytes(self, byte_values: list[int], inter_byte_s: float = 0.002) -> None:
+        """Send raw bytes through the selected Bpod serial relay immediately."""
+        self.module.set_relay(True)
+        output_name = f"Serial{self._serial_channel_index + 1}"
+        output = self.bpod.outputs[output_name]
+        for value in byte_values:
+            output.override(int(value))
+            time.sleep(inter_byte_s)
+
+    def set_channel_state(self, channel: int, state: bool) -> None:
+        self.send_bytes([int(channel), 1 if state else 0])
+
+    def set_force_direction(self, direction: str | None) -> None:
+        if direction == "cw":
+            self.set_channel_state(CCW_FORCE_OUTPUT_CHANNEL, False)
+            self.set_channel_state(CW_FORCE_OUTPUT_CHANNEL, True)
+        elif direction == "ccw":
+            self.set_channel_state(CW_FORCE_OUTPUT_CHANNEL, False)
+            self.set_channel_state(CCW_FORCE_OUTPUT_CHANNEL, True)
+        else:
+            self.force_off()
+
+    def force_off(self) -> None:
+        self.set_channel_state(CW_FORCE_OUTPUT_CHANNEL, False)
+        self.set_channel_state(CCW_FORCE_OUTPUT_CHANNEL, False)
+
+    def pump_off(self) -> None:
+        self.set_channel_state(PUMP_OUTPUT_CHANNEL, False)
+
+    def pump_on(self) -> None:
+        self.set_channel_state(PUMP_OUTPUT_CHANNEL, True)
+
+    def pulse_pump(self, duration_s: float) -> None:
+        self.pump_on()
+        wait_until_perf_counter(time.perf_counter() + max(0.0, float(duration_s)))
+        self.pump_off()
+
+    def speaker_gate(self, enabled: bool) -> None:
+        on_level = 1 if self.speaker_gate_active_high else 0
+        self.send_bytes([SPEAKER_GATE_OPCODE, on_level if enabled else 1 - on_level])
+
+    def pulse_speaker_gate(self, duration_s: float) -> None:
+        self.speaker_gate(True)
+        wait_until_perf_counter(time.perf_counter() + max(0.0, float(duration_s)))
+        self.speaker_gate(False)
+
+    def all_off(self) -> None:
+        self.pump_off()
+        self.force_off()
+        self.speaker_gate(False)

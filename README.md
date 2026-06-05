@@ -1,53 +1,67 @@
 # bpod-hf-dm
 
-Head-fixed **decision-making with effort** (wheel + force cue), implemented on **[bpod-core](https://github.com/int-brain-lab/bpod-core)** with **StreamDIO** hardware from [MM_PyBpod2](https://github.com/deviandr/MM_PyBpod2).
+Head-fixed **decision-making with effort** (wheel + force cue), implemented on **[bpod-core](https://github.com/int-brain-lab/bpod-core)** with StreamDIO hardware.
 
 Design reference: [IBLRIG](https://int-brain-lab.github.io/iblrig/) (IBL two-alternative choice structure) plus the **force-discount wheel** paradigm from `MM_PyBpod2/examples/screen_shape_force_discount_task.py`.
 
-## Hard rule: bringup compatibility
+## Hard Rule: Rig Contract
 
-All pin/channel/COM defaults match the bringup notebooks in `MM_PyBpod2/examples/`:
+All pin/channel/timing defaults are defined in this repository, mainly in `src/hf_dm/hardware/bringup_constants.py` and `configs/*.yaml`. They match the hardware brought up with the MM_PyBpod2 notebooks:
 
 | Notebook | What this repo uses |
 |----------|---------------------|
 | `rotary_encoder_bringup.ipynb` | DI01 pulse, DI03 direction, AI13 force (pin 14) |
 | `screen_bringup_shape_force_discount.ipynb` | CW force ch3/pin21, CCW ch5/pin19, pump ch1/pin23 |
 | `camera_bringup_pin32_ttl.ipynb` | StreamDIO camera 30 Hz, 10 ms exposure |
-| `speaker_bringup_pin27_whitenoise.ipynb` | Gate pin 27, serial bytes `[89,1]` / `[89,0]`, msg 210/211 |
+| `speaker_bringup_pin27_whitenoise.ipynb` | Continuous PC white noise, gated by Bpod serial action on pin 27 |
+| `cap_touch_bringup_pin15_power_pin14_touch.ipynb` | Cap-touch power output ch13/pin15; lick edges on input ch14/pin25 |
+
+The task does not read rig parameters from a sister checkout. MM_PyBpod2 is needed as an installed
+driver package for `pybpod_streamDIO_module` unless that driver is deliberately vendored later.
 
 Ports default to `AUTO` with the same discovery logic as the screen task.
+Cap-touch power is held high for the whole session. Input channel 14 is enabled in the StreamDIO
+digital stream; each configured high edge is stored both as a raw module-timestamped event and as
+an explicit `lick` session event while force remains sampled on AI13.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Session supervisor (Python)                                 │
-│  - pygame display (cue / feedback)                           │
-│  - StreamDIO wheel + force stream                            │
-│  - engagement (idle 60 s, 10 failed trials)                  │
-│  - NPZ + JSON logging                                        │
-└───────────────┬─────────────────────────────┬───────────────┘
-                │ softcodes                  │ camera TTL
-                ▼                            ▼
-┌───────────────────────────┐   ┌──────────────────────────┐
-│  bpod-core FSM (timed I/O)  │   │  StreamDIO (Teensy)       │
-│  - force direction outputs  │   │  - rotary + analog force    │
-│  - pump reward duration     │   │  - camera triggers        │
-│  - white-noise gate         │   │  - session-long streaming │
-│  - ITI ≥ 3 s                │   └──────────────────────────┘
-└───────────────────────────┘
+Session supervisor (Python)
+  - pygame display coupled to wheel position at display FPS
+  - StreamDIO rotary, force, lick, and camera TTL streams
+  - verified StreamDIO USB commands for force, pump, and cap-touch power
+  - continuous PC white noise held behind the pin-27 hardware gate
+  - required headless Spinnaker recording for the whole session
+  - full raw StreamDIO NPZ stream plus JSON/NPZ trial and event records
+  - wall timestamps plus high-resolution monotonic `perf_counter` timestamps
+
+Bpod-core trial FSM
+  - installs the full firmware module/USB event allocation during bringup
+  - owns 3 s wheel quiescence, 20 s choice `Tup`, blank, reward, timeout, and exit
+  - receives host SoftCodes only for wheel movement during quiescence and committed choices
+  - triggers verified pump/force host actions with output SoftCodes
+  - directly gates timeout white noise with its Serial-module pin-27 action
 ```
 
 **Trial timeline (decision_making phase)**
 
-1. **2 s black screen** (display)
-2. **≥ 2 s quiescence** (no wheel pulses; host)
-3. **FSM: apply force cue** (CW or CCW resistance via breakout)
-4. **FSM: 15 s choice window** — host reads wheel, sends softcode on threshold
-5. **FSM: matched/opposite pump** (0.08 s vs 0.04 s — high effort = longer reward)
-6. **Feedback** (display)
-7. **FSM: ITI ≥ 3 s**
-8. On timeout: **FSM plays white noise** (speaker gate, 2 s)
+1. Bpod requires **3 s wheel quiescence**; any streamed wheel movement sends a reset SoftCode.
+2. Bpod enters a **20 s ChoiceWindow**. Its `Tup` is the authoritative timeout.
+3. A star (high effort/high reward) and circle (low effort/low reward) begin on opposite lateral sides.
+4. The live Python loop reads StreamDIO and redraws at 60 Hz. Turning right moves only the left option
+   toward center; turning left moves only the right option toward center.
+5. Star/circle side is randomized each trial. The masks contain exactly the same number of lit pixels.
+6. On a centered choice, Python sends one high/low SoftCode. Bpod immediately enters the blank state,
+   turns force off, waits `choice_blank_s`, enters the appropriate pump state, then holds a final
+   `post_reward_s` state before exiting.
+7. On timeout, Bpod enters the timeout state directly, gates audible white noise on pin 27, gates it
+   off after `timeout_noise_s`, holds `post_timeout_s`, and exits.
+8. A fresh Bpod FSM starts the next trial. There is no host-side choice wait or extra decision-task ITI.
+
+Pump and effort outputs retain the low-latency, verified StreamDIO USB path and require both a USB
+acknowledgement and a timestamped physical `dio_output` event. Bpod controls when those actions occur
+through state-entry output SoftCodes.
 
 ## Install
 
@@ -57,16 +71,18 @@ python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
 pip install -e /path/to/bpod-core
-pip install -e /path/to/MM_PyBpod2   # StreamDIO + optional sound module
+pip install -e /path/to/MM_PyBpod2_andrestrocyte   # StreamDIO + optional sound module
 pip install -e .
 ```
 
-Requires Python ≥ 3.10, Windows rig (same as bringups), Bpod State Machine 2+.
+Requires Python >= 3.10, Windows rig (same as bringups), Bpod State Machine 2+.
 
-### Optional: headless Spinnaker recording (no SpinView)
+### Headless Spinnaker recording (no SpinView)
 
-If you want this task to start/stop FLIR recording directly, install the **Spinnaker SDK** and its
-`PySpin` Python bindings, then set `camera.backend: spinnaker` in your YAML.
+Install the **Teledyne/FLIR Spinnaker SDK** and set `camera.backend: spinnaker`. The recorder uses
+`PySpin` when a compatible binding is installed and automatically falls back to the installed
+Spinnaker C API when it is not. Both paths configure the verified bringup trigger contract:
+`FrameStart`, `Line0`, rising edge, and `TriggerWidth` exposure.
 
 Example:
 
@@ -75,6 +91,7 @@ camera:
   frequency_hz: 30
   exposure_us: 10000
   record_video: true
+  required: true
   backend: spinnaker
   serial_number: null      # optional: choose a specific camera
   pixel_format: Mono8
@@ -82,34 +99,79 @@ camera:
   save_dir: data/videos
 ```
 
-With this enabled, the session writes a frame sequence and `recording_summary.json` under
-`data/videos/<subject>_<phase>_<timestamp>_spinnaker/` and logs start/stop/error events into the
-session JSON. If `backend` is not `spinnaker`, behavior is unchanged (external recorder workflow).
+The session writes a frame sequence, `frame_timestamps.csv`, and `recording_summary.json` under
+`data/videos/<subject>_<phase>_<timestamp>_spinnaker/`. With `required: true`, the task refuses to
+run if recording cannot start.
 
 ## Run
 
 ```bash
-# Stage 1 — centering only (reward when wheel near center)
-hf-dm-run --config configs/centering_50.yaml
+# No-trial hardware preflight: Bpod/StreamDIO/Spinnaker streams and cleanup only.
+python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration 2
 
-# Stage 2–4 — full DM (50 / 100 / 200 trials)
-hf-dm-run --config configs/dm_50.yaml
-hf-dm-run --config configs/dm_100.yaml
-hf-dm-run --config configs/dm_200.yaml
+# Controlled live check. WARNING: activates real force, pump, speaker, camera, and StreamDIO.
+python -m hf_dm.cli --config configs/dm_50.yaml --hardware-self-test
+
+# Stage 1 - centering shaping (bring a lateral cue into the center target)
+python -m hf_dm.cli --config configs/centering_50.yaml
+
+# Stage 2-4 - full DM (50 / 100 / 200 trials)
+python -m hf_dm.cli --config configs/dm_50.yaml
+python -m hf_dm.cli --config configs/dm_100.yaml
+python -m hf_dm.cli --config configs/dm_200.yaml
 ```
 
 Outputs: `data/sessions/<subject>_<phase>_<timestamp>.npz` and `.json`.
 
+On this Windows rig, `python -m hf_dm.cli ...` is the reliable launcher. An editable user-site
+install may place `hf-dm-run.exe` under `%APPDATA%\Python\Python312\Scripts`, which is not always on
+PowerShell's `PATH`.
+
+### Hardware-free simulation
+
+Use this before touching the live rig to verify the real Bpod-style state sequence, screen motion,
+reward timing, timeout gate, lick logging, camera TTL bookkeeping, and cleanup/finalization:
+
+```bash
+python -m hf_dm.cli --config configs/dm_50.yaml --simulate --simulate-headless --simulate-trials 3 --simulate-choice-mode alternate
+```
+
+Drop `--simulate-headless` to open the pygame task window. Choice modes are `matched`, `opposite`,
+`timeout`, `cw`, `ccw`, and `alternate`. In the decision task, matched means star/high-effort and
+opposite means circle/low-effort.
+
+### Live rig troubleshooting
+
+This task uses its own bpod-core settings namespace under `data/runtime/bpod-core`, so unrelated
+services using the global bpod-core settings lock do not block it. Override the location with
+`HF_DM_BPOD_CORE_CONFIG_DIR`. If the task-specific lock is held, close the older `hf_dm.cli` task
+process and rerun the preflight.
+
+If StreamDIO reports `Access is denied` on COM7/COM8, another process owns the StreamDIO USB port.
+Close old notebooks, serial monitors, or task processes, then unplug/replug StreamDIO if needed.
+
+`--hardware-self-test` runs the production Bpod FSM with synthetic wheel choices but real rig
+outputs. It fails unless both effort directions and pump transitions have firmware output events,
+choice-to-pump timing matches the configured blank state, pump duration error is below 10 ms, force
+ADC and camera TTLs are present, the Bpod timeout gate completes, Spinnaker saves frames, and there
+are no choice-loop stalls or incorrectly decoded Bpod states. Licks and real wheel edges still
+require touching/turning the physical inputs.
+For an input check, run a longer `--preflight`, turn the wheel both ways, and touch the lick sensor;
+the saved `preflight_end` event reports wheel pulse/direction edges and cap-touch input edges.
+
 ## Data logged
 
-- Per-trial: force direction, choice, matched, reward duration, RT, pulses, force ADC stats, wall/mono timestamps, camera TTL list
-- Events: `session_start`, `trial_start`, `quiescence_ok`, `pre_trial_black_*`, `trial_end`, `session_end`
+- Per-trial: star/circle sides, chosen shape/side, force direction, choice, reward duration, RT, pulses, force ADC stats, licks, wall/mono timestamps, camera TTL list
+- Exact bpod-core state/event rows for every trial in JSON and NPZ `bpod_trials_json`
+- Raw NPZ `streamdio_events`: every wheel/direction edge, force sample, camera TTL, lick, module timestamp, and high-resolution host timestamp
+- Events: `session_start`, `trial_start`, `stimulus_on`, `force_on`, `choice_detected`, `feedback_on`, `pump_start`, `pump_end`, `output_actual`, `lick`, `white_noise_*`, cleanup, `trial_end`, `session_end`
+- Video: every camera frame with camera and host timestamps in `frame_timestamps.csv`
 - Session summary: end reason (`completed`, `idle_timeout`, `max_consecutive_failures`)
 
 ## Learning curricula
 
-- **[docs/CURRICULUM_BPOD_CORE.md](docs/CURRICULUM_BPOD_CORE.md)** — become fluent in bpod-core using this repo
-- **[docs/CURRICULUM_TRAINING.md](docs/CURRICULUM_TRAINING.md)** — mouse training stages (centering → 50 → 100 → 200)
+- **[docs/CURRICULUM_BPOD_CORE.md](docs/CURRICULUM_BPOD_CORE.md)** - become fluent in bpod-core using this repo
+- **[docs/CURRICULUM_TRAINING.md](docs/CURRICULUM_TRAINING.md)** - mouse training stages (centering -> 50 -> 100 -> 200)
 
 ## License
 

@@ -7,4 +7,7 @@ dist/
 .pytest_cache/
 .mypy_cache/
 data/sessions/
+data/videos/
+data/runtime/
 *.npz
+pybpod-api.log
