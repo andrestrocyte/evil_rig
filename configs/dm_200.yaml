@@ -83,8 +83,8 @@ monitor:
   camera_fps: 10.0
   camera_preview_width: 520
   camera_preview_height: 390
-  task_preview_width: 360
-  task_preview_height: 160
+  task_preview_width: 220
+  task_preview_height: 120
   task_preview_rotate_left: true
 
 results_dir: data/sessions

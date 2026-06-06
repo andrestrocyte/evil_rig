@@ -15,7 +15,11 @@ from hf_dm.data.recorder import SessionRecorder
 from hf_dm.display.pygame_display import TaskDisplay
 from hf_dm.fsm.relay import RelayMessageIds
 from hf_dm.fsm.runtime import TrialRuntime
-from hf_dm.hardware.bringup_constants import LICK_INPUT_CHANNEL
+from hf_dm.hardware.bringup_constants import (
+    CAP_TOUCH_POWER_OUTPUT_CHANNEL,
+    CAP_TOUCH_POWER_PIN,
+    LICK_INPUT_CHANNEL,
+)
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.simulated_bpod import SimulatedBpod
 from hf_dm.streamdio.wheel import Direction, WheelKinematics
@@ -383,12 +387,28 @@ class SimulatedHFDecisionSession(HFDecisionSession):
                 "simulated": True,
             },
         )
+        cap_touch_transition = self.relay.cap_touch_power(True)
+        self._publish_monitor(
+            "cap_touch_power",
+            {
+                "active": True,
+                "state": 1,
+                "channel": self.config.licks.power_output_channel,
+                "pin": (
+                    CAP_TOUCH_POWER_PIN
+                    if self.config.licks.power_output_channel == CAP_TOUCH_POWER_OUTPUT_CHANNEL
+                    else None
+                ),
+                "source": "connect_command",
+                "transition": cap_touch_transition,
+            },
+        )
         self.recorder.log_event(
             "cap_touch_power_on",
             {
                 "output_channel": self.config.licks.power_output_channel,
                 "input_channels": list(self.config.licks.channels),
-                "transition": self.relay.cap_touch_power(True),
+                "transition": cap_touch_transition,
                 "simulated": True,
             },
         )

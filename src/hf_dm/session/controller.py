@@ -22,6 +22,10 @@ from hf_dm.fsm.builders import build_host_supervised_decision_fsm
 from hf_dm.fsm.relay import SerialRelay, wait_until_perf_counter
 from hf_dm.fsm.runtime import Side, Shape, TrialRuntime
 from hf_dm.hardware.bringup_constants import (
+    CAP_TOUCH_INPUT_CHANNEL,
+    CAP_TOUCH_INPUT_PIN,
+    CAP_TOUCH_POWER_OUTPUT_CHANNEL,
+    CAP_TOUCH_POWER_PIN,
     CCW_FORCE_OUTPUT_CHANNEL,
     CW_FORCE_OUTPUT_CHANNEL,
     FORCE_ANALOG_CHANNEL,
@@ -115,6 +119,21 @@ class HFDecisionSession:
                 "without audible timeout punishment."
             )
         cap_touch_power = self.relay.cap_touch_power(True)
+        self._publish_monitor(
+            "cap_touch_power",
+            {
+                "active": True,
+                "state": 1,
+                "channel": self.config.licks.power_output_channel,
+                "pin": (
+                    CAP_TOUCH_POWER_PIN
+                    if self.config.licks.power_output_channel == CAP_TOUCH_POWER_OUTPUT_CHANNEL
+                    else None
+                ),
+                "source": "connect_command",
+                "transition": cap_touch_power,
+            },
+        )
         self.recorder.log_event(
             "cap_touch_power_on",
             {
@@ -211,6 +230,22 @@ class HFDecisionSession:
             if self.relay is not None:
                 try:
                     cap_touch_off = self.relay.cap_touch_power(False)
+                    self._publish_monitor(
+                        "cap_touch_power",
+                        {
+                            "active": False,
+                            "state": 0,
+                            "channel": self.config.licks.power_output_channel,
+                            "pin": (
+                                CAP_TOUCH_POWER_PIN
+                                if self.config.licks.power_output_channel
+                                == CAP_TOUCH_POWER_OUTPUT_CHANNEL
+                                else None
+                            ),
+                            "source": "cleanup_command",
+                            "transition": cap_touch_off,
+                        },
+                    )
                     cleanup_result["cap_touch_power"] = cap_touch_off
                     if self.recorder is not None:
                         self.recorder.log_event("all_off_cleanup_verified", cleanup_result)
@@ -274,6 +309,16 @@ class HFDecisionSession:
                 "force_channel": self.config.wheel.force_channel,
                 "lick_channels": list(self.config.licks.channels),
                 "lick_high_only": self.config.licks.high_only,
+                "lick_inputs": self._lick_input_descriptors(),
+                "cap_touch_power": {
+                    "channel": self.config.licks.power_output_channel,
+                    "pin": (
+                        CAP_TOUCH_POWER_PIN
+                        if self.config.licks.power_output_channel
+                        == CAP_TOUCH_POWER_OUTPUT_CHANNEL
+                        else None
+                    ),
+                },
             },
         )
         self._publish_monitor(
@@ -338,6 +383,21 @@ class HFDecisionSession:
     ) -> None:
         if self.monitor is not None:
             self.monitor.publish_throttled(key, max_hz, event_type, payload or {})
+
+    def _lick_input_descriptors(self) -> list[dict]:
+        descriptors: list[dict] = []
+        for channel in self.config.licks.channels:
+            channel_i = int(channel)
+            descriptors.append(
+                {
+                    "channel": channel_i,
+                    "pin": CAP_TOUCH_INPUT_PIN if channel_i == CAP_TOUCH_INPUT_CHANNEL else None,
+                    "label": "cap touch" if channel_i == CAP_TOUCH_INPUT_CHANNEL else "lick",
+                    "digital_events_enabled": True,
+                    "analog_capable": channel_i == CAP_TOUCH_INPUT_CHANNEL,
+                }
+            )
+        return descriptors
 
     def _fsm_monitor_states(self) -> list[dict]:
         timing = self.config.timing
@@ -550,6 +610,24 @@ class HFDecisionSession:
             timestamp_us,
             relative_time,
         )
+        if event_type == "analog_input" and normalized_channel in self.config.licks.channels:
+            self._publish_monitor_throttled(
+                f"cap_touch_sample_{normalized_channel}",
+                min(30.0, max(1.0, float(self.config.monitor.force_sample_hz))),
+                "cap_touch_sample",
+                {
+                    "channel": normalized_channel,
+                    "pin": (
+                        CAP_TOUCH_INPUT_PIN
+                        if normalized_channel == CAP_TOUCH_INPUT_CHANNEL
+                        else None
+                    ),
+                    "value": float(normalized_value),
+                    "timestamp_us": int(timestamp_us),
+                    "relative_time_s": float(relative_time),
+                },
+            )
+            return
         if event_type == "analog_input" and normalized_channel == FORCE_ANALOG_CHANNEL:
             self._publish_monitor_throttled(
                 "force",
@@ -578,6 +656,25 @@ class HFDecisionSession:
                     "relative_time_s": float(relative_time),
                 },
             )
+        if (
+            event_type == "dio_output"
+            and normalized_channel == self.config.licks.power_output_channel
+        ):
+            self._publish_monitor(
+                "cap_touch_power",
+                {
+                    "active": bool(normalized_value),
+                    "state": normalized_value,
+                    "channel": normalized_channel,
+                    "pin": (
+                        CAP_TOUCH_POWER_PIN
+                        if normalized_channel == CAP_TOUCH_POWER_OUTPUT_CHANNEL
+                        else None
+                    ),
+                    "timestamp_us": int(timestamp_us),
+                    "relative_time_s": float(relative_time),
+                },
+            )
         if event_type != "dio_input":
             return
         if normalized_channel not in self.config.licks.channels:
@@ -585,6 +682,7 @@ class HFDecisionSession:
         counted = not self.config.licks.high_only or bool(normalized_value)
         base_event = {
             "channel": normalized_channel,
+            "pin": CAP_TOUCH_INPUT_PIN if normalized_channel == CAP_TOUCH_INPUT_CHANNEL else None,
             "value": normalized_value,
             "timestamp_us": int(timestamp_us),
             "relative_time_s": float(relative_time),

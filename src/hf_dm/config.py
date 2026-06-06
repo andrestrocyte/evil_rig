@@ -132,8 +132,8 @@ class MonitorConfig:
     camera_fps: float = 10.0
     camera_preview_width: int = 520
     camera_preview_height: int = 390
-    task_preview_width: int = 360
-    task_preview_height: int = 160
+    task_preview_width: int = 220
+    task_preview_height: int = 120
     task_preview_rotate_left: bool = True
 
 
@@ -360,8 +360,8 @@ class SessionConfig:
                 camera_fps=float(monitor_raw.get("camera_fps", 10.0)),
                 camera_preview_width=int(monitor_raw.get("camera_preview_width", 520)),
                 camera_preview_height=int(monitor_raw.get("camera_preview_height", 390)),
-                task_preview_width=int(monitor_raw.get("task_preview_width", 360)),
-                task_preview_height=int(monitor_raw.get("task_preview_height", 160)),
+                task_preview_width=int(monitor_raw.get("task_preview_width", 220)),
+                task_preview_height=int(monitor_raw.get("task_preview_height", 120)),
                 task_preview_rotate_left=bool(
                     monitor_raw.get("task_preview_rotate_left", True)
                 ),

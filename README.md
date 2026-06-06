@@ -111,10 +111,15 @@ The official configs enable a separate lightweight monitor on the computer/main 
 drop-safe telemetry, so closing or slowing the GUI does not stall the Bpod/StreamDIO task loop.
 
 It shows a low-rate camera preview, a compact left-rotated task screen copy, the active Bpod FSM
-state, latest star/circle/timeout outcomes, lick-edge/pump/noise event rails, a live force-effort
-ADC trace with a session-held y-axis maximum, and the wheel trace reset every trial.
+state, latest star/circle/timeout outcome squares, lick-edge/pump/noise event rails, raw cap-touch
+pin status, a live force-effort ADC trace with a session-held y-axis maximum, and the wheel trace
+reset every trial.
 Use `--no-monitor` for command-line checks, or `--monitor` to force it on when a YAML file has it
 disabled. `--simulate-headless` disables the monitor automatically.
+
+Cap touch uses StreamDIO input channel 14 / physical pin 25 for the lick detector and output
+channel 13 / physical pin 15 for detector power. The GUI shows both the power output and the raw
+input channel value so detector transitions are visible even before trial-level counted licks.
 
 ## Run
 

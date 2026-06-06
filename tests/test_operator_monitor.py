@@ -1,5 +1,12 @@
 from hf_dm.config import SessionConfig
-from hf_dm.hardware.bringup_constants import FORCE_ANALOG_CHANNEL, LICK_INPUT_CHANNEL, PUMP_OUTPUT_CHANNEL
+from hf_dm.hardware.bringup_constants import (
+    CAP_TOUCH_INPUT_PIN,
+    CAP_TOUCH_POWER_OUTPUT_CHANNEL,
+    CAP_TOUCH_POWER_PIN,
+    FORCE_ANALOG_CHANNEL,
+    LICK_INPUT_CHANNEL,
+    PUMP_OUTPUT_CHANNEL,
+)
 from hf_dm.monitor import OperatorMonitorState
 from hf_dm.monitor.gui import _frame_to_netpbm
 from hf_dm.session.controller import HFDecisionSession
@@ -27,7 +34,26 @@ class FakeMonitor:
 def test_operator_monitor_state_tracks_trials_events_and_recent_frames():
     state = OperatorMonitorState(history_s=10.0, trial_history=3)
 
-    state.apply({"type": "session_info", "payload": {"subject_id": "M1", "n_trials": 50}})
+    state.apply(
+        {
+            "type": "session_info",
+            "payload": {
+                "subject_id": "M1",
+                "n_trials": 50,
+                "lick_inputs": [
+                    {
+                        "channel": LICK_INPUT_CHANNEL,
+                        "pin": CAP_TOUCH_INPUT_PIN,
+                        "label": "cap touch",
+                    }
+                ],
+                "cap_touch_power": {
+                    "channel": CAP_TOUCH_POWER_OUTPUT_CHANNEL,
+                    "pin": CAP_TOUCH_POWER_PIN,
+                },
+            },
+        }
+    )
     state.apply(
         {
             "type": "trial_start",
@@ -69,7 +95,23 @@ def test_operator_monitor_state_tracks_trials_events_and_recent_frames():
     )
     state.apply({"type": "fsm_state", "payload": {"active_state": "ChoiceWindow", "phase": "choice"}})
     state.apply({"type": "lick_edge", "payload": {"channel": LICK_INPUT_CHANNEL, "value": 0}})
+    state.apply(
+        {
+            "type": "cap_touch_sample",
+            "payload": {"channel": LICK_INPUT_CHANNEL, "pin": CAP_TOUCH_INPUT_PIN, "value": 740},
+        }
+    )
     state.apply({"type": "lick", "payload": {"channel": LICK_INPUT_CHANNEL}})
+    state.apply(
+        {
+            "type": "cap_touch_power",
+            "payload": {
+                "active": True,
+                "channel": CAP_TOUCH_POWER_OUTPUT_CHANNEL,
+                "pin": CAP_TOUCH_POWER_PIN,
+            },
+        }
+    )
     state.apply({"type": "pump", "payload": {"active": True}})
     state.apply({"type": "white_noise", "payload": {"active": True}})
     state.apply(
@@ -99,7 +141,12 @@ def test_operator_monitor_state_tracks_trials_events_and_recent_frames():
     assert state.fsm_states[0]["name"] == "ChoiceWindow"
     assert state.active_fsm_state == "ChoiceWindow"
     assert state.lick_edge_count == 1
-    assert state.last_lick_value == 0
+    assert state.lick_inputs[0]["pin"] == CAP_TOUCH_INPUT_PIN
+    assert state.lick_input_states[LICK_INPUT_CHANNEL]["value"] == 740
+    assert state.lick_input_states[LICK_INPUT_CHANNEL]["source"] == "analog"
+    assert state.cap_touch_power_active
+    assert state.cap_touch_power["pin"] == CAP_TOUCH_POWER_PIN
+    assert state.last_lick_value == 740
     assert state.lick_count == 1
     assert state.pump_active
     assert state.noise_active
@@ -114,6 +161,14 @@ def test_streamdio_callback_publishes_monitor_signals():
 
     session._handle_streamdio_event("analog_input", FORCE_ANALOG_CHANNEL, 321, 1000, 0.001)
     session._handle_streamdio_event("dio_output", PUMP_OUTPUT_CHANNEL, 1, 2000, 0.002)
+    session._handle_streamdio_event(
+        "dio_output",
+        CAP_TOUCH_POWER_OUTPUT_CHANNEL,
+        1,
+        2200,
+        0.0022,
+    )
+    session._handle_streamdio_event("analog_input", LICK_INPUT_CHANNEL, 700, 2400, 0.0024)
     session._handle_streamdio_event("dio_input", LICK_INPUT_CHANNEL, 0, 2500, 0.0025)
     session._handle_streamdio_event("dio_input", LICK_INPUT_CHANNEL, 1, 3000, 0.003)
     session._handle_streamdio_event("camera", None, None, 4000, 0.004)
@@ -121,6 +176,8 @@ def test_streamdio_callback_publishes_monitor_signals():
     event_types = [event_type for event_type, _payload in monitor.messages]
     assert "force_sample" in event_types
     assert "pump" in event_types
+    assert "cap_touch_power" in event_types
+    assert "cap_touch_sample" in event_types
     assert "lick_edge" in event_types
     assert "lick" in event_types
     assert "camera_ttl" in event_types

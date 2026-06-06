@@ -28,6 +28,7 @@ INPUT_REFRACTORY_PERIOD_US = 300
 
 # Capacitive touch (cap_touch_bringup_pin15_power_pin14_touch.ipynb)
 CAP_TOUCH_POWER_OUTPUT_CHANNEL = 13  # output channel 13 / physical pin 15
+CAP_TOUCH_POWER_PIN = 15
 CAP_TOUCH_INPUT_CHANNEL = 14         # input channel 14 / physical pin 25
 CAP_TOUCH_INPUT_PIN = 25
 LICK_INPUT_CHANNEL = CAP_TOUCH_INPUT_CHANNEL

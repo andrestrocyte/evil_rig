@@ -28,6 +28,7 @@ _CRITICAL_EVENTS = {
     "white_noise",
     "lick",
     "lick_edge",
+    "cap_touch_power",
     "fsm_states",
     "fsm_state",
 }
@@ -272,8 +273,13 @@ class OperatorMonitorState:
         self.camera_ttl_count = 0
         self.lick_count = 0
         self.lick_edge_count = 0
+        self.lick_inputs: list[dict[str, Any]] = []
+        self.lick_input_states: dict[int, dict[str, Any]] = {}
         self.last_lick_value: int | None = None
         self.last_lick_edge_mono_s: float | None = None
+        self.last_lick_source = "-"
+        self.cap_touch_power: dict[str, Any] = {}
+        self.cap_touch_power_active = False
         self.pump_active = False
         self.noise_active = False
         self.last_update_mono_s = time.perf_counter()
@@ -286,6 +292,17 @@ class OperatorMonitorState:
 
         if event_type == "session_info":
             self.session_info.update(payload)
+            inputs = payload.get("lick_inputs", [])
+            if isinstance(inputs, list):
+                self.lick_inputs = [dict(item) for item in inputs if isinstance(item, dict)]
+                for item in self.lick_inputs:
+                    channel = _optional_int(item.get("channel"))
+                    if channel is None:
+                        continue
+                    self.lick_input_states.setdefault(channel, dict(item))
+            power = payload.get("cap_touch_power")
+            if isinstance(power, dict):
+                self.cap_touch_power.update(power)
         elif event_type == "session_summary":
             self.summary.update(payload)
             self.current_phase = "finished"
@@ -335,9 +352,19 @@ class OperatorMonitorState:
             self.lick_edge_count += 1
             self.last_lick_value = _optional_int(payload.get("value"))
             self.last_lick_edge_mono_s = now
+            self.last_lick_source = "digital"
+            self._update_lick_input_state(payload, now=now, source="digital")
+        elif event_type == "cap_touch_sample":
+            self.last_lick_value = _optional_int(payload.get("value"))
+            self.last_lick_edge_mono_s = now
+            self.last_lick_source = "analog"
+            self._update_lick_input_state(payload, now=now, source="analog")
         elif event_type == "lick":
             self.lick_events.append(now)
             self.lick_count += 1
+        elif event_type == "cap_touch_power":
+            self.cap_touch_power.update(payload)
+            self.cap_touch_power_active = bool(payload.get("active", payload.get("state", False)))
         elif event_type == "pump":
             state = bool(payload.get("active", payload.get("state", False)))
             self.pump_active = state
@@ -354,6 +381,22 @@ class OperatorMonitorState:
             self.latest_task_frame = payload
 
         self.prune(now)
+
+    def _update_lick_input_state(self, payload: dict[str, Any], *, now: float, source: str) -> None:
+        channel = _optional_int(payload.get("channel"))
+        if channel is None:
+            return
+        state = self.lick_input_states.setdefault(channel, {"channel": channel})
+        if payload.get("pin") is not None:
+            state["pin"] = payload.get("pin")
+        state["value"] = payload.get("value")
+        state["source"] = source
+        state["last_mono_s"] = now
+        state["relative_time_s"] = payload.get("relative_time_s")
+        if source == "digital":
+            state["active"] = bool(payload.get("value"))
+        else:
+            state["active"] = _optional_float(payload.get("value")) not in (None, 0.0)
 
     def prune(self, now: float | None = None) -> None:
         now = time.perf_counter() if now is None else float(now)
@@ -571,14 +614,21 @@ class _MonitorWindow:
         c.create_rectangle(0, 0, self.width, self.height, fill="#edf0f2", outline="")
         margin = 16
         gap = 14
-        top_h = max(300, int(self.height * 0.43))
+        top_h = max(330, int(self.height * 0.46))
         video_w = max(360, int(self.width * 0.36))
         task_w = max(260, int(self.width * 0.22))
         status_w = self.width - margin * 2 - gap * 2 - video_w - task_w
         status_w = max(320, status_w)
         video = (margin, margin, video_w, top_h)
         task = (margin + video_w + gap, margin, task_w, top_h)
-        status = (margin + video_w + gap + task_w + gap, margin, status_w, top_h)
+        right_x = margin + video_w + gap + task_w + gap
+        choices_h = max(120, int(top_h * 0.38))
+        status_h = top_h - gap - choices_h
+        if status_h < 190:
+            status_h = 190
+            choices_h = max(100, top_h - gap - status_h)
+        status = (right_x, margin, status_w, status_h)
+        choices = (right_x, margin + status_h + gap, status_w, choices_h)
         bottom_y = margin + top_h + gap
         bottom_h = self.height - bottom_y - margin
         usable_w = self.width - margin * 2 - gap * 2
@@ -601,6 +651,7 @@ class _MonitorWindow:
         self._draw_video_panel(*video)
         self._draw_task_panel(*task)
         self._draw_status_panel(*status)
+        self._draw_choices_panel(*choices)
         self._draw_events_panel(*events)
         self._draw_fsm_panel(*fsm)
         self._draw_effort_panel(*effort)
@@ -657,8 +708,8 @@ class _MonitorWindow:
             ("Circle side", self.state.current_circle_side or "-"),
             ("Licks", str(self.state.lick_count)),
             (
-                "Lick edges",
-                f"{self.state.lick_edge_count}  last {self.state.last_lick_value}"
+                "Touch input",
+                f"{self.state.lick_edge_count}  last {self.state.last_lick_value} ({self.state.last_lick_source})"
                 if self.state.last_lick_value is not None
                 else str(self.state.lick_edge_count),
             ),
@@ -666,6 +717,7 @@ class _MonitorWindow:
             ("Noise", "ON" if self.state.noise_active else "off"),
         ]
         yy = iy
+        line_step = max(16, min(22, ih // max(1, len(status_lines))))
         for label, value in status_lines:
             self.canvas.create_text(ix, yy, anchor="w", text=label, fill="#697782", font=("Segoe UI", 9))
             self.canvas.create_text(
@@ -676,23 +728,18 @@ class _MonitorWindow:
                 fill="#1f2933",
                 font=("Segoe UI", 10, "bold"),
             )
-            yy += 23
+            yy += line_step
 
         self._draw_speaker_icon(ix + iw - 58, iy + 22, active=self.state.noise_active)
-        self.canvas.create_text(
-            ix,
-            yy + 8,
-            anchor="w",
-            text="Latest outcomes",
-            fill="#20262b",
-            font=("Segoe UI", 10, "bold"),
-        )
-        yy += 34
-        self._draw_outcomes(ix, yy, iw, ih - (yy - iy))
+
+    def _draw_choices_panel(self, x: int, y: int, w: int, h: int) -> None:
+        ix, iy, iw, ih = self._panel(x, y, w, h, "Latest Choices")
+        self._draw_outcomes(ix, iy, iw, ih)
 
     def _draw_outcomes(self, x: int, y: int, w: int, h: int) -> None:
-        col_w = 72
-        row_h = 54
+        row_h = max(38, min(54, h))
+        col_w = max(54, min(72, w // max(1, min(self.state.trial_history, 6))))
+        symbol_r = max(10, min(14, row_h // 3))
         max_cols = max(1, w // col_w)
         for idx, outcome in enumerate(list(self.state.outcomes)[-self.state.trial_history :]):
             col = idx % max_cols
@@ -705,7 +752,9 @@ class _MonitorWindow:
             responded = bool(outcome.get("responded", chosen_shape in ("star", "circle")))
             matched = bool(outcome.get("matched", False))
             fill = "#49b979" if matched else "#5b9ee8" if responded else "#e06060"
-            self.canvas.create_rectangle(xx, yy, xx + 58, yy + 44, fill="#f8fafb", outline="#d7dde2")
+            box_w = min(col_w - 8, 58)
+            box_h = min(row_h - 8, 44)
+            self.canvas.create_rectangle(xx, yy, xx + box_w, yy + box_h, fill="#f8fafb", outline="#d7dde2")
             self.canvas.create_text(
                 xx + 6,
                 yy + 8,
@@ -714,21 +763,47 @@ class _MonitorWindow:
                 fill="#687780",
                 font=("Segoe UI", 8, "bold"),
             )
+            cx = xx + box_w // 2 + 8
+            cy = yy + box_h // 2 + 4
             if chosen_shape == "star":
-                self._draw_star(xx + 36, yy + 24, 14, fill)
+                self._draw_star(cx, cy, symbol_r, fill)
             elif chosen_shape == "circle":
-                self.canvas.create_oval(xx + 23, yy + 11, xx + 49, yy + 37, fill=fill, outline="")
+                self.canvas.create_oval(
+                    cx - symbol_r,
+                    cy - symbol_r,
+                    cx + symbol_r,
+                    cy + symbol_r,
+                    fill=fill,
+                    outline="",
+                )
             else:
-                self.canvas.create_line(xx + 24, yy + 14, xx + 48, yy + 36, fill=fill, width=3)
-                self.canvas.create_line(xx + 48, yy + 14, xx + 24, yy + 36, fill=fill, width=3)
+                self.canvas.create_line(
+                    cx - symbol_r,
+                    cy - symbol_r,
+                    cx + symbol_r,
+                    cy + symbol_r,
+                    fill=fill,
+                    width=3,
+                )
+                self.canvas.create_line(
+                    cx + symbol_r,
+                    cy - symbol_r,
+                    cx - symbol_r,
+                    cy + symbol_r,
+                    fill=fill,
+                    width=3,
+                )
 
     def _draw_events_panel(self, x: int, y: int, w: int, h: int) -> None:
         ix, iy, iw, ih = self._panel(x, y, w, h, "Lick / Pump / Noise")
         now = time.perf_counter()
-        rail_h = max(36, ih // 5)
+        pin_h = 66
+        self._draw_touch_pin_status(ix, iy, iw, pin_h, now)
+        rails_y = iy + pin_h + 8
+        rail_h = max(34, (ih - pin_h - 8) // 5)
         labels = [("Lick", "#2f7dd3"), ("Pump", "#37a56b"), ("Noise", "#d9a516")]
         for idx, (label, color) in enumerate(labels):
-            yy = iy + idx * rail_h
+            yy = rails_y + idx * rail_h
             self.canvas.create_text(ix, yy + 14, anchor="w", text=label, fill="#40515f", font=("Segoe UI", 9, "bold"))
             self.canvas.create_line(ix + 64, yy + 18, ix + iw - 10, yy + 18, fill="#d8dee3")
             if label == "Lick":
@@ -752,10 +827,74 @@ class _MonitorWindow:
                 self._draw_state_intervals(ix + 64, yy + 4, iw - 74, 30, now, self.state.noise_events, color, self.state.noise_active)
                 self._draw_speaker_icon(ix + iw - 38, yy + 18, active=self.state.noise_active, small=True)
 
-        wheel_y = iy + rail_h * 3 + 10
+        wheel_y = rails_y + rail_h * 3 + 10
         self.canvas.create_text(ix, wheel_y, anchor="w", text="Wheel (trial)", fill="#20262b", font=("Segoe UI", 10, "bold"))
         plot_y = wheel_y + 18
         self._draw_wheel_plot(ix, plot_y, iw, ih - (plot_y - iy))
+
+    def _draw_touch_pin_status(self, x: int, y: int, w: int, h: int, now: float) -> None:
+        power_channel = self.state.cap_touch_power.get("channel")
+        power_pin = self.state.cap_touch_power.get("pin")
+        power_text = (
+            f"power ch{power_channel}"
+            + (f"/pin{power_pin}" if power_pin is not None else "")
+            + (" ON" if self.state.cap_touch_power_active else " off")
+        )
+        power_fill = "#daf3e5" if self.state.cap_touch_power_active else "#f4f6f7"
+        self.canvas.create_rectangle(x, y, x + w, y + h, fill="#fbfcfd", outline="#e1e6ea")
+        self.canvas.create_rectangle(x + 8, y + 8, x + min(w - 8, 170), y + 30, fill=power_fill, outline="#d7dde2")
+        self.canvas.create_text(
+            x + 16,
+            y + 19,
+            anchor="w",
+            text=power_text,
+            fill="#1f2933",
+            font=("Segoe UI", 8, "bold"),
+        )
+        inputs = self.state.lick_inputs or [
+            {"channel": channel, **state}
+            for channel, state in sorted(self.state.lick_input_states.items())
+        ]
+        if not inputs:
+            self.canvas.create_text(
+                x + 16,
+                y + 46,
+                anchor="w",
+                text="touch input: waiting for channel config",
+                fill="#687780",
+                font=("Segoe UI", 9),
+            )
+            return
+        chip_x = x + 8
+        chip_y = y + 36
+        for item in inputs[:3]:
+            channel = _optional_int(item.get("channel"))
+            if channel is None:
+                continue
+            state = self.state.lick_input_states.get(channel, {})
+            pin = state.get("pin", item.get("pin"))
+            value = state.get("value", "-")
+            source = state.get("source", "digital")
+            last_mono = _optional_float(state.get("last_mono_s"))
+            recent = last_mono is not None and now - last_mono < 0.6
+            active = bool(state.get("active", False)) or recent
+            fill = "#dbeafe" if active else "#f4f6f7"
+            outline = "#2f7dd3" if active else "#d7dde2"
+            chip_w = min(max(132, w // 3 - 8), w - (chip_x - x) - 8)
+            if chip_w < 100:
+                break
+            text = f"in ch{channel}" + (f"/pin{pin}" if pin is not None else "")
+            text += f"  {source}:{value}"
+            self.canvas.create_rectangle(chip_x, chip_y, chip_x + chip_w, chip_y + 24, fill=fill, outline=outline)
+            self.canvas.create_text(
+                chip_x + 8,
+                chip_y + 12,
+                anchor="w",
+                text=_short_text(text, max(12, chip_w // 7)),
+                fill="#1f2933",
+                font=("Segoe UI", 8, "bold"),
+            )
+            chip_x += chip_w + 8
 
     def _draw_fsm_panel(self, x: int, y: int, w: int, h: int) -> None:
         ix, iy, iw, ih = self._panel(x, y, w, h, "Bpod FSM")
@@ -996,6 +1135,16 @@ class _MonitorWindow:
                 font=("Segoe UI", 10),
             )
             return
+        if photo.width() > w or photo.height() > h:
+            factor = max(
+                1,
+                int(math.ceil(photo.width() / max(1, w))),
+                int(math.ceil(photo.height() / max(1, h))),
+            )
+            try:
+                photo = photo.subsample(factor, factor)
+            except Exception:
+                pass
         self._images.append(photo)
         px = x + max(0, (w - photo.width()) // 2)
         py = y + max(0, (h - photo.height()) // 2)
