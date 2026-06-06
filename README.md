@@ -136,6 +136,9 @@ python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration
 # Controlled live check. WARNING: activates real force, pump, speaker, camera, and StreamDIO.
 python -m hf_dm.cli --config configs/dm_50.yaml --hardware-self-test
 
+# Cap-touch input check only. Touch the lick detector during the window.
+python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-touch-duration 15
+
 # Stage 1 - centering shaping (bring a lateral cue into the center target)
 python -m hf_dm.cli --config configs/centering_50.yaml
 
@@ -176,6 +179,13 @@ process and rerun the preflight.
 
 If StreamDIO reports `Access is denied` on COM7/COM8, another process owns the StreamDIO USB port.
 Close old notebooks, serial monitors, or task processes, then unplug/replug StreamDIO if needed.
+
+`--cap-touch-diagnostic` does not start Bpod trials. It opens StreamDIO, keeps force streaming on
+analog channel 13, powers the cap-touch detector on output channel 13 / pin 15, polls the firmware
+digitizer on input channel 14 / pin 25, and prints ADC value, baseline, threshold, and high/low lick
+edge counts. If `hi_edges` increments while touching the detector, the task GUI should also show
+licks. If ADC stays near zero or `hi_edges` never increments while the detector is touched, check
+the cap-touch sensor wiring/power first, then the firmware threshold.
 
 `--hardware-self-test` runs the production Bpod FSM with synthetic wheel choices but real rig
 outputs. It fails unless both effort directions and pump transitions have firmware output events,

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 from hf_dm.config import SessionConfig
+from hf_dm.session.cap_touch_diagnostic import run_cap_touch_diagnostic
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.hardware_self_test import HardwareSelfTestSession, shorten_for_hardware_self_test
 from hf_dm.session.simulated import (
@@ -44,6 +45,26 @@ def main() -> None:
             "Run three production Bpod-FSM trials with command-driven wheel choices. "
             "WARNING: activates real force, pump, audible speaker noise, camera, and outputs."
         ),
+    )
+    parser.add_argument(
+        "--cap-touch-diagnostic",
+        action="store_true",
+        help=(
+            "Run a StreamDIO-only cap-touch check: powers ch13/pin15, polls "
+            "digitizer status on ch14/pin25, and reports lick edges."
+        ),
+    )
+    parser.add_argument(
+        "--cap-touch-duration",
+        type=float,
+        default=15.0,
+        help="Seconds to run --cap-touch-diagnostic.",
+    )
+    parser.add_argument(
+        "--cap-touch-poll-hz",
+        type=float,
+        default=10.0,
+        help="Status polling rate for --cap-touch-diagnostic.",
     )
     parser.add_argument(
         "--preflight-duration",
@@ -83,6 +104,13 @@ def main() -> None:
         parser.error("--hardware-self-test cannot be combined with --simulate")
     if args.hardware_self_test and args.preflight:
         parser.error("--hardware-self-test cannot be combined with --preflight")
+    if args.cap_touch_diagnostic and (
+        args.simulate or args.preflight or args.hardware_self_test
+    ):
+        parser.error(
+            "--cap-touch-diagnostic cannot be combined with --simulate, "
+            "--preflight, or --hardware-self-test"
+        )
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -96,6 +124,13 @@ def main() -> None:
         config.monitor.enabled = True
     if args.no_monitor:
         config.monitor.enabled = False
+    if args.cap_touch_diagnostic:
+        run_cap_touch_diagnostic(
+            config,
+            duration_s=args.cap_touch_duration,
+            poll_hz=args.cap_touch_poll_hz,
+        )
+        return
     if args.simulate:
         if args.simulate_headless:
             os.environ["SDL_VIDEODRIVER"] = "dummy"
