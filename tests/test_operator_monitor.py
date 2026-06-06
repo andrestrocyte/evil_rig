@@ -204,6 +204,38 @@ def test_operator_monitor_state_tracks_latest_camera_and_task_frame_counts():
     assert state.last_task_frame_mono_s is not None
 
 
+def test_cap_touch_status_sample_does_not_create_lick_edge_indicator():
+    state = OperatorMonitorState(history_s=10.0, trial_history=3)
+
+    state.apply(
+        {
+            "type": "cap_touch_sample",
+            "payload": {
+                "channel": LICK_INPUT_CHANNEL,
+                "pin": CAP_TOUCH_INPUT_PIN,
+                "value": 900,
+                "active": True,
+                "baseline": 20,
+                "rising_high_threshold": 700,
+                "source": "firmware_digitizer_status",
+            },
+        }
+    )
+
+    touch_state = state.lick_input_states[LICK_INPUT_CHANNEL]
+    assert state.lick_edge_count == 0
+    assert state.lick_count == 0
+    assert state.last_lick_edge_mono_s is None
+    assert state.last_touch_sample_mono_s is not None
+    assert state.last_lick_value == 900
+    assert state.last_lick_source == "status"
+    assert touch_state["source"] == "status"
+    assert touch_state["active"] is True
+    assert touch_state["baseline"] == 20
+    assert touch_state["rising_high_threshold"] == 700
+    assert touch_state["last_sample_mono_s"] == state.last_touch_sample_mono_s
+
+
 def test_operator_monitor_replaces_stale_frames_per_source_queue():
     monitor = OperatorMonitor(MonitorConfig(enabled=True))
     camera_queue = FakeBoundedQueue(maxsize=1)

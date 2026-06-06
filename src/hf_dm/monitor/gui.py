@@ -310,6 +310,7 @@ class OperatorMonitorState:
         self.lick_input_states: dict[int, dict[str, Any]] = {}
         self.last_lick_value: int | None = None
         self.last_lick_edge_mono_s: float | None = None
+        self.last_touch_sample_mono_s: float | None = None
         self.last_lick_source = "-"
         self.cap_touch_power: dict[str, Any] = {}
         self.cap_touch_power_active = False
@@ -389,9 +390,9 @@ class OperatorMonitorState:
             self._update_lick_input_state(payload, now=now, source="digital")
         elif event_type == "cap_touch_sample":
             self.last_lick_value = _optional_int(payload.get("value"))
-            self.last_lick_edge_mono_s = now
-            self.last_lick_source = "analog"
-            self._update_lick_input_state(payload, now=now, source="analog")
+            self.last_touch_sample_mono_s = now
+            self.last_lick_source = _touch_sample_source_label(payload.get("source"))
+            self._update_lick_input_state(payload, now=now, source=self.last_lick_source)
         elif event_type == "lick":
             self.lick_events.append(now)
             self.lick_count += 1
@@ -431,11 +432,24 @@ class OperatorMonitorState:
         state["last_mono_s"] = now
         state["relative_time_s"] = payload.get("relative_time_s")
         if source == "digital":
+            state["last_edge_mono_s"] = now
+        else:
+            state["last_sample_mono_s"] = now
+        for key in (
+            "baseline",
+            "polarity",
+            "rising_high_threshold",
+            "rising_low_threshold",
+            "falling_high_threshold",
+            "falling_low_threshold",
+            "error",
+        ):
+            if payload.get(key) is not None:
+                state[key] = payload.get(key)
+        if source == "digital":
             state["active"] = bool(payload.get("value"))
         elif payload.get("active") is not None:
             state["active"] = bool(payload.get("active"))
-        else:
-            state["active"] = _optional_float(payload.get("value")) not in (None, 0.0)
 
     def prune(self, now: float | None = None) -> None:
         now = time.perf_counter() if now is None else float(now)
@@ -490,6 +504,15 @@ def _short_text(text: Any, max_chars: int) -> str:
     if len(value) <= max_chars:
         return value
     return value[: max_chars - 3] + "..."
+
+
+def _touch_sample_source_label(source: Any) -> str:
+    if source in (None, ""):
+        return "analog"
+    value = str(source)
+    if value == "firmware_digitizer_status":
+        return "status"
+    return value
 
 
 def _frame_age_text(last_mono_s: float | None, now: float | None = None) -> str:
@@ -795,9 +818,9 @@ class _MonitorWindow:
             ("Licks", str(self.state.lick_count)),
             (
                 "Touch input",
-                f"{self.state.lick_edge_count}  last {self.state.last_lick_value} ({self.state.last_lick_source})"
+                f"edges {self.state.lick_edge_count}  last {self.state.last_lick_value} ({self.state.last_lick_source})"
                 if self.state.last_lick_value is not None
-                else str(self.state.lick_edge_count),
+                else f"edges {self.state.lick_edge_count}",
             ),
             ("Pump", "ON" if self.state.pump_active else "off"),
             ("Noise", "ON" if self.state.noise_active else "off"),
@@ -961,16 +984,24 @@ class _MonitorWindow:
             pin = state.get("pin", item.get("pin"))
             value = state.get("value", "-")
             source = state.get("source", "digital")
-            last_mono = _optional_float(state.get("last_mono_s"))
-            recent = last_mono is not None and now - last_mono < 0.6
-            active = bool(state.get("active", False)) or recent
-            fill = "#dbeafe" if active else "#f4f6f7"
+            last_sample_mono = _optional_float(state.get("last_sample_mono_s"))
+            last_edge_mono = _optional_float(state.get("last_edge_mono_s"))
+            sample_recent = last_sample_mono is not None and now - last_sample_mono < 1.2
+            edge_recent = last_edge_mono is not None and now - last_edge_mono < 0.6
+            active = bool(state.get("active", False))
+            fill = "#dbeafe" if active or edge_recent else "#f9fbfc" if sample_recent else "#f4f6f7"
             outline = "#2f7dd3" if active else "#d7dde2"
             chip_w = min(max(132, w // 3 - 8), w - (chip_x - x) - 8)
             if chip_w < 100:
                 break
             text = f"in ch{channel}" + (f"/pin{pin}" if pin is not None else "")
             text += f"  {source}:{value}"
+            if state.get("baseline") is not None:
+                text += f" b{state.get('baseline')}"
+            if state.get("rising_high_threshold") is not None:
+                text += f" hi>{state.get('rising_high_threshold')}"
+            if state.get("active") is not None:
+                text += " ON" if active else " off"
             self.canvas.create_rectangle(chip_x, chip_y, chip_x + chip_w, chip_y + 24, fill=fill, outline=outline)
             self.canvas.create_text(
                 chip_x + 8,
