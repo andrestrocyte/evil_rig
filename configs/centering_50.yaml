@@ -33,6 +33,9 @@ licks:
   high_only: true
   power_output_channel: 13
   power_required: true
+  cap_touch_min_high_threshold: 250
+  cap_touch_delta_high: 120
+  cap_touch_delta_low: 90
 
 speaker:
   sample_interval_us: 100

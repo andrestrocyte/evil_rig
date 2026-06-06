@@ -30,6 +30,7 @@ from hf_dm.hardware.bringup_constants import (
     CW_FORCE_OUTPUT_CHANNEL,
     FORCE_ANALOG_CHANNEL,
     PUMP_OUTPUT_CHANNEL,
+    STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION,
 )
 from hf_dm.monitor import OperatorMonitor
 from hf_dm.streamdio.client import StreamDIOClient
@@ -81,6 +82,7 @@ class HFDecisionSession:
         self.display = TaskDisplay(self.config.display)
         out = Path(self.config.results_dir)
         self.recorder = SessionRecorder(out, self.config.subject_id, self.config.phase.value)
+        self._configure_cap_touch_digitizer_from_config()
         self._start_operator_monitor()
         self._start_optional_video_recording()
         self.dio.start_streaming(callback=self._handle_streamdio_event)
@@ -371,6 +373,39 @@ class HFDecisionSession:
                     "dropped_messages": int(dropped),
                     "dropped_frames": int(dropped_frames),
                     "published_counts": published_counts,
+                },
+        )
+
+    def _configure_cap_touch_digitizer_from_config(self) -> None:
+        if self.dio is None:
+            return
+        licks = self.config.licks
+        threshold_requested = (
+            licks.cap_touch_min_high_threshold is not None
+            or licks.cap_touch_delta_high is not None
+            or licks.cap_touch_delta_low is not None
+        )
+        firmware_version = int(self.dio.raw.module_info.get("firmware_version", 0))
+        if (
+            not threshold_requested
+            and firmware_version < STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION
+        ):
+            return
+        status = self.dio.configure_cap_touch_digitizer(
+            min_high_threshold=licks.cap_touch_min_high_threshold,
+            delta_high=licks.cap_touch_delta_high,
+            delta_low=licks.cap_touch_delta_low,
+        )
+        if self.recorder is not None:
+            self.recorder.log_event(
+                "cap_touch_digitizer_configured",
+                {
+                    "requested": {
+                        "min_high_threshold": licks.cap_touch_min_high_threshold,
+                        "delta_high": licks.cap_touch_delta_high,
+                        "delta_low": licks.cap_touch_delta_low,
+                    },
+                    "status": status,
                 },
             )
 

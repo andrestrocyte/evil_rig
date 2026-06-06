@@ -4,7 +4,7 @@
 is the StreamDIO firmware used by the bringup notebooks, vendored here so the
 task and firmware stay in sync.
 
-This cap-touch digitizer build reports firmware version `3`. The Sanworks
+This cap-touch digitizer build reports firmware version `4`. The Sanworks
 `ArCOM` wrapper is vendored beside the sketch so the firmware can be compiled
 without installing an extra Arduino library.
 
@@ -23,6 +23,9 @@ digitizer:
   sample crosses hysteretic thresholds
 - exposes an `l` status command with the current ADC value, baseline,
   thresholds, active state, and polarity for low-rate GUI polling
+- exposes a USB1 `t` command to tune the cap-touch minimum high threshold,
+  touch delta, and release delta at runtime without moving force off analog
+  channel 13
 - uses non-overlapping stream event ranges for 14 inputs: DIO input events
   `1..28`, DIO output events `29..54`, and analog events from `55`
 - leaves the Python task and GUI using the same `lick_edge` / counted `lick`

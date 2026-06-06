@@ -186,6 +186,20 @@ digitizer on input channel 14 / pin 25, and prints ADC value, baseline, threshol
 edge counts. If `hi_edges` increments while touching the detector, the task GUI should also show
 licks. If ADC stays near zero or `hi_edges` never increments while the detector is touched, check
 the cap-touch sensor wiring/power first, then the firmware threshold.
+Firmware v4 supports runtime threshold tuning from YAML:
+
+```yaml
+licks:
+  cap_touch_min_high_threshold: 250
+  cap_touch_delta_high: 120
+  cap_touch_delta_low: 90
+```
+
+or for one diagnostic run:
+
+```bash
+python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-touch-min-high-threshold 250 --cap-touch-delta-high 120 --cap-touch-delta-low 90
+```
 
 `--hardware-self-test` runs the production Bpod FSM with synthetic wheel choices but real rig
 outputs. It fails unless both effort directions and pump transitions have firmware output events,

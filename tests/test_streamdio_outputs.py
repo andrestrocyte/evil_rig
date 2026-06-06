@@ -13,7 +13,7 @@ class FakeProtocol:
     def __init__(self) -> None:
         self.client = None
         self.module_info = {
-            "firmware_version": 3,
+            "firmware_version": 4,
             "n_input_channels": 14,
             "n_output_channels": 13,
         }
@@ -63,9 +63,9 @@ class FakeProtocol:
 
 
 class FakeArCOM:
-    def __init__(self) -> None:
+    def __init__(self, values: list[int] | None = None) -> None:
         self.writes = []
-        self.values = iter([1, 14, 25, 1, 1, 812, 123, 700, 283, 0, 0])
+        self.values = iter(values or [1, 14, 25, 1, 1, 812, 123, 700, 283, 0, 0])
 
     def write(self, value, data_type) -> None:
         self.writes.append((value, data_type))
@@ -132,6 +132,43 @@ def test_cap_touch_status_reads_digitizer_fields():
     assert status["pin"] == 25
     assert status["last_value"] == 812
     assert status["rising_high_threshold"] == 700
+
+
+def test_cap_touch_threshold_configuration_sends_runtime_firmware_command():
+    client = _client()
+    client.raw._config_arcom = FakeArCOM(
+        [1, 1, 14, 25, 0, 0, 0, 0, 250, 90, 0, 0]
+    )
+
+    status = client.configure_cap_touch_digitizer(
+        min_high_threshold=250,
+        delta_high=120,
+        delta_low=90,
+    )
+
+    assert client.raw._config_arcom.writes == [
+        (ord("t"), "uint8"),
+        (250, "uint16"),
+        (120, "uint16"),
+        (90, "uint16"),
+        (ord("l"), "uint8"),
+    ]
+    assert status["channel"] == LICK_INPUT_CHANNEL
+    assert status["rising_high_threshold"] == 250
+    assert status["rising_low_threshold"] == 90
+
+
+def test_cap_touch_threshold_configuration_requires_v4_firmware():
+    client = _client()
+    client.raw.module_info["firmware_version"] = 3
+
+    try:
+        client.configure_cap_touch_digitizer(min_high_threshold=250)
+    except RuntimeError as exc:
+        assert "firmware version 3" in str(exc)
+        assert "expected 4" in str(exc)
+    else:
+        raise AssertionError("Expected firmware v3 to be rejected for threshold tuning")
 
 
 def test_speaker_pulse_generates_samples_and_finishes_disabled():

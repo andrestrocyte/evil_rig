@@ -117,7 +117,7 @@ char moduleName[] = "DIO_12Ch_Stream";
 const char* eventNames[] = {"1_Hi", "1_Lo", "2_Hi", "2_Lo", "3_Hi", "3_Lo", "4_Hi", "4_Lo", "5_Hi", "5_Lo",
                       "6_Hi", "6_Lo", "7_Hi", "7_Lo", "8_Hi", "8_Lo", "9_Hi", "9_Lo", "10_Hi", "10_Lo",
                       "11_Hi", "11_Lo", "12_Hi", "12_Lo", "13_Hi", "13_Lo", "14_Hi", "14_Lo"};
-const uint32_t FirmwareVersion = 3;
+const uint32_t FirmwareVersion = 4;
 byte nEventNames = (sizeof(eventNames)/sizeof(char *));
 
 // Pin definitions
@@ -174,10 +174,13 @@ byte capTouchDigitizedState = 0;
 byte capTouchActivePolarity = 0; // 0 = idle, 1 = high-going touch, 2 = low-going touch.
 boolean capTouchBaselineInitialized = false;
 uint64_t capTouchIgnoreUntilTime = 0;
-const uint16_t CAP_TOUCH_MIN_HIGH_THRESHOLD = 700;
-const uint16_t CAP_TOUCH_DELTA_HIGH = 350;
-const uint16_t CAP_TOUCH_DELTA_LOW = 160;
+const uint16_t CAP_TOUCH_DEFAULT_MIN_HIGH_THRESHOLD = 700;
+const uint16_t CAP_TOUCH_DEFAULT_DELTA_HIGH = 350;
+const uint16_t CAP_TOUCH_DEFAULT_DELTA_LOW = 160;
 const uint32_t CAP_TOUCH_POWER_SETTLE_US = 100000;
+uint16_t capTouchMinHighThreshold = CAP_TOUCH_DEFAULT_MIN_HIGH_THRESHOLD;
+uint16_t capTouchDeltaHigh = CAP_TOUCH_DEFAULT_DELTA_HIGH;
+uint16_t capTouchDeltaLow = CAP_TOUCH_DEFAULT_DELTA_LOW;
 
 // Speaker white-noise state
 boolean speakerNoiseEnabled = false;
@@ -555,6 +558,7 @@ byte getUSBCommandBytes(byte cmd) {
     case 'R': return 4; // refractory period
     case 'E': return 2; // enable input
     case 'N': return 6; // configure analog input
+    case 't': return 6; // configure cap-touch ADC digitizer thresholds
     case 'K': return 5; // speaker white-noise enable + sample interval
     case 'Y': return 1; // speaker gate high / low on pin 27
     case 'A': return 2; // all outputs
@@ -692,15 +696,15 @@ uint16_t capTouchSaturatedSubtract(uint16_t value, uint16_t delta) {
 }
 
 uint16_t capTouchRisingHighThreshold() {
-  uint16_t threshold = capTouchSaturatedAdd(capTouchBaseline, CAP_TOUCH_DELTA_HIGH);
-  if (threshold < CAP_TOUCH_MIN_HIGH_THRESHOLD) {
-    threshold = CAP_TOUCH_MIN_HIGH_THRESHOLD;
+  uint16_t threshold = capTouchSaturatedAdd(capTouchBaseline, capTouchDeltaHigh);
+  if (threshold < capTouchMinHighThreshold) {
+    threshold = capTouchMinHighThreshold;
   }
   return threshold;
 }
 
 uint16_t capTouchRisingLowThreshold(uint16_t highThreshold) {
-  uint16_t threshold = capTouchSaturatedAdd(capTouchBaseline, CAP_TOUCH_DELTA_LOW);
+  uint16_t threshold = capTouchSaturatedAdd(capTouchBaseline, capTouchDeltaLow);
   if (threshold > highThreshold) {
     threshold = highThreshold;
   }
@@ -708,11 +712,21 @@ uint16_t capTouchRisingLowThreshold(uint16_t highThreshold) {
 }
 
 uint16_t capTouchFallingHighThreshold() {
-  return capTouchSaturatedSubtract(capTouchBaseline, CAP_TOUCH_DELTA_HIGH);
+  return capTouchSaturatedSubtract(capTouchBaseline, capTouchDeltaHigh);
 }
 
 uint16_t capTouchFallingLowThreshold() {
-  return capTouchSaturatedSubtract(capTouchBaseline, CAP_TOUCH_DELTA_LOW);
+  return capTouchSaturatedSubtract(capTouchBaseline, capTouchDeltaLow);
+}
+
+void configureCapTouchDigitizer(uint16_t minHighThreshold, uint16_t deltaHigh, uint16_t deltaLow) {
+  capTouchMinHighThreshold = min((uint16_t)ANALOG_VALUE_MASK, minHighThreshold);
+  capTouchDeltaHigh = min((uint16_t)ANALOG_VALUE_MASK, deltaHigh);
+  capTouchDeltaLow = min((uint16_t)ANALOG_VALUE_MASK, deltaLow);
+  if (capTouchDeltaLow > capTouchDeltaHigh) {
+    capTouchDeltaLow = capTouchDeltaHigh;
+  }
+  resetCapTouchDigitizer(getCurrentTimestamp());
 }
 
 void processCapTouchDigitizer() {
@@ -767,7 +781,7 @@ void processCapTouchDigitizer() {
     emitCapTouchDigitizedEvent(1, currentTime);
   } else if (
     capTouchDigitizedState == 0 &&
-    capTouchBaseline > CAP_TOUCH_DELTA_HIGH &&
+    capTouchBaseline > capTouchDeltaHigh &&
     value <= fallingHighThreshold &&
     currentTime - inputChSwitchTime[channelIndex] > refractoryPeriod
   ) {
@@ -1373,6 +1387,17 @@ void executeCompleteUSB1Command() {
 
         analogSampleIntervalUs = max((uint32_t)CYCLE_TIME_MICROS, *interval);
         setAnalogInputEnabled(channel, enabled == 1);
+        PC1.writeByte(1);
+      }
+      break;
+
+    case 't': // Configure cap-touch ADC digitizer thresholds
+      {
+        uint16_t* minHighThreshold = (uint16_t*)&usb1CmdState.buffer[0];
+        uint16_t* deltaHigh = (uint16_t*)&usb1CmdState.buffer[2];
+        uint16_t* deltaLow = (uint16_t*)&usb1CmdState.buffer[4];
+
+        configureCapTouchDigitizer(*minHighThreshold, *deltaHigh, *deltaLow);
         PC1.writeByte(1);
       }
       break;

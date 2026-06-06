@@ -119,6 +119,9 @@ def run_cap_touch_diagnostic(
     *,
     duration_s: float = 15.0,
     poll_hz: float = 10.0,
+    min_high_threshold: int | None = None,
+    delta_high: int | None = None,
+    delta_low: int | None = None,
 ) -> dict[str, Any]:
     """Run a short live StreamDIO-only cap-touch check and return a report."""
     ports = config.ports
@@ -139,6 +142,18 @@ def run_cap_touch_diagnostic(
     module_info: dict[str, Any] = {}
     listen_started_mono_s: float | None = None
     listen_finished_mono_s: float | None = None
+    threshold_status: dict[str, Any] | None = None
+    requested_thresholds = {
+        "min_high_threshold": (
+            config.licks.cap_touch_min_high_threshold
+            if min_high_threshold is None
+            else min_high_threshold
+        ),
+        "delta_high": (
+            config.licks.cap_touch_delta_high if delta_high is None else delta_high
+        ),
+        "delta_low": config.licks.cap_touch_delta_low if delta_low is None else delta_low,
+    }
 
     print(
         "Cap-touch diagnostic: reading input ch14/pin25, powering sensor via "
@@ -156,6 +171,18 @@ def run_cap_touch_diagnostic(
         }
         print(f"StreamDIO firmware: {module_info.get('firmware_version')}")
         client.configure_rotary_and_force(lick_channels=state.lick_channels)
+        threshold_requested = any(value is not None for value in requested_thresholds.values())
+        firmware_version = int(module_info.get("firmware_version", 0))
+        if threshold_requested or firmware_version >= 4:
+            threshold_status = client.configure_cap_touch_digitizer(
+                min_high_threshold=requested_thresholds["min_high_threshold"],
+                delta_high=requested_thresholds["delta_high"],
+                delta_low=requested_thresholds["delta_low"],
+            )
+            print(
+                "Cap-touch threshold config: "
+                f"{json.dumps(threshold_status, sort_keys=True)}"
+            )
         client.start_streaming(callback=state.handle_event)
         outputs = StreamDIOOutputs(
             client,
@@ -208,6 +235,8 @@ def run_cap_touch_diagnostic(
             "module_info": module_info,
             "power_on": power_on,
             "power_off": power_off,
+            "requested_thresholds": requested_thresholds,
+            "threshold_status": threshold_status,
             "detected_touch": report["high_edge_count"] > 0,
         }
     )

@@ -9,6 +9,9 @@ from collections import defaultdict
 from typing import Any, Callable
 
 from hf_dm.hardware.bringup_constants import (
+    CAP_TOUCH_DEFAULT_DELTA_HIGH,
+    CAP_TOUCH_DEFAULT_DELTA_LOW,
+    CAP_TOUCH_DEFAULT_MIN_HIGH_THRESHOLD,
     DEFAULT_CAMERA_EXPOSURE_US,
     DEFAULT_CAMERA_FREQUENCY_HZ,
     DIRECTION_INPUT_CHANNEL,
@@ -19,11 +22,16 @@ from hf_dm.hardware.bringup_constants import (
     LICK_INPUT_CHANNEL,
     PULSE_INPUT_CHANNEL,
     STREAMDIO_ANALOG_INPUT_EVENT_BASE,
+    STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION,
     STREAMDIO_CAP_TOUCH_DIGITIZER_FIRMWARE_VERSION,
     STREAMDIO_DIO_INPUT_EVENT_BASE,
     STREAMDIO_DIO_OUTPUT_EVENT_BASE,
 )
 from hf_dm.hardware.discovery import resolve_streamdio_ports
+
+
+def _uint12(value: int) -> int:
+    return max(0, min(4095, int(value)))
 
 
 class StreamDIOClient:
@@ -317,6 +325,49 @@ class StreamDIOClient:
                 "falling_low_threshold": int(config_arcom.read(1, "uint16", "builtin")),
             }
         return status
+
+    def configure_cap_touch_digitizer(
+        self,
+        *,
+        min_high_threshold: int | None = None,
+        delta_high: int | None = None,
+        delta_low: int | None = None,
+    ) -> dict[str, Any]:
+        """Configure firmware-local cap-touch ADC-to-digital thresholds."""
+        if self._dio is None:
+            raise RuntimeError("StreamDIO not connected")
+        firmware_version = int(self._dio.module_info.get("firmware_version", 0))
+        if firmware_version < STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION:
+            raise RuntimeError(
+                "StreamDIO firmware does not support runtime cap-touch threshold "
+                f"configuration. Found firmware version {firmware_version}; expected "
+                f"{STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION} or newer. Flash "
+                "firmware/Module_DIO_streeaming_100us_cycle before using tuned "
+                "cap-touch thresholds."
+            )
+        config_arcom = getattr(self._dio, "_config_arcom", None)
+        if config_arcom is None:
+            raise RuntimeError("StreamDIO driver does not expose the config ArCOM port")
+        min_high = _uint12(
+            CAP_TOUCH_DEFAULT_MIN_HIGH_THRESHOLD
+            if min_high_threshold is None
+            else min_high_threshold
+        )
+        high_delta = _uint12(
+            CAP_TOUCH_DEFAULT_DELTA_HIGH if delta_high is None else delta_high
+        )
+        low_delta = _uint12(CAP_TOUCH_DEFAULT_DELTA_LOW if delta_low is None else delta_low)
+        if low_delta > high_delta:
+            low_delta = high_delta
+        with self._config_lock:
+            config_arcom.write(ord("t"), "uint8")
+            config_arcom.write(min_high, "uint16")
+            config_arcom.write(high_delta, "uint16")
+            config_arcom.write(low_delta, "uint16")
+            acknowledged = bool(config_arcom.read(1, "uint8", "builtin"))
+        if not acknowledged:
+            raise RuntimeError("StreamDIO rejected cap-touch threshold configuration")
+        return self.get_cap_touch_status()
 
     def stop_streaming(self) -> None:
         if self._dio is not None and getattr(self._dio, "streaming_active", False):

@@ -81,6 +81,9 @@ class LickConfig:
     high_only: bool = True
     power_output_channel: int = CAP_TOUCH_POWER_OUTPUT_CHANNEL
     power_required: bool = True
+    cap_touch_min_high_threshold: int | None = None
+    cap_touch_delta_high: int | None = None
+    cap_touch_delta_low: int | None = None
 
 
 @dataclass
@@ -198,6 +201,12 @@ class SessionConfig:
                 return default
             return tuple(max(0, min(255, int(part))) for part in value)
 
+        def optional_lick_int(name: str) -> int | None:
+            value = lick_raw.get(name)
+            if value in (None, ""):
+                return None
+            return int(value)
+
         return SessionConfig(
             subject_id=str(raw.get("subject_id", "mouse01")),
             phase=phase,
@@ -283,6 +292,11 @@ class SessionConfig:
                     lick_raw.get("power_output_channel", CAP_TOUCH_POWER_OUTPUT_CHANNEL)
                 ),
                 power_required=bool(lick_raw.get("power_required", True)),
+                cap_touch_min_high_threshold=optional_lick_int(
+                    "cap_touch_min_high_threshold"
+                ),
+                cap_touch_delta_high=optional_lick_int("cap_touch_delta_high"),
+                cap_touch_delta_low=optional_lick_int("cap_touch_delta_low"),
             ),
             speaker=SpeakerConfig(
                 sample_interval_us=int(

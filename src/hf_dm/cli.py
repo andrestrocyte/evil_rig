@@ -67,6 +67,24 @@ def main() -> None:
         help="Status polling rate for --cap-touch-diagnostic.",
     )
     parser.add_argument(
+        "--cap-touch-min-high-threshold",
+        type=int,
+        default=None,
+        help="Runtime cap-touch minimum high threshold for --cap-touch-diagnostic.",
+    )
+    parser.add_argument(
+        "--cap-touch-delta-high",
+        type=int,
+        default=None,
+        help="Runtime cap-touch high delta for --cap-touch-diagnostic.",
+    )
+    parser.add_argument(
+        "--cap-touch-delta-low",
+        type=int,
+        default=None,
+        help="Runtime cap-touch release delta for --cap-touch-diagnostic.",
+    )
+    parser.add_argument(
         "--preflight-duration",
         type=float,
         default=2.0,
@@ -129,6 +147,9 @@ def main() -> None:
             config,
             duration_s=args.cap_touch_duration,
             poll_hz=args.cap_touch_poll_hz,
+            min_high_threshold=args.cap_touch_min_high_threshold,
+            delta_high=args.cap_touch_delta_high,
+            delta_low=args.cap_touch_delta_low,
         )
         return
     if args.simulate:
