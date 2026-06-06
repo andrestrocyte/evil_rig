@@ -60,6 +60,8 @@ class HFDecisionSession:
         self._closed = False
         self._last_choice_loop_stats: dict[str, float | int | str | bool] = {}
         self._active_trial_runtime: TrialRuntime | None = None
+        self._cap_touch_poll_stop = threading.Event()
+        self._cap_touch_poll_thread: threading.Thread | None = None
 
     def connect(self) -> None:
         self._closed = False
@@ -142,6 +144,7 @@ class HFDecisionSession:
                 "transition": cap_touch_power,
             },
         )
+        self._start_cap_touch_status_poll()
         self.dio.start_camera_session(
             frequency_hz=self.config.camera.frequency_hz,
             exposure_us=self.config.camera.exposure_us,
@@ -185,6 +188,7 @@ class HFDecisionSession:
                     self._wait_for_bpod_trial_threads()
                 except Exception:
                     logger.exception("Failed to abort active Bpod trial during cleanup")
+            self._stop_cap_touch_status_poll()
             if self.relay is not None:
                 try:
                     result = self.relay.task_outputs_off()
@@ -369,6 +373,73 @@ class HFDecisionSession:
                     "published_counts": published_counts,
                 },
             )
+
+    def _start_cap_touch_status_poll(self) -> None:
+        if self.monitor is None or self.dio is None:
+            return
+        if CAP_TOUCH_INPUT_CHANNEL not in {int(channel) for channel in self.config.licks.channels}:
+            return
+        if self._cap_touch_poll_thread is not None and self._cap_touch_poll_thread.is_alive():
+            return
+
+        max_hz = min(20.0, max(1.0, float(self.config.monitor.force_sample_hz)))
+        interval_s = 1.0 / max_hz
+        self._cap_touch_poll_stop.clear()
+
+        def poll() -> None:
+            while not self._cap_touch_poll_stop.wait(interval_s):
+                if self.dio is None:
+                    return
+                try:
+                    status = self.dio.get_cap_touch_status()
+                except Exception as exc:
+                    logger.warning("Stopping cap-touch status polling: %s", exc)
+                    self._publish_monitor(
+                        "cap_touch_sample",
+                        {
+                            "channel": CAP_TOUCH_INPUT_CHANNEL,
+                            "pin": CAP_TOUCH_INPUT_PIN,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+                    return
+                channel = int(status.get("channel", CAP_TOUCH_INPUT_CHANNEL))
+                self._publish_monitor_throttled(
+                    "cap_touch_status",
+                    max_hz,
+                    "cap_touch_sample",
+                    {
+                        "channel": channel,
+                        "pin": int(status.get("pin", CAP_TOUCH_INPUT_PIN)),
+                        "value": int(status.get("last_value", 0)),
+                        "active": bool(status.get("state", 0)),
+                        "polarity": int(status.get("polarity", 0)),
+                        "baseline": int(status.get("baseline", 0)),
+                        "rising_high_threshold": int(
+                            status.get("rising_high_threshold", 0)
+                        ),
+                        "rising_low_threshold": int(status.get("rising_low_threshold", 0)),
+                        "falling_high_threshold": int(
+                            status.get("falling_high_threshold", 0)
+                        ),
+                        "falling_low_threshold": int(status.get("falling_low_threshold", 0)),
+                        "source": "firmware_digitizer_status",
+                    },
+                )
+
+        self._cap_touch_poll_thread = threading.Thread(
+            target=poll,
+            name="hf-dm-cap-touch-status",
+            daemon=True,
+        )
+        self._cap_touch_poll_thread.start()
+
+    def _stop_cap_touch_status_poll(self) -> None:
+        self._cap_touch_poll_stop.set()
+        thread = self._cap_touch_poll_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        self._cap_touch_poll_thread = None
 
     def _publish_monitor(self, event_type: str, payload: dict | None = None) -> None:
         if self.monitor is not None:

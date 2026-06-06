@@ -70,8 +70,8 @@
 
 // Event code definitions
 #define DIO_INPUT_EVENT_BASE 1
-#define DIO_OUTPUT_EVENT_BASE 25
-#define ANALOG_INPUT_EVENT_BASE 53
+#define DIO_OUTPUT_EVENT_BASE 29
+#define ANALOG_INPUT_EVENT_BASE 55
 #define CAMERA_EVENT 75
 #define BPOD_STATE_EVENT_BASE 100
 #define BPOD_BNC_OUT_EVENT_BASE 400
@@ -117,7 +117,7 @@ char moduleName[] = "DIO_12Ch_Stream";
 const char* eventNames[] = {"1_Hi", "1_Lo", "2_Hi", "2_Lo", "3_Hi", "3_Lo", "4_Hi", "4_Lo", "5_Hi", "5_Lo",
                       "6_Hi", "6_Lo", "7_Hi", "7_Lo", "8_Hi", "8_Lo", "9_Hi", "9_Lo", "10_Hi", "10_Lo",
                       "11_Hi", "11_Lo", "12_Hi", "12_Lo", "13_Hi", "13_Lo", "14_Hi", "14_Lo"};
-const uint32_t FirmwareVersion = 1;
+const uint32_t FirmwareVersion = 3;
 byte nEventNames = (sizeof(eventNames)/sizeof(char *));
 
 // Pin definitions
@@ -125,6 +125,7 @@ byte inputPins[nInputChannels] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 28, 14, 25
 byte outputPins[nOutputChannels] = {23, 22, 21, 20, 19, 18, 17, 16, 41, 40, 39, 38, 15};
 const byte FORCE_ANALOG_CHANNEL = 13;  // Module channel 13 maps to Teensy pin 14 / A0.
 const byte CAP_TOUCH_CHANNEL = 14;     // Module channel 14 maps to Teensy pin 25 / A11.
+const byte CAP_TOUCH_POWER_OUTPUT_CHANNEL = 13; // Output channel 13 maps to Teensy pin 15.
 
 // Special function pins
 const byte CAMERA_PIN = 32;
@@ -170,10 +171,13 @@ uint64_t lastCapTouchSampleTime = 0;
 uint16_t capTouchBaseline = 0;
 uint16_t capTouchLastValue = 0;
 byte capTouchDigitizedState = 0;
+byte capTouchActivePolarity = 0; // 0 = idle, 1 = high-going touch, 2 = low-going touch.
 boolean capTouchBaselineInitialized = false;
+uint64_t capTouchIgnoreUntilTime = 0;
 const uint16_t CAP_TOUCH_MIN_HIGH_THRESHOLD = 700;
 const uint16_t CAP_TOUCH_DELTA_HIGH = 350;
 const uint16_t CAP_TOUCH_DELTA_LOW = 160;
+const uint32_t CAP_TOUCH_POWER_SETTLE_US = 100000;
 
 // Speaker white-noise state
 boolean speakerNoiseEnabled = false;
@@ -658,6 +662,59 @@ void emitCapTouchDigitizedEvent(byte newState, uint64_t timestampUs) {
   lastInputChState[channelIndex] = newState;
 }
 
+void resetCapTouchDigitizer(uint64_t timestampUs) {
+  const byte channelIndex = CAP_TOUCH_CHANNEL - 1;
+  capTouchBaseline = 0;
+  capTouchLastValue = 0;
+  capTouchDigitizedState = 0;
+  capTouchActivePolarity = 0;
+  capTouchBaselineInitialized = false;
+  lastCapTouchSampleTime = 0;
+  capTouchIgnoreUntilTime = timestampUs + CAP_TOUCH_POWER_SETTLE_US;
+  inputChState[channelIndex] = 0;
+  lastInputChState[channelIndex] = 0;
+  inputChSwitchTime[channelIndex] = timestampUs;
+}
+
+uint16_t capTouchSaturatedAdd(uint16_t value, uint16_t delta) {
+  uint32_t result = (uint32_t)value + delta;
+  if (result > ANALOG_VALUE_MASK) {
+    return ANALOG_VALUE_MASK;
+  }
+  return (uint16_t)result;
+}
+
+uint16_t capTouchSaturatedSubtract(uint16_t value, uint16_t delta) {
+  if (value <= delta) {
+    return 0;
+  }
+  return value - delta;
+}
+
+uint16_t capTouchRisingHighThreshold() {
+  uint16_t threshold = capTouchSaturatedAdd(capTouchBaseline, CAP_TOUCH_DELTA_HIGH);
+  if (threshold < CAP_TOUCH_MIN_HIGH_THRESHOLD) {
+    threshold = CAP_TOUCH_MIN_HIGH_THRESHOLD;
+  }
+  return threshold;
+}
+
+uint16_t capTouchRisingLowThreshold(uint16_t highThreshold) {
+  uint16_t threshold = capTouchSaturatedAdd(capTouchBaseline, CAP_TOUCH_DELTA_LOW);
+  if (threshold > highThreshold) {
+    threshold = highThreshold;
+  }
+  return threshold;
+}
+
+uint16_t capTouchFallingHighThreshold() {
+  return capTouchSaturatedSubtract(capTouchBaseline, CAP_TOUCH_DELTA_HIGH);
+}
+
+uint16_t capTouchFallingLowThreshold() {
+  return capTouchSaturatedSubtract(capTouchBaseline, CAP_TOUCH_DELTA_LOW);
+}
+
 void processCapTouchDigitizer() {
   if (!capTouchDigitizerEnabled) {
     return;
@@ -670,6 +727,11 @@ void processCapTouchDigitizer() {
   }
 
   uint64_t currentTime = getCurrentTimestamp();
+  if (currentTime < capTouchIgnoreUntilTime) {
+    lastCapTouchSampleTime = currentTime;
+    return;
+  }
+
   if (currentTime - lastCapTouchSampleTime < capTouchSampleIntervalUs) {
     return;
   }
@@ -690,32 +752,45 @@ void processCapTouchDigitizer() {
     capTouchBaseline = (uint16_t)(((uint32_t)capTouchBaseline * 31 + value) / 32);
   }
 
-  uint16_t highThreshold = capTouchBaseline + CAP_TOUCH_DELTA_HIGH;
-  if (highThreshold < CAP_TOUCH_MIN_HIGH_THRESHOLD) {
-    highThreshold = CAP_TOUCH_MIN_HIGH_THRESHOLD;
-  }
-  if (highThreshold > ANALOG_VALUE_MASK) {
-    highThreshold = ANALOG_VALUE_MASK;
-  }
-
-  uint16_t lowThreshold = capTouchBaseline + CAP_TOUCH_DELTA_LOW;
-  if (lowThreshold > highThreshold) {
-    lowThreshold = highThreshold;
-  }
+  uint16_t risingHighThreshold = capTouchRisingHighThreshold();
+  uint16_t risingLowThreshold = capTouchRisingLowThreshold(risingHighThreshold);
+  uint16_t fallingHighThreshold = capTouchFallingHighThreshold();
+  uint16_t fallingLowThreshold = capTouchFallingLowThreshold();
 
   if (
     capTouchDigitizedState == 0 &&
-    value >= highThreshold &&
+    value >= risingHighThreshold &&
     currentTime - inputChSwitchTime[channelIndex] > refractoryPeriod
   ) {
     capTouchDigitizedState = 1;
+    capTouchActivePolarity = 1;
+    emitCapTouchDigitizedEvent(1, currentTime);
+  } else if (
+    capTouchDigitizedState == 0 &&
+    capTouchBaseline > CAP_TOUCH_DELTA_HIGH &&
+    value <= fallingHighThreshold &&
+    currentTime - inputChSwitchTime[channelIndex] > refractoryPeriod
+  ) {
+    capTouchDigitizedState = 1;
+    capTouchActivePolarity = 2;
     emitCapTouchDigitizedEvent(1, currentTime);
   } else if (
     capTouchDigitizedState == 1 &&
-    value <= lowThreshold &&
+    capTouchActivePolarity == 1 &&
+    value <= risingLowThreshold &&
     currentTime - inputChSwitchTime[channelIndex] > refractoryPeriod
   ) {
     capTouchDigitizedState = 0;
+    capTouchActivePolarity = 0;
+    emitCapTouchDigitizedEvent(0, currentTime);
+  } else if (
+    capTouchDigitizedState == 1 &&
+    capTouchActivePolarity == 2 &&
+    value >= fallingLowThreshold &&
+    currentTime - inputChSwitchTime[channelIndex] > refractoryPeriod
+  ) {
+    capTouchDigitizedState = 0;
+    capTouchActivePolarity = 0;
     emitCapTouchDigitizedEvent(0, currentTime);
   }
 }
@@ -772,6 +847,10 @@ void processOutputs() {
             allOutputStates &= ~(1 << cmd.channel);
           }
 
+          if (cmd.channel == (CAP_TOUCH_POWER_OUTPUT_CHANNEL - 1)) {
+            resetCapTouchDigitizer(currentTime);
+          }
+
           uint16_t eventCode = DIO_OUTPUT_EVENT_BASE + cmd.channel * 2 + cmd.state;
           streamingEventPut(eventCode, currentTime);
         }
@@ -786,11 +865,15 @@ void processOutputs() {
               digitalWriteFast(outputPins[i], newState);
               outputChState[i] = newState;
 
+              if (i == (CAP_TOUCH_POWER_OUTPUT_CHANNEL - 1)) {
+                resetCapTouchDigitizer(currentTime);
+              }
+
               uint16_t eventCode = DIO_OUTPUT_EVENT_BASE + i * 2 + newState;
               streamingEventPut(eventCode, currentTime);
             }
           }
-          allOutputStates = newStates & 0x0FFF;
+          allOutputStates = newStates & 0x1FFF;
         }
         break;
 
@@ -1217,6 +1300,20 @@ void executeImmediateUSB1Command(byte cmd) {
       PC1.writeByte(inputPins[analogInputChannel - 1]);
       PC1.writeUint32(analogSampleIntervalUs);
       PC1.writeUint16(lastAnalogValue);
+      break;
+
+    case 'l': // Get cap-touch ADC digitizer status
+      PC1.writeByte(capTouchDigitizerEnabled ? 1 : 0);
+      PC1.writeByte(CAP_TOUCH_CHANNEL);
+      PC1.writeByte(inputPins[CAP_TOUCH_CHANNEL - 1]);
+      PC1.writeByte(capTouchDigitizedState);
+      PC1.writeByte(capTouchActivePolarity);
+      PC1.writeUint16(capTouchLastValue);
+      PC1.writeUint16(capTouchBaseline);
+      PC1.writeUint16(capTouchRisingHighThreshold());
+      PC1.writeUint16(capTouchRisingLowThreshold(capTouchRisingHighThreshold()));
+      PC1.writeUint16(capTouchFallingHighThreshold());
+      PC1.writeUint16(capTouchFallingLowThreshold());
       break;
 
     case 'k': // Get speaker white-noise status

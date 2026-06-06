@@ -395,6 +395,8 @@ class OperatorMonitorState:
         state["relative_time_s"] = payload.get("relative_time_s")
         if source == "digital":
             state["active"] = bool(payload.get("value"))
+        elif payload.get("active") is not None:
+            state["active"] = bool(payload.get("active"))
         else:
             state["active"] = _optional_float(payload.get("value")) not in (None, 0.0)
 

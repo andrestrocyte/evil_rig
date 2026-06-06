@@ -123,7 +123,9 @@ input channel value so detector transitions are visible even before trial-level 
 Because the firmware can stream only one configured analog input at a time, force remains on analog
 channel 13 and the vendored StreamDIO firmware in `firmware/` digitizes cap-touch pin 25 locally
 into normal channel-14 high/low input events. Flash that firmware if the detector LED changes but no
-lick events appear in the GUI.
+lick events appear in the GUI. With firmware version 3 or newer, the operator monitor also polls the
+firmware digitizer status at low rate so the cap-touch ADC value/baseline is visible without moving
+force off analog channel 13.
 
 ## Run
 
