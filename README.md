@@ -103,6 +103,19 @@ The session writes a frame sequence, `frame_timestamps.csv`, and `recording_summ
 `data/videos/<subject>_<phase>_<timestamp>_spinnaker/`. With `required: true`, the task refuses to
 run if recording cannot start.
 
+### Operator monitor GUI
+
+The official configs enable a separate lightweight monitor on the computer/main screen
+(`monitor.display_index: 0`), while the task stimulus remains on the behavior display
+(`display.display_index: 1`). The monitor runs in its own process and receives only nonblocking,
+drop-safe telemetry, so closing or slowing the GUI does not stall the Bpod/StreamDIO task loop.
+
+It shows a low-rate camera preview, a compact left-rotated task screen copy, the active Bpod FSM
+state, latest star/circle/timeout outcomes, lick-edge/pump/noise event rails, a live force-effort
+ADC trace with a session-held y-axis maximum, and the wheel trace reset every trial.
+Use `--no-monitor` for command-line checks, or `--monitor` to force it on when a YAML file has it
+disabled. `--simulate-headless` disables the monitor automatically.
+
 ## Run
 
 ```bash
@@ -119,6 +132,9 @@ python -m hf_dm.cli --config configs/centering_50.yaml
 python -m hf_dm.cli --config configs/dm_50.yaml
 python -m hf_dm.cli --config configs/dm_100.yaml
 python -m hf_dm.cli --config configs/dm_200.yaml
+
+# Same tasks without the operator GUI
+python -m hf_dm.cli --config configs/dm_50.yaml --no-monitor
 ```
 
 Outputs: `data/sessions/<subject>_<phase>_<timestamp>.npz` and `.json`.

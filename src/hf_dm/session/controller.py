@@ -24,8 +24,10 @@ from hf_dm.fsm.runtime import Side, Shape, TrialRuntime
 from hf_dm.hardware.bringup_constants import (
     CCW_FORCE_OUTPUT_CHANNEL,
     CW_FORCE_OUTPUT_CHANNEL,
+    FORCE_ANALOG_CHANNEL,
     PUMP_OUTPUT_CHANNEL,
 )
+from hf_dm.monitor import OperatorMonitor
 from hf_dm.streamdio.client import StreamDIOClient
 from hf_dm.streamdio.outputs import StreamDIOOutputs
 from hf_dm.streamdio.wheel import Direction, WheelAccumulator
@@ -46,6 +48,7 @@ class HFDecisionSession:
         self.display: TaskDisplay | None = None
         self.recorder: SessionRecorder | None = None
         self.camera_recorder: HeadlessSpinnakerRecorder | None = None
+        self.monitor: OperatorMonitor | None = None
         self._last_wheel_movement_mono = time.perf_counter()
         self._consecutive_failures = 0
         self._lick_lock = threading.Lock()
@@ -72,6 +75,7 @@ class HFDecisionSession:
         self.display = TaskDisplay(self.config.display)
         out = Path(self.config.results_dir)
         self.recorder = SessionRecorder(out, self.config.subject_id, self.config.phase.value)
+        self._start_operator_monitor()
         self._start_optional_video_recording()
         self.dio.start_streaming(callback=self._handle_streamdio_event)
         self.recorder.log_event("streamdio_streaming_started", {})
@@ -151,7 +155,7 @@ class HFDecisionSession:
             },
         )
 
-    def close(self) -> None:
+    def close(self, *, stop_monitor: bool = True) -> None:
         if self._closed:
             return
         cleanup_result: dict = {}
@@ -239,6 +243,8 @@ class HFDecisionSession:
                             {"error": f"{type(exc).__name__}: {exc}"},
                         )
         finally:
+            if stop_monitor:
+                self._stop_operator_monitor()
             self._closed = True
 
     def _bpod_serial_ports(self) -> set[str]:
@@ -250,6 +256,249 @@ class HFDecisionSession:
             if port:
                 ports.add(str(port))
         return ports
+
+    def _start_operator_monitor(self) -> None:
+        if not self.config.monitor.enabled:
+            return
+        self.monitor = OperatorMonitor(self.config.monitor)
+        self.monitor.start()
+        self._publish_monitor(
+            "session_info",
+            {
+                "subject_id": self.config.subject_id,
+                "phase": self.config.phase.value,
+                "n_trials": self.config.n_trials,
+                "display_index": self.config.display.display_index,
+                "camera_hz": self.config.camera.frequency_hz,
+                "camera_backend": self.config.camera.backend,
+                "force_channel": self.config.wheel.force_channel,
+                "lick_channels": list(self.config.licks.channels),
+                "lick_high_only": self.config.licks.high_only,
+            },
+        )
+        self._publish_monitor(
+            "fsm_states",
+            {
+                "controller": "host_supervised_decision",
+                "states": self._fsm_monitor_states(),
+            },
+        )
+        if self.display is not None:
+            self.display.fill_black()
+            self._publish_monitor("task_state", {"phase": "idle"})
+            self._publish_task_screen(force=True)
+        if self.recorder is not None:
+            self.recorder.log_event(
+                "operator_monitor_started",
+                {
+                    "enabled": True,
+                    "display_index": self.config.monitor.display_index,
+                    "size": [self.config.monitor.width, self.config.monitor.height],
+                },
+            )
+
+    def _stop_operator_monitor(self, summary: SessionSummary | None = None) -> None:
+        monitor = self.monitor
+        if monitor is None:
+            return
+        published_counts = monitor.published_counts
+        if summary is not None:
+            self._publish_monitor(
+                "session_summary",
+                {
+                    "end_reason": summary.end_reason,
+                    "n_trials_completed": summary.n_trials_completed,
+                    "n_trials_planned": summary.n_trials_planned,
+                },
+            )
+        dropped = monitor.dropped_messages
+        dropped_frames = monitor.dropped_frames
+        monitor.stop()
+        self.monitor = None
+        if self.recorder is not None:
+            self.recorder.log_event(
+                "operator_monitor_stopped",
+                {
+                    "dropped_messages": int(dropped),
+                    "dropped_frames": int(dropped_frames),
+                    "published_counts": published_counts,
+                },
+            )
+
+    def _publish_monitor(self, event_type: str, payload: dict | None = None) -> None:
+        if self.monitor is not None:
+            self.monitor.publish(event_type, payload or {})
+
+    def _publish_monitor_throttled(
+        self,
+        key: str,
+        max_hz: float,
+        event_type: str,
+        payload: dict | None = None,
+    ) -> None:
+        if self.monitor is not None:
+            self.monitor.publish_throttled(key, max_hz, event_type, payload or {})
+
+    def _fsm_monitor_states(self) -> list[dict]:
+        timing = self.config.timing
+        reward = self.config.reward
+        return [
+            {
+                "name": "Quiescence",
+                "duration_s": timing.quiescence_s,
+                "logic": "Tup -> ChoiceWindow; wheel motion -> QuiescenceReset",
+            },
+            {
+                "name": "QuiescenceReset",
+                "duration_s": 0.001,
+                "logic": "Tup -> Quiescence",
+            },
+            {
+                "name": "ChoiceWindow",
+                "duration_s": timing.choice_timeout_s,
+                "logic": "high choice -> ChoiceBlankHigh; low choice -> ChoiceBlankLow; Tup -> TimeoutNoise",
+            },
+            {
+                "name": "ChoiceBlankHigh",
+                "duration_s": timing.choice_blank_s,
+                "logic": "Tup -> RewardHigh",
+            },
+            {
+                "name": "ChoiceBlankLow",
+                "duration_s": timing.choice_blank_s,
+                "logic": "Tup -> RewardLow",
+            },
+            {
+                "name": "RewardHigh",
+                "duration_s": reward.matched_pump_s,
+                "logic": "pump ON; Tup -> PostRewardHigh",
+            },
+            {
+                "name": "RewardLow",
+                "duration_s": reward.opposite_pump_s,
+                "logic": "pump ON; Tup -> PostRewardLow",
+            },
+            {
+                "name": "PostRewardHigh",
+                "duration_s": timing.post_reward_s,
+                "logic": "pump OFF; Tup -> exit",
+            },
+            {
+                "name": "PostRewardLow",
+                "duration_s": timing.post_reward_s,
+                "logic": "pump OFF; Tup -> exit",
+            },
+            {
+                "name": "TimeoutNoise",
+                "duration_s": timing.timeout_noise_s,
+                "logic": "force OFF + white noise ON; Tup -> PostTimeout",
+            },
+            {
+                "name": "PostTimeout",
+                "duration_s": timing.post_timeout_s,
+                "logic": "white noise OFF; Tup -> exit",
+            },
+            {
+                "name": "Abort",
+                "duration_s": 0.001,
+                "logic": "all task outputs OFF; Tup -> exit",
+            },
+        ]
+
+    def _publish_fsm_state(
+        self,
+        state_name: str,
+        *,
+        runtime: TrialRuntime | None = None,
+        phase: str | None = None,
+    ) -> None:
+        payload: dict = {"active_state": state_name}
+        if phase is not None:
+            payload["phase"] = phase
+        if runtime is not None:
+            payload.update(
+                {
+                    "trial_index": runtime.trial_index,
+                    "force_direction": runtime.force_direction,
+                    "star_side": runtime.star_side,
+                    "circle_side": runtime.circle_side,
+                    "chosen_shape": runtime.chosen_shape,
+                    "choice_side": runtime.choice_side,
+                }
+            )
+        self._publish_monitor("fsm_state", payload)
+
+    def _publish_task_screen(self, *, force: bool = False) -> None:
+        if self.monitor is None or self.display is None:
+            return
+        monitor_cfg = self.config.monitor
+        frame = self.display.preview_frame(
+            monitor_cfg.task_preview_width,
+            monitor_cfg.task_preview_height,
+            rotate_left=monitor_cfg.task_preview_rotate_left,
+        )
+        if frame is not None:
+            if force:
+                self.monitor.publish("task_frame", frame)
+            else:
+                self.monitor.publish_throttled(
+                    "task_screen",
+                    monitor_cfg.screen_fps,
+                    "task_frame",
+                    frame,
+                )
+
+    def _publish_wheel_snapshot(self, *, phase: str, trial_index: int | None = None) -> None:
+        snap = self.wheel.snapshot()
+        if snap["force_last"] is not None:
+            self._publish_monitor_throttled(
+                "force",
+                self.config.monitor.force_sample_hz,
+                "force_sample",
+                {
+                    "value": float(snap["force_last"]),
+                    "source": "wheel_snapshot",
+                },
+            )
+        self._publish_monitor_throttled(
+            "wheel",
+            self.config.monitor.wheel_sample_hz,
+            "wheel_sample",
+            {
+                "trial_index": trial_index,
+                "phase": phase,
+                "position_deg": int(snap["net_pulses"]) * self.config.wheel.deg_per_pulse,
+                "net_pulses": int(snap["net_pulses"]),
+                "cw_pulses": int(snap["cw_pulses"]),
+                "ccw_pulses": int(snap["ccw_pulses"]),
+                "force_last": snap["force_last"],
+            },
+        )
+
+    def _handle_camera_preview(self, frame: dict) -> None:
+        self._publish_monitor("camera_frame", frame)
+
+    def _add_trial_record(self, trial: TrialRecord) -> None:
+        assert self.recorder is not None
+        self.recorder.add_trial(trial)
+        self._publish_monitor(
+            "trial_result",
+            {
+                "trial_index": trial.trial_index,
+                "phase": trial.phase,
+                "choice": trial.choice,
+                "choice_side": trial.choice_side,
+                "chosen_shape": trial.chosen_shape,
+                "matched": trial.matched,
+                "responded": trial.responded,
+                "reward_duration_s": trial.reward_duration_s,
+                "response_time_s": trial.response_time_s,
+                "final_position_deg": trial.final_position_deg,
+                "star_side": trial.star_side,
+                "circle_side": trial.circle_side,
+                "lick_count": trial.lick_count,
+            },
+        )
 
     def _handle_streamdio_event(
         self,
@@ -286,6 +535,14 @@ class HFDecisionSession:
                     "relative_time_s": float(relative_time),
                 },
             )
+        if event_type == "camera":
+            self._publish_monitor(
+                "camera_ttl",
+                {
+                    "timestamp_us": int(timestamp_us),
+                    "relative_time_s": float(relative_time),
+                },
+            )
         self.wheel.handle_event(
             event_type,
             normalized_channel,
@@ -293,13 +550,40 @@ class HFDecisionSession:
             timestamp_us,
             relative_time,
         )
+        if event_type == "analog_input" and normalized_channel == FORCE_ANALOG_CHANNEL:
+            self._publish_monitor_throttled(
+                "force",
+                self.config.monitor.force_sample_hz,
+                "force_sample",
+                {
+                    "value": float(normalized_value),
+                    "timestamp_us": int(timestamp_us),
+                    "relative_time_s": float(relative_time),
+                },
+            )
+            return
+        if (
+            event_type == "dio_input"
+            and normalized_channel
+            in (self.config.wheel.pulse_channel, self.config.wheel.direction_channel)
+        ):
+            self._publish_wheel_snapshot(phase="stream")
+        if event_type == "dio_output" and normalized_channel == PUMP_OUTPUT_CHANNEL:
+            self._publish_monitor(
+                "pump",
+                {
+                    "active": bool(normalized_value),
+                    "state": normalized_value,
+                    "timestamp_us": int(timestamp_us),
+                    "relative_time_s": float(relative_time),
+                },
+            )
         if event_type != "dio_input":
             return
         if normalized_channel not in self.config.licks.channels:
             return
-        if self.config.licks.high_only and not normalized_value:
-            return
-        lick_event = {
+        counted = not self.config.licks.high_only or bool(normalized_value)
+        base_event = {
             "channel": normalized_channel,
             "value": normalized_value,
             "timestamp_us": int(timestamp_us),
@@ -307,8 +591,18 @@ class HFDecisionSession:
             "wall_time_s": time.time(),
             "monotonic_s": time.perf_counter(),
         }
+        edge_event = {**base_event, "counted": counted}
+        self._publish_monitor("lick_edge", edge_event)
+        if self.recorder is not None:
+            self.recorder.log_event("lick_edge", edge_event)
+        if not counted:
+            return
+        lick_event = {
+            **base_event,
+        }
         with self._lick_lock:
             self._lick_events.append(lick_event)
+        self._publish_monitor("lick", lick_event)
         if self.recorder is not None:
             self.recorder.log_event("lick", lick_event)
 
@@ -329,9 +623,17 @@ class HFDecisionSession:
         started = time.perf_counter()
         self.speaker_relay.speaker_gate(True)
         on_done = time.perf_counter()
+        self._publish_monitor(
+            "white_noise",
+            {"active": True, "duration_s": float(duration_s), "source": "host_pulse"},
+        )
         wait_until_perf_counter(on_done + max(0.0, float(duration_s)))
         self.speaker_relay.speaker_gate(False)
         off_done = time.perf_counter()
+        self._publish_monitor(
+            "white_noise",
+            {"active": False, "duration_s": float(duration_s), "source": "host_pulse"},
+        )
         return {
             "source": "pc_soundcard_continuous_bpod_pin27_gate",
             "command_start_mono_s": started,
@@ -369,6 +671,14 @@ class HFDecisionSession:
                 gain_db=camera_cfg.gain_db,
                 gamma=camera_cfg.gamma,
                 acquisition_timeout_ms=camera_cfg.acquisition_timeout_ms,
+                preview_callback=(
+                    self._handle_camera_preview if self.monitor is not None else None
+                ),
+                preview_max_width=self.config.monitor.camera_preview_width,
+                preview_max_height=self.config.monitor.camera_preview_height,
+                preview_min_interval_s=(
+                    1.0 / max(1.0, float(self.config.monitor.camera_fps))
+                ),
             )
             session_dir = recorder.start()
             self.camera_recorder = recorder
@@ -449,7 +759,7 @@ class HFDecisionSession:
             )
             raise
         finally:
-            self.close()
+            self.close(stop_monitor=False)
             if self.display is not None:
                 self.display.close()
             summary = SessionSummary(
@@ -463,6 +773,7 @@ class HFDecisionSession:
                 session_end_wall_s=time.time(),
                 engagement_idle_triggered=end_reason == "idle_timeout",
             )
+            self._stop_operator_monitor(summary)
             path = self.recorder.finalize(summary)
             logger.info("Session data saved to %s", path)
         return summary
@@ -532,7 +843,7 @@ class HFDecisionSession:
             )
             raise
         finally:
-            self.close()
+            self.close(stop_monitor=False)
             if self.display is not None:
                 self.display.close()
             summary = SessionSummary(
@@ -546,6 +857,7 @@ class HFDecisionSession:
                 session_end_wall_s=time.time(),
                 engagement_idle_triggered=False,
             )
+            self._stop_operator_monitor(summary)
             path = self.recorder.finalize(summary)
             logger.info("Preflight data saved to %s", path)
         return summary
@@ -659,6 +971,7 @@ class HFDecisionSession:
 
         try:
             if softcode == sc.STATE_QUIESCENCE:
+                self._publish_fsm_state("Quiescence", runtime=runtime, phase="quiescence")
                 runtime.enter("quiescence", softcode=softcode)
                 return
 
@@ -677,6 +990,7 @@ class HFDecisionSession:
                     },
                 )
                 self._on_choice_window_started(runtime)
+                self._publish_fsm_state("ChoiceWindow", runtime=runtime, phase="choice")
                 runtime.enter("choice", softcode=softcode, output_result=transition)
                 return
 
@@ -693,6 +1007,14 @@ class HFDecisionSession:
                         "trigger": "bpod_state_entry",
                     },
                 )
+                blank_state = (
+                    "ChoiceBlankHigh"
+                    if runtime.chosen_shape == "star"
+                    else "ChoiceBlankLow"
+                    if runtime.chosen_shape == "circle"
+                    else "ChoiceBlank"
+                )
+                self._publish_fsm_state(blank_state, runtime=runtime, phase="blank")
                 runtime.enter("blank", softcode=softcode, output_result=transition)
                 return
 
@@ -718,6 +1040,20 @@ class HFDecisionSession:
                         "trigger": "bpod_state_entry",
                     },
                 )
+                self._publish_monitor(
+                    "pump",
+                    {
+                        "active": True,
+                        "trial_index": runtime.trial_index,
+                        "duration_s": reward_s,
+                        "source": "bpod_state_entry",
+                    },
+                )
+                self._publish_fsm_state(
+                    "RewardHigh" if runtime.chosen_shape == "star" else "RewardLow",
+                    runtime=runtime,
+                    phase="reward",
+                )
                 runtime.enter("reward", softcode=softcode, output_result=transition)
                 return
 
@@ -738,6 +1074,19 @@ class HFDecisionSession:
                         "actual_open_s": actual_open,
                         "trigger": "bpod_state_entry",
                     },
+                )
+                self._publish_monitor(
+                    "pump",
+                    {
+                        "active": False,
+                        "trial_index": runtime.trial_index,
+                        "source": "bpod_state_entry",
+                    },
+                )
+                self._publish_fsm_state(
+                    "PostRewardHigh" if runtime.chosen_shape == "star" else "PostRewardLow",
+                    runtime=runtime,
+                    phase="post_reward",
                 )
                 runtime.enter("post_reward", softcode=softcode, output_result=transition)
                 return
@@ -764,6 +1113,15 @@ class HFDecisionSession:
                         "trigger": "bpod_state_entry",
                     },
                 )
+                self._publish_monitor(
+                    "white_noise",
+                    {
+                        "active": True,
+                        "trial_index": runtime.trial_index,
+                        "duration_s": self.config.timing.timeout_noise_s,
+                    },
+                )
+                self._publish_fsm_state("TimeoutNoise", runtime=runtime, phase="timeout")
                 runtime.enter("timeout", softcode=softcode, output_result=transition)
                 return
 
@@ -777,11 +1135,21 @@ class HFDecisionSession:
                         "trigger": "bpod_state_entry",
                     },
                 )
+                self._publish_monitor(
+                    "white_noise",
+                    {
+                        "active": False,
+                        "trial_index": runtime.trial_index,
+                        "duration_s": self.config.timing.timeout_noise_s,
+                    },
+                )
+                self._publish_fsm_state("PostTimeout", runtime=runtime, phase="post_timeout")
                 runtime.enter("post_timeout", softcode=softcode)
                 return
 
             if softcode == sc.STATE_ABORT:
                 result = self.relay.task_outputs_off()
+                self._publish_fsm_state("Abort", runtime=runtime, phase="abort")
                 runtime.enter("abort", softcode=softcode, output_result=result)
                 return
 
@@ -888,11 +1256,22 @@ class HFDecisionSession:
                     edges = int(wheel_snap["cw_pulses"]) + int(wheel_snap["ccw_pulses"])
                     if edges != last_quiescence_edges:
                         self.bpod.send_softcode(sc.QUIESCENCE_MOVEMENT)
+                        self._publish_fsm_state(
+                            "QuiescenceReset",
+                            runtime=runtime,
+                            phase="quiescence_reset",
+                        )
                         last_quiescence_edges = edges
                     if last_phase != phase:
                         self.display.fill_black()
+                        self._publish_monitor(
+                            "task_state",
+                            {"trial_index": trial_index, "phase": phase},
+                        )
+                        self._publish_task_screen()
                     else:
                         self.display.pump_events()
+                    self._publish_wheel_snapshot(phase=phase, trial_index=trial_index)
 
                 elif phase == "choice":
                     frame_mono_s = time.perf_counter()
@@ -928,6 +1307,23 @@ class HFDecisionSession:
                         force_direction=force_direction,
                         trial_index=trial_index,
                     )
+                    self._publish_monitor_throttled(
+                        "task_state",
+                        min(30.0, float(self.config.display.fps)),
+                        "task_state",
+                        {
+                            "trial_index": trial_index,
+                            "phase": phase,
+                            "star_side": star_side,
+                            "circle_side": circle_side,
+                            "force_direction": force_direction,
+                            "left_position_deg": final_left_deg,
+                            "right_position_deg": final_right_deg,
+                            "net_position_deg": net_position_deg,
+                        },
+                    )
+                    self._publish_wheel_snapshot(phase=phase, trial_index=trial_index)
+                    self._publish_task_screen()
                     if not stimulus_visible:
                         stimulus_visible = True
                         self.recorder.log_event(
@@ -987,6 +1383,19 @@ class HFDecisionSession:
                                     ),
                                 },
                             )
+                            self._publish_monitor(
+                                "task_state",
+                                {
+                                    "trial_index": trial_index,
+                                    "phase": "choice_detected",
+                                    "choice": wheel_choice,
+                                    "choice_side": selected_side,
+                                    "chosen_shape": chosen_shape,
+                                    "matched": chosen_shape == "star",
+                                    "response_time_s": response_time_s,
+                                    "reward_duration_s": reward_s,
+                                },
+                            )
                             self.bpod.send_softcode(
                                 sc.CHOICE_HIGH if chosen_shape == "star" else sc.CHOICE_LOW
                             )
@@ -995,6 +1404,11 @@ class HFDecisionSession:
                     if stimulus_visible:
                         blank_flip_mono_s = self.display.fill_black()
                         stimulus_visible = False
+                        self._publish_monitor(
+                            "task_state",
+                            {"trial_index": trial_index, "phase": phase},
+                        )
+                        self._publish_task_screen()
                         self.recorder.log_event(
                             "stimulus_off",
                             {
@@ -1005,6 +1419,11 @@ class HFDecisionSession:
                         )
                     else:
                         self.display.pump_events()
+                        if last_phase != phase:
+                            self._publish_monitor(
+                                "trial_phase",
+                                {"trial_index": trial_index, "phase": phase},
+                            )
                     if phase == "timeout" and not timeout_logged:
                         timeout_logged = True
                         self.recorder.log_event(
@@ -1224,6 +1643,15 @@ class HFDecisionSession:
                         "actual_on_mono_s": pump_actual_on_mono_s,
                     },
                 )
+                self._publish_monitor(
+                    "pump",
+                    {
+                        "active": True,
+                        "trial_index": trial_index,
+                        "duration_s": reward_s,
+                        "source": "host_choice_epoch",
+                    },
+                )
                 feedback_flip_mono_s = self.display.draw_trial(
                     force_direction,
                     final_pos_deg,
@@ -1240,6 +1668,7 @@ class HFDecisionSession:
                         "display_flip_mono_s": feedback_flip_mono_s,
                     },
                 )
+                self._publish_task_screen()
                 wait_until_perf_counter(pump_actual_on_mono_s + reward_s)
                 pump_off_cmd_start_mono_s = time.perf_counter()
                 pump_off_transition = self.relay.pump_off()
@@ -1258,6 +1687,14 @@ class HFDecisionSession:
                         "transition": pump_off_transition,
                         "actual_off_mono_s": pump_actual_off_mono_s,
                         "actual_open_s": pump_actual_off_mono_s - pump_actual_on_mono_s,
+                    },
+                )
+                self._publish_monitor(
+                    "pump",
+                    {
+                        "active": False,
+                        "trial_index": trial_index,
+                        "source": "host_choice_epoch",
                     },
                 )
                 self._set_choice_loop_stats(
@@ -1375,6 +1812,14 @@ class HFDecisionSession:
         camera_start_idx = len(self.dio.get_camera_events())
         lick_start_idx = self._lick_event_count()
         self.recorder.log_event("trial_start", {"trial_index": trial_index, "force_direction": force_direction})
+        self._publish_monitor(
+            "trial_start",
+            {
+                "trial_index": trial_index,
+                "phase": self.config.phase.value,
+                "force_direction": force_direction,
+            },
+        )
 
         self._pre_trial_black()
         self._wait_quiescence()
@@ -1412,7 +1857,7 @@ class HFDecisionSession:
         snap = self.wheel.snapshot()
         cam_events = self.dio.get_camera_events()[camera_start_idx:]
         lick_events = self._lick_events_since(lick_start_idx)
-        self.recorder.add_trial(
+        self._add_trial_record(
             TrialRecord(
                 trial_index=trial_index,
                 phase=self.config.phase.value,
@@ -1467,13 +1912,23 @@ class HFDecisionSession:
                 "trial_controller": "bpod_core_fsm",
             },
         )
+        self._publish_monitor(
+            "trial_start",
+            {
+                "trial_index": trial_index,
+                "phase": self.config.phase.value,
+                "star_side": star_side,
+                "circle_side": circle_side,
+                "force_direction": force_direction,
+            },
+        )
 
         result = self._run_bpod_decision_epoch(star_side=star_side, trial_index=trial_index)
         loop_stats = dict(self._last_choice_loop_stats)
         snap = self.wheel.snapshot()
         cam_events = self.dio.get_camera_events()[camera_start_idx:]
         lick_events = self._lick_events_since(lick_start_idx)
-        self.recorder.add_trial(
+        self._add_trial_record(
             TrialRecord(
                 trial_index=trial_index,
                 phase=self.config.phase.value,
@@ -1545,6 +2000,14 @@ class HFDecisionSession:
                 "threshold_deg": self.config.centering_threshold_deg,
             },
         )
+        self._publish_monitor(
+            "trial_start",
+            {
+                "trial_index": trial_index,
+                "phase": self.config.phase.value,
+                "force_direction": movement_direction,
+            },
+        )
         self._pre_trial_black()
         self._wait_quiescence()
 
@@ -1557,6 +2020,16 @@ class HFDecisionSession:
             start_position_deg,
             trial_index=trial_index,
         )
+        self._publish_monitor(
+            "task_state",
+            {
+                "trial_index": trial_index,
+                "phase": "centering",
+                "force_direction": movement_direction,
+                "position_deg": start_position_deg,
+            },
+        )
+        self._publish_task_screen()
         self.recorder.log_event(
             "stimulus_on",
             {
@@ -1584,6 +2057,19 @@ class HFDecisionSession:
                 position_deg,
                 trial_index=trial_index,
             )
+            self._publish_monitor_throttled(
+                "task_state",
+                min(30.0, float(self.config.display.fps)),
+                "task_state",
+                {
+                    "trial_index": trial_index,
+                    "phase": "centering",
+                    "force_direction": movement_direction,
+                    "position_deg": position_deg,
+                },
+            )
+            self._publish_wheel_snapshot(phase="centering", trial_index=trial_index)
+            self._publish_task_screen()
             if abs(position_deg) <= threshold:
                 centered = True
                 break
@@ -1612,6 +2098,15 @@ class HFDecisionSession:
                     "actual_on_mono_s": pump_actual_on_mono_s,
                 },
             )
+            self._publish_monitor(
+                "pump",
+                {
+                    "active": True,
+                    "trial_index": trial_index,
+                    "duration_s": reward_s,
+                    "source": "centering",
+                },
+            )
             feedback_flip_mono_s = self.display.draw_centering(
                 movement_direction,
                 position_deg,
@@ -1628,6 +2123,7 @@ class HFDecisionSession:
                     "display_flip_mono_s": feedback_flip_mono_s,
                 },
             )
+            self._publish_task_screen()
             wait_until_perf_counter(pump_actual_on_mono_s + reward_s)
             pump_off_command_start_mono_s = time.perf_counter()
             pump_off_transition = self.relay.pump_off()
@@ -1644,6 +2140,14 @@ class HFDecisionSession:
                     "actual_off_mono_s": pump_actual_off_mono_s,
                     "actual_open_s": pump_actual_off_mono_s - pump_actual_on_mono_s,
                     "command_end_mono_s": time.perf_counter(),
+                },
+            )
+            self._publish_monitor(
+                "pump",
+                {
+                    "active": False,
+                    "trial_index": trial_index,
+                    "source": "centering",
                 },
             )
             outcome = "centered"
@@ -1664,6 +2168,7 @@ class HFDecisionSession:
                     "display_flip_mono_s": feedback_flip_mono_s,
                 },
             )
+            self._publish_task_screen()
             self.recorder.log_event(
                 "white_noise_start",
                 {
@@ -1698,7 +2203,7 @@ class HFDecisionSession:
         snap = self.wheel.snapshot()
         cam_events = self.dio.get_camera_events()[camera_start_idx:]
         lick_events = self._lick_events_since(lick_start_idx)
-        self.recorder.add_trial(
+        self._add_trial_record(
             TrialRecord(
                 trial_index=trial_index,
                 phase="centering",

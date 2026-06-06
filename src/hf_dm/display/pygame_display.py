@@ -141,6 +141,39 @@ class TaskDisplay:
         pygame.display.flip()
         return time.perf_counter()
 
+    def preview_frame(
+        self,
+        max_width: int,
+        max_height: int,
+        *,
+        rotate_left: bool = False,
+    ) -> dict | None:
+        """Return a small RGB copy of the current task window for the operator GUI."""
+        max_width = int(max_width)
+        max_height = int(max_height)
+        if max_width <= 0 or max_height <= 0:
+            return None
+        surface = self.screen.copy()
+        if rotate_left:
+            surface = pygame.transform.rotate(surface, 90)
+        src_width, src_height = surface.get_size()
+        if src_width <= 0 or src_height <= 0:
+            return None
+        scale = min(max_width / float(src_width), max_height / float(src_height), 1.0)
+        dst_width = max(1, int(round(src_width * scale)))
+        dst_height = max(1, int(round(src_height * scale)))
+        if dst_width != src_width or dst_height != src_height:
+            surface = pygame.transform.smoothscale(surface, (dst_width, dst_height))
+        return {
+            "width": dst_width,
+            "height": dst_height,
+            "channels": 3,
+            "format": "RGB",
+            "data": pygame.image.tostring(surface, "RGB"),
+            "monotonic_s": time.perf_counter(),
+            "rotation_deg": 90 if rotate_left else 0,
+        }
+
     def pump_events(self) -> None:
         self._pump_quit()
 

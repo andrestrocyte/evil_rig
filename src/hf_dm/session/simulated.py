@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Callable, Literal
 
 from hf_dm.config import SessionConfig
 from hf_dm.data.recorder import SessionRecorder
@@ -247,25 +249,84 @@ class SimulatedDIO:
 
 
 class SimulatedVideoRecorder:
-    def __init__(self, save_dir: Path, subject_id: str, phase: str) -> None:
+    def __init__(
+        self,
+        save_dir: Path,
+        subject_id: str,
+        phase: str,
+        *,
+        preview_callback: Callable[[dict[str, Any]], None] | None = None,
+        preview_width: int = 320,
+        preview_height: int = 240,
+        fps: int = 10,
+    ) -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.session_dir = Path(save_dir) / f"{subject_id}_{phase}_{stamp}_spinnaker_sim"
         self._start_wall_s = time.time()
+        self._preview_callback = preview_callback
+        self._preview_width = max(64, int(preview_width))
+        self._preview_height = max(48, int(preview_height))
+        self._fps = max(1, int(fps))
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._frames = 0
 
     def start(self) -> Path:
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        if self._preview_callback is not None:
+            self._running = True
+            self._thread = threading.Thread(
+                target=self._preview_loop,
+                name="spinnaker-sim-preview",
+                daemon=True,
+            )
+            self._thread.start()
         return self.session_dir
 
     def stop(self) -> dict:
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
         return {
             "backend": "spinnaker_sim",
             "session_dir": str(self.session_dir),
             "frames_saved": 0,
+            "preview_frames": self._frames,
             "start_wall_s": self._start_wall_s,
             "stop_wall_s": time.time(),
             "capture_error": None,
             "cleanup_error": None,
         }
+
+    def _preview_loop(self) -> None:
+        period_s = 1.0 / float(self._fps)
+        while self._running:
+            frame_index = self._frames
+            data = bytearray(self._preview_width * self._preview_height)
+            for y in range(self._preview_height):
+                base = y * self._preview_width
+                band = int(55 + 45 * math.sin((frame_index * 0.11) + y * 0.045))
+                for x in range(self._preview_width):
+                    data[base + x] = max(
+                        0,
+                        min(255, band + ((x + frame_index * 3) % 90)),
+                    )
+            now = time.perf_counter()
+            self._preview_callback(
+                {
+                    "frame_index": frame_index,
+                    "camera_timestamp_ns": int(now * 1_000_000_000),
+                    "width": self._preview_width,
+                    "height": self._preview_height,
+                    "channels": 1,
+                    "format": "L",
+                    "data": bytes(data),
+                    "monotonic_s": now,
+                    "backend": "spinnaker_sim",
+                }
+            )
+            self._frames += 1
+            time.sleep(period_s)
 
 
 class SimulatedHFDecisionSession(HFDecisionSession):
@@ -291,11 +352,18 @@ class SimulatedHFDecisionSession(HFDecisionSession):
             self.config.subject_id,
             self.config.phase.value,
         )
+        self._start_operator_monitor()
         if self.config.camera.record_video:
             video = SimulatedVideoRecorder(
                 Path(self.config.camera.save_dir),
                 self.config.subject_id,
                 self.config.phase.value,
+                preview_callback=(
+                    self._handle_camera_preview if self.monitor is not None else None
+                ),
+                preview_width=self.config.monitor.camera_preview_width,
+                preview_height=self.config.monitor.camera_preview_height,
+                fps=int(max(1.0, float(self.config.monitor.camera_fps))),
             )
             session_dir = video.start()
             self.camera_recorder = video

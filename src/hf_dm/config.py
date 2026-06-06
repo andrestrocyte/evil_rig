@@ -115,6 +115,29 @@ class CameraConfig:
 
 
 @dataclass
+class MonitorConfig:
+    enabled: bool = False
+    display_index: int | None = 0
+    window_x: int | None = None
+    window_y: int | None = None
+    width: int = 1500
+    height: int = 940
+    fps: int = 30
+    history_s: float = 20.0
+    trial_history: int = 12
+    queue_size: int = 512
+    force_sample_hz: float = 80.0
+    wheel_sample_hz: float = 60.0
+    screen_fps: float = 12.0
+    camera_fps: float = 10.0
+    camera_preview_width: int = 520
+    camera_preview_height: int = 390
+    task_preview_width: int = 360
+    task_preview_height: int = 160
+    task_preview_rotate_left: bool = True
+
+
+@dataclass
 class SessionConfig:
     subject_id: str = "mouse01"
     phase: TrainingPhase = TrainingPhase.DECISION_MAKING
@@ -131,6 +154,7 @@ class SessionConfig:
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     engagement: EngagementConfig = field(default_factory=EngagementConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
     results_dir: str = "data/sessions"
 
     @staticmethod
@@ -153,6 +177,7 @@ class SessionConfig:
         display_raw = raw.get("display", {})
         engagement_raw = raw.get("engagement", {})
         camera_raw = raw.get("camera", {})
+        monitor_raw = raw.get("monitor", {})
         wheel_raw = raw.get("wheel", {})
 
         def channels(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
@@ -305,6 +330,41 @@ class SessionConfig:
                 pixel_format=str(camera_raw.get("pixel_format", "Mono8")),
                 acquisition_timeout_ms=int(camera_raw.get("acquisition_timeout_ms", 1000)),
                 save_dir=str(camera_raw.get("save_dir", "data/videos")),
+            ),
+            monitor=MonitorConfig(
+                enabled=bool(monitor_raw.get("enabled", False)),
+                display_index=(
+                    int(monitor_raw["display_index"])
+                    if monitor_raw.get("display_index") not in (None, "")
+                    else None
+                ),
+                window_x=(
+                    int(monitor_raw["window_x"])
+                    if monitor_raw.get("window_x") not in (None, "")
+                    else None
+                ),
+                window_y=(
+                    int(monitor_raw["window_y"])
+                    if monitor_raw.get("window_y") not in (None, "")
+                    else None
+                ),
+                width=int(monitor_raw.get("width", 1500)),
+                height=int(monitor_raw.get("height", 940)),
+                fps=int(monitor_raw.get("fps", 30)),
+                history_s=float(monitor_raw.get("history_s", 20.0)),
+                trial_history=int(monitor_raw.get("trial_history", 12)),
+                queue_size=int(monitor_raw.get("queue_size", 512)),
+                force_sample_hz=float(monitor_raw.get("force_sample_hz", 80.0)),
+                wheel_sample_hz=float(monitor_raw.get("wheel_sample_hz", 60.0)),
+                screen_fps=float(monitor_raw.get("screen_fps", 12.0)),
+                camera_fps=float(monitor_raw.get("camera_fps", 10.0)),
+                camera_preview_width=int(monitor_raw.get("camera_preview_width", 520)),
+                camera_preview_height=int(monitor_raw.get("camera_preview_height", 390)),
+                task_preview_width=int(monitor_raw.get("task_preview_width", 360)),
+                task_preview_height=int(monitor_raw.get("task_preview_height", 160)),
+                task_preview_rotate_left=bool(
+                    monitor_raw.get("task_preview_rotate_left", True)
+                ),
             ),
             results_dir=str(raw.get("results_dir", "data/sessions")),
         )

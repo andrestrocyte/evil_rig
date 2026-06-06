@@ -6,14 +6,76 @@ import csv
 import ctypes
 import json
 import logging
+import math
 import os
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+
+
+PreviewCallback = Callable[[dict[str, Any]], None]
+
+
+def _preview_due(last_preview_mono_s: float, min_interval_s: float) -> bool:
+    return time.perf_counter() - last_preview_mono_s >= max(0.0, float(min_interval_s))
+
+
+def _downsample_array_preview(
+    array: Any,
+    *,
+    max_width: int,
+    max_height: int,
+) -> tuple[int, int, int, bytes] | None:
+    shape = getattr(array, "shape", None)
+    if not shape or len(shape) < 2:
+        return None
+    height = int(shape[0])
+    width = int(shape[1])
+    if width <= 0 or height <= 0:
+        return None
+    step = max(
+        1,
+        int(math.ceil(width / float(max(1, max_width)))),
+        int(math.ceil(height / float(max(1, max_height)))),
+    )
+    try:
+        if len(shape) == 2:
+            view = array[::step, ::step].copy()
+            return int(view.shape[1]), int(view.shape[0]), 1, view.tobytes()
+        channels = min(3, int(shape[2]))
+        view = array[::step, ::step, :channels].copy()
+        return int(view.shape[1]), int(view.shape[0]), channels, view.tobytes()
+    except Exception:
+        return None
+
+
+def _downsample_mono_bytes(
+    raw: bytes,
+    *,
+    width: int,
+    height: int,
+    stride: int,
+    max_width: int,
+    max_height: int,
+) -> tuple[int, int, bytes] | None:
+    if width <= 0 or height <= 0 or stride < width:
+        return None
+    step = max(
+        1,
+        int(math.ceil(width / float(max(1, max_width)))),
+        int(math.ceil(height / float(max(1, max_height)))),
+    )
+    rows: list[bytes] = []
+    for y in range(0, height, step):
+        row = raw[y * stride : y * stride + width]
+        rows.append(row[::step])
+    if not rows:
+        return None
+    return len(rows[0]), len(rows), b"".join(rows)
 
 
 class _FrameTimestampWriter:
@@ -60,6 +122,10 @@ class _SpinnakerCRecorder:
         gain_db: float | None,
         gamma: float | None,
         acquisition_timeout_ms: int,
+        preview_callback: PreviewCallback | None = None,
+        preview_max_width: int = 520,
+        preview_max_height: int = 390,
+        preview_min_interval_s: float = 0.125,
     ) -> None:
         self.session_dir = session_dir
         self._serial_number = serial_number
@@ -69,6 +135,12 @@ class _SpinnakerCRecorder:
         self._gain_db = gain_db
         self._gamma = gamma
         self._acquisition_timeout_ms = int(acquisition_timeout_ms)
+        self._preview_callback = preview_callback
+        self._preview_max_width = int(preview_max_width)
+        self._preview_max_height = int(preview_max_height)
+        self._preview_min_interval_s = float(preview_min_interval_s)
+        self._last_preview_mono_s = 0.0
+        self._preview_count = 0
         self._running = False
         self._thread: threading.Thread | None = None
         self._error: str | None = None
@@ -138,6 +210,7 @@ class _SpinnakerCRecorder:
             "backend": "spinnaker_c",
             "session_dir": str(self.session_dir),
             "frames_saved": int(self._frame_count),
+            "preview_frames": int(self._preview_count),
             "frame_timestamps_csv": str(self.session_dir / "frame_timestamps.csv"),
             "start_wall_s": self._start_wall_s,
             "stop_wall_s": self._stop_wall_s,
@@ -198,6 +271,10 @@ class _SpinnakerCRecorder:
         self._bind("spinImageGetTimeStamp", [void_p, ctypes.POINTER(ctypes.c_uint64)])
         self._bind("spinImageSave", [void_p, ctypes.c_char_p, ctypes.c_int])
         self._bind("spinImageSaveFromExt", [void_p, ctypes.c_char_p])
+        self._bind_optional("spinImageGetWidth", [void_p, size_p])
+        self._bind_optional("spinImageGetHeight", [void_p, size_p])
+        self._bind_optional("spinImageGetStride", [void_p, size_p])
+        self._bind_optional("spinImageGetData", [void_p, ctypes.POINTER(void_p)])
         self._bind("spinImageRelease", [void_p])
         self._bind("spinCameraGetNodeMap", [void_p, ctypes.POINTER(void_p)])
         self._bind("spinCameraGetTLDeviceNodeMap", [void_p, ctypes.POINTER(void_p)])
@@ -220,6 +297,15 @@ class _SpinnakerCRecorder:
         func.argtypes = argtypes
         func.restype = ctypes.c_int
         self._fn[name] = func
+
+    def _bind_optional(self, name: str, argtypes: list[Any]) -> bool:
+        func = getattr(self._dll, name, None)
+        if func is None:
+            return False
+        func.argtypes = argtypes
+        func.restype = ctypes.c_int
+        self._fn[name] = func
+        return True
 
     def _check(self, name: str, *args: Any) -> None:
         result = int(self._fn[name](*args))
@@ -371,9 +457,76 @@ class _SpinnakerCRecorder:
                     camera_timestamp.value if timestamp_result == 0 else None,
                     filename,
                 )
+                self._maybe_emit_preview(
+                    image,
+                    frame_index=frame_index,
+                    camera_timestamp_ns=(
+                        camera_timestamp.value if timestamp_result == 0 else None
+                    ),
+                )
                 self._frame_count += 1
             finally:
                 self._fn["spinImageRelease"](image)
+
+    def _maybe_emit_preview(
+        self,
+        image: ctypes.c_void_p,
+        *,
+        frame_index: int,
+        camera_timestamp_ns: int | None,
+    ) -> None:
+        if self._preview_callback is None:
+            return
+        if not _preview_due(self._last_preview_mono_s, self._preview_min_interval_s):
+            return
+        required = ("spinImageGetWidth", "spinImageGetHeight", "spinImageGetStride", "spinImageGetData")
+        if any(name not in self._fn for name in required):
+            return
+        try:
+            width = ctypes.c_size_t()
+            height = ctypes.c_size_t()
+            stride = ctypes.c_size_t()
+            data_ptr = ctypes.c_void_p()
+            if self._fn["spinImageGetWidth"](image, ctypes.byref(width)) != 0:
+                return
+            if self._fn["spinImageGetHeight"](image, ctypes.byref(height)) != 0:
+                return
+            if self._fn["spinImageGetStride"](image, ctypes.byref(stride)) != 0:
+                return
+            if self._fn["spinImageGetData"](image, ctypes.byref(data_ptr)) != 0:
+                return
+            if not data_ptr.value:
+                return
+            byte_count = int(stride.value) * int(height.value)
+            raw = ctypes.string_at(data_ptr, byte_count)
+            preview = _downsample_mono_bytes(
+                raw,
+                width=int(width.value),
+                height=int(height.value),
+                stride=int(stride.value),
+                max_width=self._preview_max_width,
+                max_height=self._preview_max_height,
+            )
+            if preview is None:
+                return
+            out_width, out_height, data = preview
+            self._last_preview_mono_s = time.perf_counter()
+            self._preview_callback(
+                {
+                    "frame_index": int(frame_index),
+                    "camera_timestamp_ns": camera_timestamp_ns,
+                    "width": out_width,
+                    "height": out_height,
+                    "channels": 1,
+                    "format": "L",
+                    "data": data,
+                    "monotonic_s": self._last_preview_mono_s,
+                    "backend": "spinnaker_c",
+                }
+            )
+            self._preview_count += 1
+        except Exception:
+            logger.debug("Could not emit Spinnaker C preview frame", exc_info=True)
 
     def _cleanup(self) -> list[str]:
         errors: list[str] = []
@@ -421,6 +574,10 @@ class HeadlessSpinnakerRecorder:
         gain_db: float | None = None,
         gamma: float | None = None,
         acquisition_timeout_ms: int = 1000,
+        preview_callback: PreviewCallback | None = None,
+        preview_max_width: int = 520,
+        preview_max_height: int = 390,
+        preview_min_interval_s: float = 0.125,
     ) -> None:
         self._out_dir = Path(out_dir)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -432,6 +589,12 @@ class HeadlessSpinnakerRecorder:
         self._gain_db = gain_db
         self._gamma = gamma
         self._acquisition_timeout_ms = int(acquisition_timeout_ms)
+        self._preview_callback = preview_callback
+        self._preview_max_width = int(preview_max_width)
+        self._preview_max_height = int(preview_max_height)
+        self._preview_min_interval_s = float(preview_min_interval_s)
+        self._last_preview_mono_s = 0.0
+        self._preview_count = 0
         self.backend = "spinnaker_pyspin"
 
         self._running = False
@@ -476,6 +639,10 @@ class HeadlessSpinnakerRecorder:
                 gain_db=self._gain_db,
                 gamma=self._gamma,
                 acquisition_timeout_ms=self._acquisition_timeout_ms,
+                preview_callback=self._preview_callback,
+                preview_max_width=self._preview_max_width,
+                preview_max_height=self._preview_max_height,
+                preview_min_interval_s=self._preview_min_interval_s,
             )
             return self._c_backend.start()
 
@@ -523,6 +690,7 @@ class HeadlessSpinnakerRecorder:
             "backend": self.backend,
             "session_dir": str(self.session_dir),
             "frames_saved": int(self._frame_count),
+            "preview_frames": int(self._preview_count),
             "frame_timestamps_csv": str(self.session_dir / "frame_timestamps.csv"),
             "start_wall_s": self._start_wall_s,
             "stop_wall_s": self._stop_wall_s,
@@ -651,6 +819,11 @@ class HeadlessSpinnakerRecorder:
                 except Exception:
                     pass
                 self._timestamps.write(frame_index, camera_timestamp, filename)
+                self._maybe_emit_preview(
+                    image,
+                    frame_index=frame_index,
+                    camera_timestamp_ns=camera_timestamp,
+                )
                 self._frame_count += 1
             except Exception as exc:  # pragma: no cover - device-specific
                 if "timeout" in str(exc).lower() and self._running:
@@ -661,4 +834,43 @@ class HeadlessSpinnakerRecorder:
             finally:
                 if image is not None:
                     image.Release()
+
+    def _maybe_emit_preview(
+        self,
+        image: Any,
+        *,
+        frame_index: int,
+        camera_timestamp_ns: int | None,
+    ) -> None:
+        if self._preview_callback is None:
+            return
+        if not _preview_due(self._last_preview_mono_s, self._preview_min_interval_s):
+            return
+        try:
+            array = image.GetNDArray()
+            preview = _downsample_array_preview(
+                array,
+                max_width=self._preview_max_width,
+                max_height=self._preview_max_height,
+            )
+            if preview is None:
+                return
+            width, height, channels, data = preview
+            self._last_preview_mono_s = time.perf_counter()
+            self._preview_callback(
+                {
+                    "frame_index": int(frame_index),
+                    "camera_timestamp_ns": camera_timestamp_ns,
+                    "width": width,
+                    "height": height,
+                    "channels": channels,
+                    "format": "L" if channels == 1 else "RGB",
+                    "data": data,
+                    "monotonic_s": self._last_preview_mono_s,
+                    "backend": "spinnaker_pyspin",
+                }
+            )
+            self._preview_count += 1
+        except Exception:
+            logger.debug("Could not emit PySpin preview frame", exc_info=True)
 

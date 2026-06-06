@@ -68,6 +68,16 @@ def main() -> None:
         default=None,
         help="Override n_trials and shorten timing for simulation.",
     )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Force-enable the operator monitor GUI, overriding the YAML monitor block.",
+    )
+    parser.add_argument(
+        "--no-monitor",
+        action="store_true",
+        help="Disable the operator monitor GUI, overriding the YAML monitor block.",
+    )
     args = parser.parse_args()
     if args.hardware_self_test and args.simulate:
         parser.error("--hardware-self-test cannot be combined with --simulate")
@@ -80,9 +90,16 @@ def main() -> None:
     )
 
     config = SessionConfig.from_yaml(args.config)
+    if args.monitor and args.no_monitor:
+        parser.error("--monitor cannot be combined with --no-monitor")
+    if args.monitor:
+        config.monitor.enabled = True
+    if args.no_monitor:
+        config.monitor.enabled = False
     if args.simulate:
         if args.simulate_headless:
             os.environ["SDL_VIDEODRIVER"] = "dummy"
+            config.monitor.enabled = False
         shorten_for_simulation(config, n_trials=args.simulate_trials)
         session = SimulatedHFDecisionSession(
             config,
@@ -105,7 +122,7 @@ def main() -> None:
             if isinstance(session, HardwareSelfTestSession):
                 report = session.validate_results()
                 print(f"Hardware self-test validated: {json.dumps(report, sort_keys=True)}")
-    except Exception:
+    except BaseException:
         session.close()
         raise
     print(f"Session finished: {summary.end_reason}")
