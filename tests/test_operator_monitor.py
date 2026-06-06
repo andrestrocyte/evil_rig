@@ -1,4 +1,6 @@
-from hf_dm.config import SessionConfig
+import queue
+
+from hf_dm.config import MonitorConfig, SessionConfig
 from hf_dm.hardware.bringup_constants import (
     CAP_TOUCH_INPUT_PIN,
     CAP_TOUCH_POWER_OUTPUT_CHANNEL,
@@ -7,8 +9,8 @@ from hf_dm.hardware.bringup_constants import (
     LICK_INPUT_CHANNEL,
     PUMP_OUTPUT_CHANNEL,
 )
-from hf_dm.monitor import OperatorMonitorState
-from hf_dm.monitor.gui import _frame_to_netpbm
+from hf_dm.monitor import OperatorMonitor, OperatorMonitorState
+from hf_dm.monitor.gui import _frame_age_text, _frame_to_netpbm
 from hf_dm.session.controller import HFDecisionSession
 
 
@@ -29,6 +31,22 @@ class FakeMonitor:
     ) -> bool:
         del key, max_hz
         return self.publish(event_type, payload)
+
+
+class FakeBoundedQueue:
+    def __init__(self, maxsize: int = 1) -> None:
+        self.maxsize = maxsize
+        self.items = []
+
+    def put_nowait(self, item: dict) -> None:
+        if len(self.items) >= self.maxsize:
+            raise queue.Full
+        self.items.append(item)
+
+    def get_nowait(self) -> dict:
+        if not self.items:
+            raise queue.Empty
+        return self.items.pop(0)
 
 
 def test_operator_monitor_state_tracks_trials_events_and_recent_frames():
@@ -151,7 +169,57 @@ def test_operator_monitor_state_tracks_trials_events_and_recent_frames():
     assert state.pump_active
     assert state.noise_active
     assert state.latest_camera_frame["frame_index"] == 2
+    assert state.camera_frame_count == 1
+    assert state.last_camera_frame_mono_s is not None
     assert state.outcomes[-1]["chosen_shape"] == "star"
+
+
+def test_operator_monitor_state_tracks_latest_camera_and_task_frame_counts():
+    state = OperatorMonitorState(history_s=10.0, trial_history=3)
+
+    state.apply(
+        {
+            "type": "camera_frame",
+            "payload": {"frame_index": 1, "width": 1, "height": 1, "channels": 1, "data": b"a"},
+        }
+    )
+    state.apply(
+        {
+            "type": "camera_frame",
+            "payload": {"frame_index": 2, "width": 1, "height": 1, "channels": 1, "data": b"b"},
+        }
+    )
+    state.apply(
+        {
+            "type": "task_frame",
+            "payload": {"frame_index": 5, "width": 1, "height": 1, "channels": 3, "data": b"abc"},
+        }
+    )
+
+    assert state.camera_frame_count == 2
+    assert state.task_frame_count == 1
+    assert state.latest_camera_frame["frame_index"] == 2
+    assert state.latest_task_frame["frame_index"] == 5
+    assert state.last_camera_frame_mono_s is not None
+    assert state.last_task_frame_mono_s is not None
+
+
+def test_operator_monitor_replaces_stale_frames_per_source_queue():
+    monitor = OperatorMonitor(MonitorConfig(enabled=True))
+    camera_queue = FakeBoundedQueue(maxsize=1)
+    task_queue = FakeBoundedQueue(maxsize=1)
+    monitor._camera_frame_queue = camera_queue
+    monitor._task_frame_queue = task_queue
+
+    assert monitor.publish("camera_frame", {"frame_index": 1})
+    assert monitor.publish("camera_frame", {"frame_index": 2})
+    assert monitor.publish("task_frame", {"frame_index": 10})
+
+    assert camera_queue.items[0]["payload"]["frame_index"] == 2
+    assert task_queue.items[0]["payload"]["frame_index"] == 10
+    assert monitor.published_counts["camera_frame"] == 2
+    assert monitor.published_counts["task_frame"] == 1
+    assert monitor.dropped_frames == 1
 
 
 def test_streamdio_callback_publishes_monitor_signals():
@@ -216,3 +284,9 @@ def test_monitor_frames_convert_to_tk_readable_netpbm_bytes():
     assert rgb is not None
     assert mono.startswith(b"P5\n2 2\n255\n")
     assert rgb.startswith(b"P6\n2 2\n255\n")
+
+
+def test_frame_age_text_formats_recent_and_stale_frames():
+    assert _frame_age_text(None) == "age -"
+    assert _frame_age_text(9.75, now=10.0) == "age 250 ms"
+    assert _frame_age_text(8.0, now=10.0) == "age 2.0 s"

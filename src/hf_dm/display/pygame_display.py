@@ -135,6 +135,7 @@ class TaskDisplay:
         self.font = pygame.font.Font(None, 28)
         self.small_font = pygame.font.Font(None, 22)
         self._decision_shapes, self.shape_bright_pixel_counts = self._make_decision_shapes()
+        self._preview_frame_index = 0
 
     def fill_black(self) -> float:
         self.screen.fill((0, 0, 0))
@@ -164,7 +165,10 @@ class TaskDisplay:
         dst_height = max(1, int(round(src_height * scale)))
         if dst_width != src_width or dst_height != src_height:
             surface = pygame.transform.smoothscale(surface, (dst_width, dst_height))
+        frame_index = self._preview_frame_index
+        self._preview_frame_index += 1
         return {
+            "frame_index": frame_index,
             "width": dst_width,
             "height": dst_height,
             "channels": 3,

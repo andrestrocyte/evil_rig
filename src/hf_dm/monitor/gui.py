@@ -114,7 +114,8 @@ class OperatorMonitor:
         self.config = config
         self._process: mp.Process | None = None
         self._event_queue: Any = None
-        self._frame_queue: Any = None
+        self._camera_frame_queue: Any = None
+        self._task_frame_queue: Any = None
         self._last_by_key: dict[str, float] = {}
         self._dropped_messages = 0
         self._dropped_frames = 0
@@ -144,10 +145,16 @@ class OperatorMonitor:
         try:
             ctx = mp.get_context("spawn")
             self._event_queue = ctx.Queue(maxsize=max(16, int(self.config.queue_size)))
-            self._frame_queue = ctx.Queue(maxsize=4)
+            self._camera_frame_queue = ctx.Queue(maxsize=2)
+            self._task_frame_queue = ctx.Queue(maxsize=2)
             self._process = ctx.Process(
                 target=_run_monitor_process,
-                args=(self.config, self._event_queue, self._frame_queue),
+                args=(
+                    self.config,
+                    self._event_queue,
+                    self._camera_frame_queue,
+                    self._task_frame_queue,
+                ),
                 name="hf-dm-operator-monitor",
                 daemon=True,
             )
@@ -156,7 +163,35 @@ class OperatorMonitor:
             logger.exception("Failed to start operator monitor")
             self._process = None
             self._event_queue = None
-            self._frame_queue = None
+            self._camera_frame_queue = None
+            self._task_frame_queue = None
+
+    def _queue_for_event(self, event_type: str) -> Any:
+        if event_type == "camera_frame":
+            return self._camera_frame_queue
+        if event_type == "task_frame":
+            return self._task_frame_queue
+        return self._event_queue
+
+    def _publish_frame_latest(self, target_queue: Any, message: dict[str, Any]) -> bool:
+        if target_queue is None:
+            return False
+        while True:
+            try:
+                target_queue.put_nowait(message)
+                self._published_counts[str(message["type"])] += 1
+                return True
+            except queue.Full:
+                self._dropped_frames += 1
+                try:
+                    target_queue.get_nowait()
+                except queue.Empty:
+                    return False
+                except Exception:
+                    return False
+            except Exception:
+                self._dropped_frames += 1
+                return False
 
     def publish(self, event_type: str, payload: dict[str, Any] | None = None) -> bool:
         if not self.config.enabled:
@@ -167,23 +202,16 @@ class OperatorMonitor:
             "sent_mono_s": time.perf_counter(),
             "sent_wall_s": time.time(),
         }
-        target_queue = self._frame_queue if event_type in _FRAME_EVENTS else self._event_queue
+        target_queue = self._queue_for_event(event_type)
         if target_queue is None:
             return False
+        if event_type in _FRAME_EVENTS:
+            return self._publish_frame_latest(target_queue, message)
         try:
             target_queue.put_nowait(message)
             self._published_counts[event_type] += 1
             return True
         except queue.Full:
-            if event_type in _FRAME_EVENTS:
-                self._dropped_frames += 1
-                try:
-                    target_queue.get_nowait()
-                    target_queue.put_nowait(message)
-                    self._published_counts[event_type] += 1
-                    return True
-                except Exception:
-                    return False
             self._dropped_messages += 1
             if event_type in _CRITICAL_EVENTS:
                 try:
@@ -228,7 +256,7 @@ class OperatorMonitor:
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=0.5)
-        for q in (self._event_queue, self._frame_queue):
+        for q in (self._event_queue, self._camera_frame_queue, self._task_frame_queue):
             if q is None:
                 continue
             try:
@@ -241,7 +269,8 @@ class OperatorMonitor:
                 pass
         self._process = None
         self._event_queue = None
-        self._frame_queue = None
+        self._camera_frame_queue = None
+        self._task_frame_queue = None
 
 
 class OperatorMonitorState:
@@ -262,6 +291,10 @@ class OperatorMonitorState:
         self.last_task_state: dict[str, Any] = {}
         self.latest_camera_frame: dict[str, Any] | None = None
         self.latest_task_frame: dict[str, Any] | None = None
+        self.camera_frame_count = 0
+        self.task_frame_count = 0
+        self.last_camera_frame_mono_s: float | None = None
+        self.last_task_frame_mono_s: float | None = None
         self.force_samples: deque[tuple[float, float]] = deque()
         self.force_session_max = 1.0
         self.wheel_samples: deque[tuple[float, float, int, int, int]] = deque()
@@ -377,8 +410,12 @@ class OperatorMonitorState:
             self.camera_ttl_count += 1
         elif event_type == "camera_frame":
             self.latest_camera_frame = payload
+            self.camera_frame_count += 1
+            self.last_camera_frame_mono_s = now
         elif event_type == "task_frame":
             self.latest_task_frame = payload
+            self.task_frame_count += 1
+            self.last_task_frame_mono_s = now
 
         self.prune(now)
 
@@ -455,6 +492,16 @@ def _short_text(text: Any, max_chars: int) -> str:
     return value[: max_chars - 3] + "..."
 
 
+def _frame_age_text(last_mono_s: float | None, now: float | None = None) -> str:
+    if last_mono_s is None:
+        return "age -"
+    now = time.perf_counter() if now is None else float(now)
+    age_s = max(0.0, now - float(last_mono_s))
+    if age_s < 1.0:
+        return f"age {age_s * 1000.0:.0f} ms"
+    return f"age {age_s:.1f} s"
+
+
 def _frame_to_netpbm(frame: dict[str, Any] | None) -> bytes | None:
     if not frame:
         return None
@@ -492,7 +539,12 @@ def _frame_to_netpbm(frame: dict[str, Any] | None) -> bytes | None:
     return None
 
 
-def _run_monitor_process(config: MonitorConfig, event_q: Any, frame_q: Any) -> None:
+def _run_monitor_process(
+    config: MonitorConfig,
+    event_q: Any,
+    camera_frame_q: Any,
+    task_frame_q: Any,
+) -> None:
     try:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     except Exception:
@@ -504,7 +556,7 @@ def _run_monitor_process(config: MonitorConfig, event_q: Any, frame_q: Any) -> N
 
     root = tk.Tk()
     try:
-        window = _MonitorWindow(root, config, event_q, frame_q, tk)
+        window = _MonitorWindow(root, config, event_q, camera_frame_q, task_frame_q, tk)
         window.start()
         root.mainloop()
     except Exception:
@@ -517,11 +569,20 @@ def _run_monitor_process(config: MonitorConfig, event_q: Any, frame_q: Any) -> N
 
 
 class _MonitorWindow:
-    def __init__(self, root: Any, config: MonitorConfig, event_q: Any, frame_q: Any, tk: Any):
+    def __init__(
+        self,
+        root: Any,
+        config: MonitorConfig,
+        event_q: Any,
+        camera_frame_q: Any,
+        task_frame_q: Any,
+        tk: Any,
+    ):
         self.root = root
         self.config = config
         self.event_queue = event_q
-        self.frame_queue = frame_q
+        self.camera_frame_queue = camera_frame_q
+        self.task_frame_queue = task_frame_q
         self.tk = tk
         self.state = OperatorMonitorState(
             history_s=config.history_s,
@@ -591,22 +652,29 @@ class _MonitorWindow:
                 continue
             self.state.apply(message)
 
-        latest_frames: dict[str, dict[str, Any]] = {}
-        drained_frames = 0
-        while drained_frames < 32:
+        for message in (
+            self._latest_frame_message(self.camera_frame_queue, "camera_frame"),
+            self._latest_frame_message(self.task_frame_queue, "task_frame"),
+        ):
+            if message is None:
+                continue
+            self.state.apply(message)
+        return shutdown
+
+    def _latest_frame_message(self, frame_queue: Any, event_type: str) -> dict[str, Any] | None:
+        latest: dict[str, Any] | None = None
+        drained = 0
+        while drained < 64:
             try:
-                message = self.frame_queue.get_nowait()
+                message = frame_queue.get_nowait()
             except queue.Empty:
                 break
             except Exception:
                 break
-            drained_frames += 1
-            event_type = str(message.get("type", ""))
-            if event_type in _FRAME_EVENTS:
-                latest_frames[event_type] = message
-        for message in latest_frames.values():
-            self.state.apply(message)
-        return shutdown
+            drained += 1
+            if str(message.get("type", "")) == event_type:
+                latest = message
+        return latest
 
     def _render(self) -> None:
         self.state.prune()
@@ -676,9 +744,11 @@ class _MonitorWindow:
         ix, iy, iw, ih = self._panel(x, y, w, h, "Video")
         frame = self.state.latest_camera_frame
         self._draw_image_or_placeholder(ix, iy, iw, ih, frame, "waiting for camera preview")
-        meta = []
+        now = time.perf_counter()
+        meta = [f"frames {self.state.camera_frame_count}"]
         if frame:
             meta.append(f"frame {frame.get('frame_index', 0)}")
+        meta.append(_frame_age_text(self.state.last_camera_frame_mono_s, now))
         meta.append(f"TTL {self.state.camera_ttl_count}")
         self.canvas.create_text(
             ix + 8,
@@ -692,6 +762,20 @@ class _MonitorWindow:
     def _draw_task_panel(self, x: int, y: int, w: int, h: int) -> None:
         ix, iy, iw, ih = self._panel(x, y, w, h, "Task Screen")
         self._draw_image_or_placeholder(ix, iy, iw, ih, self.state.latest_task_frame, "waiting for task frame")
+        now = time.perf_counter()
+        meta = [f"frames {self.state.task_frame_count}"]
+        frame = self.state.latest_task_frame
+        if frame and frame.get("frame_index") is not None:
+            meta.append(f"frame {frame.get('frame_index')}")
+        meta.append(_frame_age_text(self.state.last_task_frame_mono_s, now))
+        self.canvas.create_text(
+            ix + 8,
+            y + h - 16,
+            anchor="w",
+            text="  ".join(meta),
+            fill="#51606b",
+            font=("Segoe UI", 10),
+        )
 
     def _draw_status_panel(self, x: int, y: int, w: int, h: int) -> None:
         ix, iy, iw, ih = self._panel(x, y, w, h, "Session")
