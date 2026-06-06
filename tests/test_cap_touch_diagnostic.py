@@ -11,6 +11,8 @@ def test_cap_touch_diagnostic_counts_lick_edges_status_and_force_separately():
 
     state.handle_event("analog_input", FORCE_ANALOG_CHANNEL, 20, 1000, 0.001)
     state.handle_event("analog_input", FORCE_ANALOG_CHANNEL, 40, 2000, 0.002)
+    state.handle_event("analog_input", CAP_TOUCH_INPUT_CHANNEL, 100, 2500, 0.0025)
+    state.handle_event("analog_input", CAP_TOUCH_INPUT_CHANNEL, 850, 2600, 0.0026)
     state.handle_event("dio_input", CAP_TOUCH_INPUT_CHANNEL, 1, 3000, 0.003)
     state.handle_event("dio_input", CAP_TOUCH_INPUT_CHANNEL, 0, 4000, 0.004)
     state.add_status(
@@ -32,6 +34,16 @@ def test_cap_touch_diagnostic_counts_lick_edges_status_and_force_separately():
     assert report["force_sample_count"] == 2
     assert report["force_min"] == 20
     assert report["force_max"] == 40
+    assert report["cap_touch_analog_sample_count"] == 2
+    assert report["cap_touch_analog_min"] == 100
+    assert report["cap_touch_analog_max"] == 850
+    assert report["cap_touch_analog_last"] == 850
+    assert report["cap_touch_analog_span"] == 750
     assert report["adc_last"] == 900
     assert report["baseline_last"] == 10
     assert report["final_status"]["pin"] == CAP_TOUCH_INPUT_PIN
+
+    state.clear_cap_touch_analog_samples()
+    cleared = state.snapshot()
+    assert cleared["cap_touch_analog_sample_count"] == 0
+    assert cleared["cap_touch_analog_span"] is None

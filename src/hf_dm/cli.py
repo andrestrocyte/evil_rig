@@ -67,6 +67,14 @@ def main() -> None:
         help="Status polling rate for --cap-touch-diagnostic.",
     )
     parser.add_argument(
+        "--cap-touch-raw-analog",
+        action="store_true",
+        help=(
+            "For --cap-touch-diagnostic, temporarily stream cap-touch ch14/pin25 "
+            "as the single analog input instead of force."
+        ),
+    )
+    parser.add_argument(
         "--cap-touch-min-high-threshold",
         type=int,
         default=None,
@@ -150,6 +158,7 @@ def main() -> None:
             min_high_threshold=args.cap_touch_min_high_threshold,
             delta_high=args.cap_touch_delta_high,
             delta_low=args.cap_touch_delta_low,
+            raw_analog=args.cap_touch_raw_analog,
         )
         return
     if args.simulate:

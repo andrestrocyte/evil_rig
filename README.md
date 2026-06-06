@@ -201,6 +201,16 @@ or for one diagnostic run:
 python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-touch-min-high-threshold 250 --cap-touch-delta-high 120 --cap-touch-delta-low 90
 ```
 
+To reproduce the old bringup-style analog readout, temporarily stream cap-touch
+pin 25 as the single analog input:
+
+```bash
+python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-touch-raw-analog --cap-touch-duration 15
+```
+
+That mode disables the force ADC only for the diagnostic. During the task, force
+stays on analog channel 13 and cap touch is digitized locally in firmware.
+
 `--hardware-self-test` runs the production Bpod FSM with synthetic wheel choices but real rig
 outputs. It fails unless both effort directions and pump transitions have firmware output events,
 choice-to-pump timing matches the configured blank state, pump duration error is below 10 ms, force

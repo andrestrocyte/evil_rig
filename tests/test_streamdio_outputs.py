@@ -2,7 +2,12 @@ import threading
 import time
 from collections import defaultdict
 
-from hf_dm.hardware.bringup_constants import FORCE_ANALOG_CHANNEL, FORCE_ANALOG_PIN, LICK_INPUT_CHANNEL
+from hf_dm.hardware.bringup_constants import (
+    CAP_TOUCH_INPUT_PIN,
+    FORCE_ANALOG_CHANNEL,
+    FORCE_ANALOG_PIN,
+    LICK_INPUT_CHANNEL,
+)
 from hf_dm.streamdio.client import StreamDIOClient
 from hf_dm.streamdio.outputs import StreamDIOOutputs
 
@@ -28,11 +33,17 @@ class FakeProtocol:
         return True
 
     def get_analog_input_status(self) -> dict:
+        analog = (self.configured or {}).get(
+            "analog_input",
+            {"channel": FORCE_ANALOG_CHANNEL, "enabled": True, "sample_interval_us": 1000},
+        )
+        channel = int(analog.get("channel", FORCE_ANALOG_CHANNEL))
+        pin = CAP_TOUCH_INPUT_PIN if channel == LICK_INPUT_CHANNEL else FORCE_ANALOG_PIN
         return {
-            "enabled": True,
-            "channel": FORCE_ANALOG_CHANNEL,
-            "pin": FORCE_ANALOG_PIN,
-            "sample_interval_us": 1000,
+            "enabled": bool(analog.get("enabled", True)),
+            "channel": channel,
+            "pin": pin,
+            "sample_interval_us": int(analog.get("sample_interval_us", 1000)),
             "last_value": 0,
         }
 
@@ -119,6 +130,19 @@ def test_rotary_force_config_accepts_digitizer_firmware():
     enabled = client.raw.configured["input_channels_enabled"]
     assert enabled[LICK_INPUT_CHANNEL - 1]
     assert client.raw.configured["analog_input"]["channel"] == FORCE_ANALOG_CHANNEL
+
+
+def test_cap_touch_analog_diagnostic_streams_touch_channel_instead_of_force():
+    client = _client()
+
+    status = client.configure_cap_touch_analog_diagnostic(sample_interval_us=2000)
+
+    enabled = client.raw.configured["input_channels_enabled"]
+    assert not any(enabled)
+    assert client.raw.configured["analog_input"]["channel"] == LICK_INPUT_CHANNEL
+    assert client.raw.configured["analog_input"]["sample_interval_us"] == 2000
+    assert status["channel"] == LICK_INPUT_CHANNEL
+    assert status["pin"] == CAP_TOUCH_INPUT_PIN
 
 
 def test_cap_touch_status_reads_digitizer_fields():

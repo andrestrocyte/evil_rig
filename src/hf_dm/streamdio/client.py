@@ -12,6 +12,8 @@ from hf_dm.hardware.bringup_constants import (
     CAP_TOUCH_DEFAULT_DELTA_HIGH,
     CAP_TOUCH_DEFAULT_DELTA_LOW,
     CAP_TOUCH_DEFAULT_MIN_HIGH_THRESHOLD,
+    CAP_TOUCH_INPUT_CHANNEL,
+    CAP_TOUCH_INPUT_PIN,
     DEFAULT_CAMERA_EXPOSURE_US,
     DEFAULT_CAMERA_FREQUENCY_HZ,
     DIRECTION_INPUT_CHANNEL,
@@ -135,6 +137,39 @@ class StreamDIOClient:
             raise RuntimeError(f"Unexpected force channel: {status}")
         if int(status.get("pin", -1)) != FORCE_ANALOG_PIN:
             raise RuntimeError(f"Unexpected force pin: {status}")
+
+    def configure_cap_touch_analog_diagnostic(
+        self,
+        *,
+        sample_interval_us: int = FORCE_ANALOG_SAMPLE_INTERVAL_US,
+    ) -> dict[str, Any]:
+        """Temporarily stream cap-touch pin 25 as the only analog channel."""
+        if self._dio is None:
+            raise RuntimeError("StreamDIO not connected")
+        with self._config_lock:
+            enable_vector = [False] * int(self._dio.module_info["n_input_channels"])
+            ok = self._dio.configure_module(
+                refractory_period=INPUT_REFRACTORY_PERIOD_US,
+                input_channels_enabled=enable_vector,
+                analog_input={
+                    "channel": CAP_TOUCH_INPUT_CHANNEL,
+                    "enabled": True,
+                    "sample_interval_us": int(sample_interval_us),
+                },
+            )
+            if not ok:
+                raise RuntimeError("StreamDIO cap-touch analog diagnostic config failed")
+            status = self._dio.get_analog_input_status()
+        if not status.get("enabled"):
+            raise RuntimeError(f"Analog cap-touch not enabled: {status}")
+        if int(status.get("channel", -1)) != CAP_TOUCH_INPUT_CHANNEL:
+            raise RuntimeError(f"Unexpected cap-touch analog channel: {status}")
+        if int(status.get("pin", -1)) != CAP_TOUCH_INPUT_PIN:
+            raise RuntimeError(f"Unexpected cap-touch analog pin: {status}")
+        return {
+            str(key): value.item() if hasattr(value, "item") else value
+            for key, value in dict(status).items()
+        }
 
     def start_camera_session(
         self,
