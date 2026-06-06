@@ -120,6 +120,10 @@ disabled. `--simulate-headless` disables the monitor automatically.
 Cap touch uses StreamDIO input channel 14 / physical pin 25 for the lick detector and output
 channel 13 / physical pin 15 for detector power. The GUI shows both the power output and the raw
 input channel value so detector transitions are visible even before trial-level counted licks.
+Because the firmware can stream only one configured analog input at a time, force remains on analog
+channel 13 and the vendored StreamDIO firmware in `firmware/` digitizes cap-touch pin 25 locally
+into normal channel-14 high/low input events. Flash that firmware if the detector LED changes but no
+lick events appear in the GUI.
 
 ## Run
 
