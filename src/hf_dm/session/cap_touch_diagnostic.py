@@ -148,6 +148,22 @@ class CapTouchDiagnosticState:
             }
 
 
+def _interpret_cap_touch_report(report: dict[str, Any]) -> str:
+    if report.get("mode") == "raw_analog":
+        if report.get("detected_raw_change"):
+            return "raw_adc_swing_detected"
+        if report.get("cap_touch_analog_sample_count", 0) <= 0:
+            return "raw_no_samples"
+        return "raw_adc_below_threshold"
+    if report.get("detected_touch"):
+        return "digitizer_edges_detected"
+    if report.get("status_adc_crossed_threshold"):
+        return "adc_crossed_threshold_without_edge"
+    if report.get("adc_max") is None:
+        return "digitizer_no_status_samples"
+    return "digitizer_adc_below_threshold"
+
+
 def run_cap_touch_diagnostic(
     config: SessionConfig,
     *,
@@ -293,6 +309,17 @@ def run_cap_touch_diagnostic(
     )
     raw_span = report.get("cap_touch_analog_span")
     raw_change_threshold = int(requested_thresholds["min_high_threshold"] or 250)
+    final_status = report.get("final_status") if isinstance(report.get("final_status"), dict) else {}
+    status_adc_threshold = (
+        final_status.get("rising_high_threshold")
+        if final_status.get("rising_high_threshold") is not None
+        else requested_thresholds["min_high_threshold"]
+    )
+    status_adc_crossed_threshold = (
+        report.get("adc_max") is not None
+        and status_adc_threshold is not None
+        and int(report["adc_max"]) >= int(status_adc_threshold)
+    )
     report.update(
         {
             "mode": "raw_analog" if raw_analog else "digitizer",
@@ -308,11 +335,15 @@ def run_cap_touch_diagnostic(
             "detected_raw_change": bool(
                 raw_analog and raw_span is not None and raw_span >= raw_change_threshold
             ),
+            "status_adc_threshold": status_adc_threshold,
+            "status_adc_crossed_threshold": status_adc_crossed_threshold,
             "detected_touch": report["high_edge_count"] > 0,
         }
     )
+    report["diagnosis"] = _interpret_cap_touch_report(report)
     print("Cap-touch diagnostic report:")
     print(json.dumps(report, indent=2, sort_keys=True))
+    print(f"Diagnostic interpretation: {report['diagnosis']}")
     if not raw_analog and not report["detected_touch"]:
         print(
             "No high lick edges were detected. If the detector was touched during "

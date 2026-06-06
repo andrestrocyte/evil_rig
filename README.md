@@ -210,6 +210,9 @@ python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-tou
 
 That mode disables the force ADC only for the diagnostic. During the task, force
 stays on analog channel 13 and cap touch is digitized locally in firmware.
+The diagnostic report includes a `diagnosis` field such as
+`raw_adc_swing_detected`, `raw_adc_below_threshold`,
+`digitizer_edges_detected`, or `digitizer_adc_below_threshold`.
 
 `--hardware-self-test` runs the production Bpod FSM with synthetic wheel choices but real rig
 outputs. It fails unless both effort directions and pump transitions have firmware output events,

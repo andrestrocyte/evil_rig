@@ -4,6 +4,7 @@ from hf_dm.hardware.bringup_constants import (
     FORCE_ANALOG_CHANNEL,
 )
 from hf_dm.session.cap_touch_diagnostic import CapTouchDiagnosticState
+from hf_dm.session.cap_touch_diagnostic import _interpret_cap_touch_report
 
 
 def test_cap_touch_diagnostic_counts_lick_edges_status_and_force_separately():
@@ -47,3 +48,48 @@ def test_cap_touch_diagnostic_counts_lick_edges_status_and_force_separately():
     cleared = state.snapshot()
     assert cleared["cap_touch_analog_sample_count"] == 0
     assert cleared["cap_touch_analog_span"] is None
+
+
+def test_cap_touch_diagnostic_interprets_raw_and_digitizer_reports():
+    assert (
+        _interpret_cap_touch_report(
+            {
+                "mode": "raw_analog",
+                "detected_raw_change": True,
+                "cap_touch_analog_sample_count": 10,
+            }
+        )
+        == "raw_adc_swing_detected"
+    )
+    assert (
+        _interpret_cap_touch_report(
+            {
+                "mode": "raw_analog",
+                "detected_raw_change": False,
+                "cap_touch_analog_sample_count": 10,
+            }
+        )
+        == "raw_adc_below_threshold"
+    )
+    assert (
+        _interpret_cap_touch_report(
+            {
+                "mode": "digitizer",
+                "detected_touch": False,
+                "status_adc_crossed_threshold": True,
+                "adc_max": 500,
+            }
+        )
+        == "adc_crossed_threshold_without_edge"
+    )
+    assert (
+        _interpret_cap_touch_report(
+            {
+                "mode": "digitizer",
+                "detected_touch": False,
+                "status_adc_crossed_threshold": False,
+                "adc_max": 10,
+            }
+        )
+        == "digitizer_adc_below_threshold"
+    )
