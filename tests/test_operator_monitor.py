@@ -10,7 +10,7 @@ from hf_dm.hardware.bringup_constants import (
     PUMP_OUTPUT_CHANNEL,
 )
 from hf_dm.monitor import OperatorMonitor, OperatorMonitorState
-from hf_dm.monitor.gui import _frame_age_text, _frame_to_netpbm
+from hf_dm.monitor.gui import _frame_age_text, _frame_to_netpbm, _mono_frame_to_rgb_netpbm
 from hf_dm.session.controller import HFDecisionSession
 
 
@@ -316,6 +316,14 @@ def test_monitor_frames_convert_to_tk_readable_netpbm_bytes():
     assert rgb is not None
     assert mono.startswith(b"P5\n2 2\n255\n")
     assert rgb.startswith(b"P6\n2 2\n255\n")
+
+
+def test_mono_monitor_frames_can_fall_back_to_rgb_netpbm_bytes():
+    rgb = _mono_frame_to_rgb_netpbm(
+        {"width": 2, "height": 1, "channels": 1, "data": bytes([10, 200])}
+    )
+
+    assert rgb == b"P6\n2 1\n255\n" + bytes([10, 10, 10, 200, 200, 200])
 
 
 def test_frame_age_text_formats_recent_and_stale_frames():

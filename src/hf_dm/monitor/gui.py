@@ -562,6 +562,33 @@ def _frame_to_netpbm(frame: dict[str, Any] | None) -> bytes | None:
     return None
 
 
+def _mono_frame_to_rgb_netpbm(frame: dict[str, Any] | None) -> bytes | None:
+    if not frame:
+        return None
+    try:
+        width = int(frame["width"])
+        height = int(frame["height"])
+        channels = int(frame.get("channels", 1))
+        data = frame["data"]
+    except Exception:
+        return None
+    if channels != 1 or not isinstance(data, (bytes, bytearray)) or width <= 0 or height <= 0:
+        return None
+    pixels = width * height
+    raw = bytes(data)
+    if len(raw) < pixels:
+        return None
+    rgb = bytearray(pixels * 3)
+    out = 0
+    for value in raw[:pixels]:
+        rgb[out] = value
+        rgb[out + 1] = value
+        rgb[out + 2] = value
+        out += 3
+    header = f"P6\n{width} {height}\n255\n".encode("ascii")
+    return header + bytes(rgb)
+
+
 def _run_monitor_process(
     config: MonitorConfig,
     event_q: Any,
@@ -614,6 +641,7 @@ class _MonitorWindow:
         self.width = max(980, int(config.width))
         self.height = max(720, int(config.height))
         self._images: list[Any] = []
+        self._photo_cache: dict[str, tuple[int, int, int, Any]] = {}
 
         self.root.title("HF Decision Monitor")
         self.root.configure(bg="#edf0f2")
@@ -766,7 +794,15 @@ class _MonitorWindow:
     def _draw_video_panel(self, x: int, y: int, w: int, h: int) -> None:
         ix, iy, iw, ih = self._panel(x, y, w, h, "Video")
         frame = self.state.latest_camera_frame
-        self._draw_image_or_placeholder(ix, iy, iw, ih, frame, "waiting for camera preview")
+        self._draw_image_or_placeholder(
+            ix,
+            iy,
+            iw,
+            ih,
+            frame,
+            "waiting for camera preview",
+            cache_key="camera",
+        )
         now = time.perf_counter()
         meta = [f"frames {self.state.camera_frame_count}"]
         if frame:
@@ -784,7 +820,15 @@ class _MonitorWindow:
 
     def _draw_task_panel(self, x: int, y: int, w: int, h: int) -> None:
         ix, iy, iw, ih = self._panel(x, y, w, h, "Task Screen")
-        self._draw_image_or_placeholder(ix, iy, iw, ih, self.state.latest_task_frame, "waiting for task frame")
+        self._draw_image_or_placeholder(
+            ix,
+            iy,
+            iw,
+            ih,
+            self.state.latest_task_frame,
+            "waiting for task frame",
+            cache_key="task",
+        )
         now = time.perf_counter()
         meta = [f"frames {self.state.task_frame_count}"]
         frame = self.state.latest_task_frame
@@ -1240,9 +1284,16 @@ class _MonitorWindow:
         h: int,
         frame: dict[str, Any] | None,
         placeholder: str,
+        *,
+        cache_key: str,
     ) -> None:
         self.canvas.create_rectangle(x, y, x + w, y + h, fill="#11161b", outline="#11161b")
-        photo = self._photo_from_frame(frame)
+        photo = self._photo_from_frame(
+            frame,
+            cache_key=cache_key,
+            max_width=w,
+            max_height=h,
+        )
         if photo is None:
             self.canvas.create_text(
                 x + w / 2,
@@ -1252,29 +1303,53 @@ class _MonitorWindow:
                 font=("Segoe UI", 10),
             )
             return
-        if photo.width() > w or photo.height() > h:
-            factor = max(
-                1,
-                int(math.ceil(photo.width() / max(1, w))),
-                int(math.ceil(photo.height() / max(1, h))),
-            )
-            try:
-                photo = photo.subsample(factor, factor)
-            except Exception:
-                pass
         self._images.append(photo)
         px = x + max(0, (w - photo.width()) // 2)
         py = y + max(0, (h - photo.height()) // 2)
         self.canvas.create_image(px, py, anchor="nw", image=photo)
 
-    def _photo_from_frame(self, frame: dict[str, Any] | None) -> Any | None:
+    def _photo_from_frame(
+        self,
+        frame: dict[str, Any] | None,
+        *,
+        cache_key: str,
+        max_width: int,
+        max_height: int,
+    ) -> Any | None:
+        if frame is None:
+            self._photo_cache.pop(cache_key, None)
+            return None
+        token = id(frame)
+        cached = self._photo_cache.get(cache_key)
+        if cached is not None and cached[:3] == (token, int(max_width), int(max_height)):
+            return cached[3]
         data = _frame_to_netpbm(frame)
         if data is None:
+            self._photo_cache.pop(cache_key, None)
             return None
-        try:
-            return self.tk.PhotoImage(data=data, format="PPM")
-        except Exception:
-            return None
+        for candidate in (data, _mono_frame_to_rgb_netpbm(frame)):
+            if candidate is None:
+                continue
+            try:
+                photo = self.tk.PhotoImage(data=candidate, format="PPM")
+                if photo.width() > max_width or photo.height() > max_height:
+                    factor = max(
+                        1,
+                        int(math.ceil(photo.width() / max(1, max_width))),
+                        int(math.ceil(photo.height() / max(1, max_height))),
+                    )
+                    photo = photo.subsample(factor, factor)
+                self._photo_cache[cache_key] = (
+                    token,
+                    int(max_width),
+                    int(max_height),
+                    photo,
+                )
+                return photo
+            except Exception:
+                continue
+        self._photo_cache.pop(cache_key, None)
+        return None
 
     def _draw_speaker_icon(self, cx: int, cy: int, *, active: bool, small: bool = False) -> None:
         scale = 0.65 if small else 1.0
