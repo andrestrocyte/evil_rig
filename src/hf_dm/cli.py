@@ -10,7 +10,7 @@ import logging
 import os
 from pathlib import Path
 
-from hf_dm.config import SessionConfig, config_to_dict
+from hf_dm.config import SessionConfig, config_to_dict, task_design_summary
 from hf_dm.session.cap_touch_diagnostic import run_cap_touch_diagnostic
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.hardware_self_test import HardwareSelfTestSession, shorten_for_hardware_self_test
@@ -193,6 +193,7 @@ def _apply_session_setup(config: SessionConfig, setup: SessionSetup) -> None:
     config.camera.save_dir = str(session_dir / "videos")
     metadata = {
         "setup": asdict(setup),
+        "task_summary": task_design_summary(config),
         "config": config_to_dict(config),
         "created_wall_time_s": datetime.now().timestamp(),
     }

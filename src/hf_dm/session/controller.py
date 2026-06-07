@@ -12,7 +12,7 @@ from typing import Literal
 from bpod_core.bpod import Bpod
 
 from hf_dm.audio.white_noise import WhiteNoisePlayer
-from hf_dm.config import SessionConfig, TrainingPhase, config_to_dict
+from hf_dm.config import SessionConfig, TrainingPhase, config_to_dict, task_design_summary
 from hf_dm.camera.spinnaker import HeadlessSpinnakerRecorder
 from hf_dm.hardware.discovery import connect_bpod_core
 from hf_dm.data.recorder import SessionRecorder, SessionSummary, TrialRecord
@@ -338,11 +338,7 @@ class HFDecisionSession:
         return {
             "config": config_to_dict(self.config),
             "trial_schedule": list(self._trial_schedule),
-            "symbols": {
-                "high_effect": "star",
-                "low_effect": "circle",
-                "star_effect": self.config.task.modality,
-            },
+            "task_summary": task_design_summary(self.config),
         }
 
     def _start_operator_monitor(self) -> None:

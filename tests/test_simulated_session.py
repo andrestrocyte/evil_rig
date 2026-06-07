@@ -1,4 +1,7 @@
+import json
 import os
+
+import numpy as np
 
 from hf_dm.config import SessionConfig, TrainingPhase
 from hf_dm.session.simulated import (
@@ -43,6 +46,12 @@ def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
     assert all(trial.lick_count >= 1 for trial in session.recorder.trials)
     assert all(trial.force_samples > 0 for trial in session.recorder.trials)
     assert len(session.recorder.bpod_trials) == 3
+    with np.load(session.recorder.base_path.with_suffix(".npz"), allow_pickle=True) as data:
+        assert "trials_json" in data.files
+        assert "events_json" in data.files
+        first_trial = json.loads(str(data["trials_json"][0]))
+        assert "lick_timestamps_us" in first_trial
+        assert "camera_ttl_timestamps_us" in first_trial
     timeout_states = [
         row["state"]
         for row in session.recorder.bpod_trials[2]["events"]
@@ -106,4 +115,5 @@ def test_simulated_forced_risk_star_can_omit_pump_and_records_metadata(tmp_path)
     assert trial.risk_star_probability == 0.0
     assert "pump_omitted" in event_types
     assert "pump_start" not in event_types
-    assert session.recorder.metadata["symbols"]["star_effect"] == "risk"
+    assert session.recorder.metadata["task_summary"]["symbols"]["star"]["effect"] == "risk"
+    assert session.recorder.metadata["task_summary"]["symbols"]["star"]["reward_probability"] == 0.0

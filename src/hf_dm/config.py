@@ -441,3 +441,50 @@ def config_to_dict(config: SessionConfig) -> dict[str, Any]:
         return value
 
     return convert(asdict(config))
+
+
+def task_design_summary(config: SessionConfig) -> dict[str, Any]:
+    task = config.task
+    modality = str(task.modality or "force").lower()
+    if modality not in {"force", "risk", "delay"}:
+        modality = "force"
+    n_forced = max(0, int(task.n_forced_trials))
+    if task.n_free_trials is None:
+        n_free = max(0, int(config.n_trials) - n_forced)
+    else:
+        n_free = max(0, int(task.n_free_trials))
+    total = n_free + n_forced
+    star_summary: dict[str, Any] = {
+        "shape": "star",
+        "effect": modality,
+        "reward_duration_s": float(config.reward.matched_pump_s),
+        "relative_reward": "long",
+    }
+    if modality == "risk":
+        reward_probability = max(0.0, min(1.0, float(task.risk_star_probability)))
+        star_summary["reward_probability"] = reward_probability
+        star_summary["omission_probability"] = 1.0 - reward_probability
+    if modality == "delay":
+        star_summary["extra_delay_s"] = max(0.0, float(task.delay_star_extra_s))
+    return {
+        "modality": modality,
+        "profile_name": task.profile_name,
+        "n_trials": total,
+        "n_free_trials": n_free,
+        "n_forced_trials": n_forced,
+        "choice_modes": {
+            "free": "star and circle both visible; either centered shape ends the trial",
+            "forced": "only the forced shape is visible; only that side can end the trial before timeout",
+        },
+        "symbols": {
+            "star": star_summary,
+            "circle": {
+                "shape": "circle",
+                "effect": "baseline",
+                "reward_duration_s": float(config.reward.opposite_pump_s),
+                "reward_probability": 1.0,
+                "extra_delay_s": 0.0,
+                "relative_reward": "short",
+            },
+        },
+    }

@@ -210,6 +210,21 @@ class SessionRecorder:
                 [json.dumps(trial) for trial in self.bpod_trials],
                 dtype=object,
             ),
+            trials_json=np.array(
+                [json.dumps(asdict(trial), default=str) for trial in self.trials],
+                dtype=object,
+            ),
+            events_json=np.array(
+                [json.dumps(asdict(event), default=str) for event in self.events],
+                dtype=object,
+            ),
+            fsm_definitions_json=np.array(
+                [
+                    json.dumps({"fsm_name": name, "fsm_json": fsm_json}, default=str)
+                    for name, fsm_json in self.fsm_definitions.items()
+                ],
+                dtype=object,
+            ),
             summary_json=np.array([json.dumps(asdict(summary))], dtype=object),
             session_metadata_json=np.array(
                 [json.dumps(self.metadata, default=str)],
