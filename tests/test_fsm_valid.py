@@ -89,6 +89,26 @@ def test_production_fsm_owns_quiescence_choice_reward_and_timeout(mock_relay):
     assert fsm.states["PostTimeout"].actions[mock_relay.module_name] == 211
 
 
+def test_production_fsm_supports_shape_specific_reward_delays(mock_relay):
+    fsm = build_host_supervised_decision_fsm(
+        mock_relay,
+        quiescence_s=3.0,
+        choice_timeout_s=20.0,
+        choice_blank_s=0.1,
+        high_reward_s=0.08,
+        low_reward_s=0.04,
+        post_reward_s=1.0,
+        timeout_noise_s=2.0,
+        post_timeout_s=1.0,
+        high_delay_s=2.1,
+        low_delay_s=0.1,
+    )
+
+    fsm.check()
+    assert fsm.states["ChoiceBlankHigh"].timer == 2.1
+    assert fsm.states["ChoiceBlankLow"].timer == 0.1
+
+
 def test_decision_trial_reverses_reward_mapping_for_ccw_force(mock_relay):
     fsm = build_decision_trial_fsm(
         mock_relay,

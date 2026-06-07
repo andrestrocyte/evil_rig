@@ -10,7 +10,12 @@ from hf_dm.hardware.bringup_constants import (
     PUMP_OUTPUT_CHANNEL,
 )
 from hf_dm.monitor import OperatorMonitor, OperatorMonitorState
-from hf_dm.monitor.gui import _frame_age_text, _frame_to_netpbm, _mono_frame_to_rgb_netpbm
+from hf_dm.monitor.gui import (
+    _frame_age_text,
+    _frame_to_netpbm,
+    _frame_to_pillow_image,
+    _mono_frame_to_rgb_netpbm,
+)
 from hf_dm.session.controller import HFDecisionSession
 
 
@@ -324,6 +329,24 @@ def test_mono_monitor_frames_can_fall_back_to_rgb_netpbm_bytes():
     )
 
     assert rgb == b"P6\n2 1\n255\n" + bytes([10, 10, 10, 200, 200, 200])
+
+
+def test_monitor_frames_convert_to_pillow_images_when_available():
+    image = _frame_to_pillow_image(
+        {
+            "width": 3,
+            "height": 2,
+            "channels": 1,
+            "data": bytes([0, 40, 80, 120, 160, 200]),
+        },
+        max_width=2,
+        max_height=2,
+    )
+
+    if image is None:
+        return
+    assert image.mode == "L"
+    assert image.size == (2, 1)
 
 
 def test_frame_age_text_formats_recent_and_stale_frames():

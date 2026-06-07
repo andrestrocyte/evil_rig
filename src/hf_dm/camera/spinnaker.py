@@ -78,6 +78,69 @@ def _downsample_mono_bytes(
     return len(rows[0]), len(rows), b"".join(rows)
 
 
+def _downsample_pgm_file_preview(
+    path: Path,
+    *,
+    max_width: int,
+    max_height: int,
+) -> tuple[int, int, bytes] | None:
+    try:
+        raw = path.read_bytes()
+        width, height, pixel_offset = _parse_pgm_header(raw)
+    except Exception:
+        return None
+    pixels = width * height
+    if pixels <= 0 or len(raw) < pixel_offset + pixels:
+        return None
+    return _downsample_mono_bytes(
+        raw[pixel_offset : pixel_offset + pixels],
+        width=width,
+        height=height,
+        stride=width,
+        max_width=max_width,
+        max_height=max_height,
+    )
+
+
+def _parse_pgm_header(raw: bytes) -> tuple[int, int, int]:
+    magic, pos = _next_pgm_token(raw, 0)
+    if magic != b"P5":
+        raise ValueError("unsupported PGM magic")
+    width_token, pos = _next_pgm_token(raw, pos)
+    height_token, pos = _next_pgm_token(raw, pos)
+    max_value_token, pos = _next_pgm_token(raw, pos)
+    width = int(width_token)
+    height = int(height_token)
+    max_value = int(max_value_token)
+    if width <= 0 or height <= 0 or max_value <= 0 or max_value > 255:
+        raise ValueError("unsupported PGM dimensions or bit depth")
+    if pos >= len(raw) or raw[pos] not in b" \t\r\n":
+        raise ValueError("PGM header missing raster separator")
+    if raw[pos : pos + 2] == b"\r\n":
+        return width, height, pos + 2
+    return width, height, pos + 1
+
+
+def _next_pgm_token(raw: bytes, pos: int) -> tuple[bytes, int]:
+    length = len(raw)
+    while pos < length:
+        value = raw[pos]
+        if value in b" \t\r\n":
+            pos += 1
+            continue
+        if value == ord("#"):
+            while pos < length and raw[pos] not in b"\r\n":
+                pos += 1
+            continue
+        break
+    start = pos
+    while pos < length and raw[pos] not in b" \t\r\n":
+        pos += 1
+    if start == pos:
+        raise ValueError("PGM token missing")
+    return raw[start:pos], pos
+
+
 class _PreviewDispatcher:
     """Drop-stale dispatcher so preview publishing cannot stall acquisition."""
 
@@ -532,8 +595,8 @@ class _SpinnakerCRecorder:
                     camera_timestamp_ns,
                     filename,
                 )
-                self._maybe_emit_preview(
-                    image,
+                self._maybe_emit_saved_preview(
+                    frame_path,
                     frame_index=frame_index,
                     camera_timestamp_ns=camera_timestamp_ns,
                 )
@@ -541,9 +604,9 @@ class _SpinnakerCRecorder:
             finally:
                 self._fn["spinImageRelease"](image)
 
-    def _maybe_emit_preview(
+    def _maybe_emit_saved_preview(
         self,
-        image: ctypes.c_void_p,
+        frame_path: Path,
         *,
         frame_index: int,
         camera_timestamp_ns: int | None,
@@ -552,31 +615,9 @@ class _SpinnakerCRecorder:
             return
         if not _preview_due(self._last_preview_mono_s, self._preview_min_interval_s):
             return
-        required = ("spinImageGetWidth", "spinImageGetHeight", "spinImageGetStride", "spinImageGetData")
-        if any(name not in self._fn for name in required):
-            return
         try:
-            width = ctypes.c_size_t()
-            height = ctypes.c_size_t()
-            stride = ctypes.c_size_t()
-            data_ptr = ctypes.c_void_p()
-            if self._fn["spinImageGetWidth"](image, ctypes.byref(width)) != 0:
-                return
-            if self._fn["spinImageGetHeight"](image, ctypes.byref(height)) != 0:
-                return
-            if self._fn["spinImageGetStride"](image, ctypes.byref(stride)) != 0:
-                return
-            if self._fn["spinImageGetData"](image, ctypes.byref(data_ptr)) != 0:
-                return
-            if not data_ptr.value:
-                return
-            byte_count = int(stride.value) * int(height.value)
-            raw = ctypes.string_at(data_ptr, byte_count)
-            preview = _downsample_mono_bytes(
-                raw,
-                width=int(width.value),
-                height=int(height.value),
-                stride=int(stride.value),
+            preview = _downsample_pgm_file_preview(
+                frame_path,
                 max_width=self._preview_max_width,
                 max_height=self._preview_max_height,
             )

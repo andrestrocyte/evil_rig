@@ -75,3 +75,35 @@ def test_simulated_centering_requires_wheel_motion_and_rewards_at_center(tmp_pat
     assert abs(trial.final_position_deg) <= config.centering_threshold_deg
     assert abs(trial.net_pulses) > 0
     assert "pump_start" in event_types
+
+
+def test_simulated_forced_risk_star_can_omit_pump_and_records_metadata(tmp_path):
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    config = SessionConfig(n_trials=1, random_seed=1, results_dir=str(tmp_path))
+    config.camera.save_dir = str(tmp_path / "videos")
+    config.task.modality = "risk"
+    config.task.n_free_trials = 0
+    config.task.n_forced_trials = 1
+    config.task.risk_star_probability = 0.0
+    shorten_for_simulation(config)
+    session = SimulatedHFDecisionSession(
+        config,
+        SimulationOptions(choice_mode="matched", frames_to_choice=4),
+    )
+
+    session.connect()
+    summary = session.run()
+
+    trial = session.recorder.trials[0]
+    event_types = [event.event_type for event in session.recorder.events]
+    assert summary.n_trials_completed == 1
+    assert trial.trial_mode == "forced"
+    assert trial.forced_shape == "star"
+    assert trial.modality == "risk"
+    assert trial.chosen_shape == "star"
+    assert trial.reward_duration_s == 0.0
+    assert not trial.reward_delivered
+    assert trial.risk_star_probability == 0.0
+    assert "pump_omitted" in event_types
+    assert "pump_start" not in event_types
+    assert session.recorder.metadata["symbols"]["star_effect"] == "risk"

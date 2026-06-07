@@ -19,6 +19,15 @@ class TrialRuntime:
     force_direction: Direction
     star_side: Side
     circle_side: Side
+    trial_mode: str = "free"
+    forced_shape: Shape | None = None
+    modality: str = "force"
+    high_reward_s: float = 0.08
+    low_reward_s: float = 0.04
+    high_delay_s: float = 0.0
+    low_delay_s: float = 0.0
+    star_reward_delivered: bool = True
+    risk_star_probability: float | None = None
     phase: str = "starting"
     phase_started_mono_s: float = field(default_factory=time.perf_counter)
     error: str | None = None
@@ -102,6 +111,15 @@ class TrialRuntime:
                 "chosen_shape": self.chosen_shape,
                 "choice_side": self.choice_side,
                 "wheel_choice": self.wheel_choice,
+                "trial_mode": self.trial_mode,
+                "forced_shape": self.forced_shape,
+                "modality": self.modality,
+                "high_reward_s": self.high_reward_s,
+                "low_reward_s": self.low_reward_s,
+                "high_delay_s": self.high_delay_s,
+                "low_delay_s": self.low_delay_s,
+                "star_reward_delivered": self.star_reward_delivered,
+                "risk_star_probability": self.risk_star_probability,
                 "choice_detected_mono_s": self.choice_detected_mono_s,
                 "choice_closed": self.choice_closed,
                 "state_entries": list(self.state_entries),

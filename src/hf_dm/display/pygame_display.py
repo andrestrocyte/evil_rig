@@ -213,6 +213,7 @@ class TaskDisplay:
         left_position_deg: float,
         right_position_deg: float,
         force_direction: Direction,
+        visible_shape: Shape | None = None,
         trial_index: int | None = None,
         response_time_s: float | None = None,
     ) -> float:
@@ -228,8 +229,10 @@ class TaskDisplay:
         )
         left_shape = "star" if star_side == "left" else "circle"
         right_shape = "circle" if star_side == "left" else "star"
-        self._blit_shape(left_shape, self._shape_center(left_position_deg))
-        self._blit_shape(right_shape, self._shape_center(right_position_deg))
+        if visible_shape in (None, left_shape):
+            self._blit_shape(left_shape, self._shape_center(left_position_deg))
+        if visible_shape in (None, right_shape):
+            self._blit_shape(right_shape, self._shape_center(right_position_deg))
         if self.config.show_debug_overlay:
             self._draw_debug_overlay(force_direction, trial_index, response_time_s)
         pygame.display.flip()

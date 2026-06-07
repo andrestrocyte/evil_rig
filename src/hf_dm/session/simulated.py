@@ -356,6 +356,7 @@ class SimulatedHFDecisionSession(HFDecisionSession):
             self.config.subject_id,
             self.config.phase.value,
         )
+        self.recorder.set_metadata(self._session_metadata())
         self._start_operator_monitor()
         if self.config.camera.record_video:
             video = SimulatedVideoRecorder(
@@ -481,7 +482,20 @@ class SimulatedHFDecisionSession(HFDecisionSession):
 
 def shorten_for_simulation(config: SessionConfig, *, n_trials: int | None = None) -> None:
     if n_trials is not None:
-        config.n_trials = int(n_trials)
+        n_trials = max(0, int(n_trials))
+        if config.task.n_free_trials is not None or config.task.n_forced_trials:
+            old_free = (
+                int(config.task.n_free_trials)
+                if config.task.n_free_trials is not None
+                else max(0, int(config.n_trials) - int(config.task.n_forced_trials))
+            )
+            old_forced = max(0, int(config.task.n_forced_trials))
+            old_total = max(1, old_free + old_forced)
+            forced = int(round(n_trials * (old_forced / old_total)))
+            forced = max(0, min(n_trials, forced))
+            config.task.n_free_trials = n_trials - forced
+            config.task.n_forced_trials = forced
+        config.n_trials = n_trials
     config.timing.quiescence_s = 0.0
     config.timing.inter_trial_min_s = min(config.timing.inter_trial_min_s, 0.05)
     config.timing.choice_timeout_s = min(config.timing.choice_timeout_s, 0.5)

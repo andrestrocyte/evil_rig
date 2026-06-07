@@ -32,10 +32,14 @@ def build_host_supervised_decision_fsm(
     post_reward_s: float,
     timeout_noise_s: float,
     post_timeout_s: float,
+    high_delay_s: float | None = None,
+    low_delay_s: float | None = None,
 ) -> StateMachine:
     """Build the production FSM while Python supervises wheel/display continuously."""
     fsm = StateMachine(name="HostSupervisedDecision")
     abort_transition = {f"SoftCode{sc.SESSION_ABORT}": "Abort"}
+    high_delay = choice_blank_s if high_delay_s is None else float(high_delay_s)
+    low_delay = choice_blank_s if low_delay_s is None else float(low_delay_s)
 
     fsm.add_state(
         name="Quiescence",
@@ -68,13 +72,13 @@ def build_host_supervised_decision_fsm(
     )
     fsm.add_state(
         name="ChoiceBlankHigh",
-        timer=choice_blank_s,
+        timer=high_delay,
         transitions={"Tup": "RewardHigh", **abort_transition},
         actions=_softcode_action(sc.STATE_BLANK),
     )
     fsm.add_state(
         name="ChoiceBlankLow",
-        timer=choice_blank_s,
+        timer=low_delay,
         transitions={"Tup": "RewardLow", **abort_transition},
         actions=_softcode_action(sc.STATE_BLANK),
     )

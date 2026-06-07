@@ -12,7 +12,7 @@ from typing import Literal
 from bpod_core.bpod import Bpod
 
 from hf_dm.audio.white_noise import WhiteNoisePlayer
-from hf_dm.config import SessionConfig, TrainingPhase
+from hf_dm.config import SessionConfig, TrainingPhase, config_to_dict
 from hf_dm.camera.spinnaker import HeadlessSpinnakerRecorder
 from hf_dm.hardware.discovery import connect_bpod_core
 from hf_dm.data.recorder import SessionRecorder, SessionSummary, TrialRecord
@@ -63,6 +63,7 @@ class HFDecisionSession:
         self._active_trial_runtime: TrialRuntime | None = None
         self._cap_touch_poll_stop = threading.Event()
         self._cap_touch_poll_thread: threading.Thread | None = None
+        self._trial_schedule = self._build_trial_schedule()
 
     def connect(self) -> None:
         self._closed = False
@@ -82,6 +83,7 @@ class HFDecisionSession:
         self.display = TaskDisplay(self.config.display)
         out = Path(self.config.results_dir)
         self.recorder = SessionRecorder(out, self.config.subject_id, self.config.phase.value)
+        self.recorder.set_metadata(self._session_metadata())
         self._configure_cap_touch_digitizer_from_config()
         self._start_operator_monitor()
         self._start_optional_video_recording()
@@ -298,6 +300,51 @@ class HFDecisionSession:
                 ports.add(str(port))
         return ports
 
+    def _build_trial_schedule(self) -> list[dict[str, str | None]]:
+        task = self.config.task
+        n_forced = max(0, int(task.n_forced_trials))
+        if task.n_free_trials is None:
+            n_free = max(0, int(self.config.n_trials) - n_forced)
+        else:
+            n_free = max(0, int(task.n_free_trials))
+        total = n_free + n_forced
+        if total > 0:
+            self.config.n_trials = total
+
+        schedule: list[dict[str, str | None]] = [
+            {"trial_mode": "free", "forced_shape": None} for _ in range(n_free)
+        ]
+        forced_shapes = ["star" if idx % 2 == 0 else "circle" for idx in range(n_forced)]
+        self.rng.shuffle(forced_shapes)
+        schedule.extend(
+            {"trial_mode": "forced", "forced_shape": shape} for shape in forced_shapes
+        )
+        self.rng.shuffle(schedule)
+        return schedule
+
+    def _trial_spec(self, trial_index: int) -> dict[str, str | None]:
+        if 1 <= trial_index <= len(self._trial_schedule):
+            return dict(self._trial_schedule[trial_index - 1])
+        return {"trial_mode": "free", "forced_shape": None}
+
+    def _n_trials_by_mode(self) -> dict[str, int]:
+        counts = {"free": 0, "forced": 0}
+        for spec in self._trial_schedule:
+            mode = str(spec.get("trial_mode") or "free")
+            counts[mode] = counts.get(mode, 0) + 1
+        return counts
+
+    def _session_metadata(self) -> dict:
+        return {
+            "config": config_to_dict(self.config),
+            "trial_schedule": list(self._trial_schedule),
+            "symbols": {
+                "high_effect": "star",
+                "low_effect": "circle",
+                "star_effect": self.config.task.modality,
+            },
+        }
+
     def _start_operator_monitor(self) -> None:
         if not self.config.monitor.enabled:
             return
@@ -309,6 +356,10 @@ class HFDecisionSession:
                 "subject_id": self.config.subject_id,
                 "phase": self.config.phase.value,
                 "n_trials": self.config.n_trials,
+                "task_modality": self.config.task.modality,
+                "task_profile": self.config.task.profile_name,
+                "n_free_trials": self._n_trials_by_mode().get("free", 0),
+                "n_forced_trials": self._n_trials_by_mode().get("forced", 0),
                 "display_index": self.config.display.display_index,
                 "camera_hz": self.config.camera.frequency_hz,
                 "camera_backend": self.config.camera.backend,
@@ -590,6 +641,9 @@ class HFDecisionSession:
                     "circle_side": runtime.circle_side,
                     "chosen_shape": runtime.chosen_shape,
                     "choice_side": runtime.choice_side,
+                    "trial_mode": runtime.trial_mode,
+                    "forced_shape": runtime.forced_shape,
+                    "modality": runtime.modality,
                 }
             )
         self._publish_monitor("fsm_state", payload)
@@ -655,9 +709,14 @@ class HFDecisionSession:
                 "choice": trial.choice,
                 "choice_side": trial.choice_side,
                 "chosen_shape": trial.chosen_shape,
+                "trial_mode": trial.trial_mode,
+                "forced_shape": trial.forced_shape,
+                "modality": trial.modality,
                 "matched": trial.matched,
                 "responded": trial.responded,
                 "reward_duration_s": trial.reward_duration_s,
+                "reward_delay_s": trial.reward_delay_s,
+                "reward_delivered": trial.reward_delivered,
                 "response_time_s": trial.response_time_s,
                 "final_position_deg": trial.final_position_deg,
                 "star_side": trial.star_side,
@@ -1225,11 +1284,38 @@ class HFDecisionSession:
             if softcode == sc.STATE_PUMP_ON:
                 if runtime.chosen_shape not in ("star", "circle"):
                     raise RuntimeError("Bpod entered reward state before a host choice was committed")
-                reward_s = (
-                    self.config.reward.matched_pump_s
-                    if runtime.chosen_shape == "star"
-                    else self.config.reward.opposite_pump_s
-                )
+                reward_s = self._runtime_reward_duration(runtime, runtime.chosen_shape)
+                if reward_s <= 0.0:
+                    self.recorder.log_event(
+                        "pump_omitted",
+                        {
+                            "trial_index": runtime.trial_index,
+                            "chosen_shape": runtime.chosen_shape,
+                            "modality": runtime.modality,
+                            "reason": "risk_no_reward",
+                            "trigger": "bpod_state_entry",
+                        },
+                    )
+                    self._publish_monitor(
+                        "pump",
+                        {
+                            "active": False,
+                            "trial_index": runtime.trial_index,
+                            "duration_s": 0.0,
+                            "source": "risk_no_reward",
+                        },
+                    )
+                    self._publish_fsm_state(
+                        "RewardHigh" if runtime.chosen_shape == "star" else "RewardLow",
+                        runtime=runtime,
+                        phase="reward",
+                    )
+                    runtime.enter(
+                        "reward",
+                        softcode=softcode,
+                        output_result={"pump_skipped": True, "reason": "risk_no_reward"},
+                    )
+                    return
                 transition = self.relay.pump_on()
                 actual_on = self._actual_transition_time(transition)
                 runtime.pump_actual_on_mono_s = actual_on
@@ -1239,6 +1325,7 @@ class HFDecisionSession:
                         "trial_index": runtime.trial_index,
                         "duration_s": reward_s,
                         "chosen_shape": runtime.chosen_shape,
+                        "modality": runtime.modality,
                         "transition": transition,
                         "actual_on_mono_s": actual_on,
                         "trigger": "bpod_state_entry",
@@ -1250,6 +1337,7 @@ class HFDecisionSession:
                         "active": True,
                         "trial_index": runtime.trial_index,
                         "duration_s": reward_s,
+                        "chosen_shape": runtime.chosen_shape,
                         "source": "bpod_state_entry",
                     },
                 )
@@ -1273,6 +1361,8 @@ class HFDecisionSession:
                     "pump_end",
                     {
                         "trial_index": runtime.trial_index,
+                        "chosen_shape": runtime.chosen_shape,
+                        "modality": runtime.modality,
                         "transition": transition,
                         "actual_off_mono_s": actual_off,
                         "actual_open_s": actual_open,
@@ -1374,6 +1464,51 @@ class HFDecisionSession:
         del trial_index
         return self.rng.choice(["left", "right"])
 
+    def _reward_plan_for_trial(self) -> dict[str, float | bool | str | None]:
+        modality = str(self.config.task.modality or "force").lower()
+        if modality not in {"force", "risk", "delay"}:
+            modality = "force"
+        star_delivered = True
+        risk_probability: float | None = None
+        if modality == "risk":
+            risk_probability = max(0.0, min(1.0, float(self.config.task.risk_star_probability)))
+            star_delivered = self.rng.random() < risk_probability
+        high_reward_s = float(self.config.reward.matched_pump_s) if star_delivered else 0.0
+        low_reward_s = float(self.config.reward.opposite_pump_s)
+        low_delay_s = float(self.config.timing.choice_blank_s)
+        high_delay_s = low_delay_s
+        if modality == "delay":
+            high_delay_s += max(0.0, float(self.config.task.delay_star_extra_s))
+        return {
+            "modality": modality,
+            "high_reward_s": high_reward_s,
+            "low_reward_s": low_reward_s,
+            "high_delay_s": high_delay_s,
+            "low_delay_s": low_delay_s,
+            "star_reward_delivered": bool(star_delivered),
+            "risk_star_probability": risk_probability,
+        }
+
+    @staticmethod
+    def _reward_state_timer(reward_s: float) -> float:
+        return max(0.001, float(reward_s))
+
+    @staticmethod
+    def _runtime_reward_duration(runtime: TrialRuntime, shape: Shape | None) -> float:
+        if shape == "star":
+            return float(runtime.high_reward_s)
+        if shape == "circle":
+            return float(runtime.low_reward_s)
+        return 0.0
+
+    @staticmethod
+    def _runtime_reward_delay(runtime: TrialRuntime, shape: Shape | None) -> float:
+        if shape == "star":
+            return float(runtime.high_delay_s)
+        if shape == "circle":
+            return float(runtime.low_delay_s)
+        return 0.0
+
     def _prepare_decision_trial(self, runtime: TrialRuntime) -> None:
         """Extension hook for the command-driven simulator and hardware self-test."""
         del runtime
@@ -1398,17 +1533,35 @@ class HFDecisionSession:
         *,
         star_side: Side,
         trial_index: int,
+        trial_mode: str = "free",
+        forced_shape: Shape | None = None,
     ) -> dict:
         assert self.bpod is not None and self.display is not None and self.recorder is not None
         assert self.speaker_relay is not None
 
         circle_side = self._opposite_side(star_side)
         force_direction = self._wheel_direction_for_side(star_side)
+        if forced_shape == "circle":
+            force_direction = self._wheel_direction_for_side(circle_side)
+        reward_plan = self._reward_plan_for_trial()
         runtime = TrialRuntime(
             trial_index=trial_index,
             force_direction=force_direction,
             star_side=star_side,
             circle_side=circle_side,
+            trial_mode=str(trial_mode),
+            forced_shape=forced_shape,
+            modality=str(reward_plan["modality"]),
+            high_reward_s=float(reward_plan["high_reward_s"]),
+            low_reward_s=float(reward_plan["low_reward_s"]),
+            high_delay_s=float(reward_plan["high_delay_s"]),
+            low_delay_s=float(reward_plan["low_delay_s"]),
+            star_reward_delivered=bool(reward_plan["star_reward_delivered"]),
+            risk_star_probability=(
+                None
+                if reward_plan["risk_star_probability"] is None
+                else float(reward_plan["risk_star_probability"])
+            ),
         )
         self._active_trial_runtime = runtime
         self._prepare_decision_trial(runtime)
@@ -1417,13 +1570,15 @@ class HFDecisionSession:
             quiescence_s=self.config.timing.quiescence_s,
             choice_timeout_s=self.config.timing.choice_timeout_s,
             choice_blank_s=self.config.timing.choice_blank_s,
-            high_reward_s=self.config.reward.matched_pump_s,
-            low_reward_s=self.config.reward.opposite_pump_s,
+            high_reward_s=self._reward_state_timer(runtime.high_reward_s),
+            low_reward_s=self._reward_state_timer(runtime.low_reward_s),
             post_reward_s=self.config.timing.post_reward_s,
             timeout_noise_s=self.config.timing.timeout_noise_s,
             post_timeout_s=self.config.timing.post_timeout_s,
+            high_delay_s=runtime.high_delay_s,
+            low_delay_s=runtime.low_delay_s,
         )
-        self.recorder.log_fsm_definition("host_supervised_decision", fsm)
+        self.recorder.log_fsm_definition(f"host_supervised_decision_trial_{trial_index}", fsm)
         self.wheel.reset_trial()
         self.display.fill_black()
 
@@ -1509,6 +1664,7 @@ class HFDecisionSession:
                         left_position_deg=final_left_deg,
                         right_position_deg=final_right_deg,
                         force_direction=force_direction,
+                        visible_shape=forced_shape if trial_mode == "forced" else None,
                         trial_index=trial_index,
                     )
                     self._publish_monitor_throttled(
@@ -1521,6 +1677,9 @@ class HFDecisionSession:
                             "star_side": star_side,
                             "circle_side": circle_side,
                             "force_direction": force_direction,
+                            "trial_mode": trial_mode,
+                            "forced_shape": forced_shape,
+                            "modality": runtime.modality,
                             "left_position_deg": final_left_deg,
                             "right_position_deg": final_right_deg,
                             "net_position_deg": net_position_deg,
@@ -1536,6 +1695,9 @@ class HFDecisionSession:
                                 "trial_index": trial_index,
                                 "star_side": star_side,
                                 "circle_side": circle_side,
+                                "trial_mode": trial_mode,
+                                "forced_shape": forced_shape,
+                                "modality": runtime.modality,
                                 "left_position_deg": final_left_deg,
                                 "right_position_deg": final_right_deg,
                                 "display_flip_mono_s": flip_mono_s,
@@ -1549,6 +1711,10 @@ class HFDecisionSession:
                         selected_side = "left"
                     elif final_right_deg <= threshold:
                         selected_side = "right"
+                    if selected_side is not None and trial_mode == "forced":
+                        forced_side = star_side if forced_shape == "star" else circle_side
+                        if selected_side != forced_side:
+                            selected_side = None
 
                     if selected_side is not None:
                         chosen_shape: Shape = "star" if selected_side == star_side else "circle"
@@ -1564,11 +1730,8 @@ class HFDecisionSession:
                                 0.0,
                                 detected_mono_s - float(choice_start_mono_s),
                             )
-                            reward_s = (
-                                self.config.reward.matched_pump_s
-                                if chosen_shape == "star"
-                                else self.config.reward.opposite_pump_s
-                            )
+                            reward_s = self._runtime_reward_duration(runtime, chosen_shape)
+                            reward_delay_s = self._runtime_reward_delay(runtime, chosen_shape)
                             self.recorder.log_event(
                                 "choice_detected",
                                 {
@@ -1576,10 +1739,16 @@ class HFDecisionSession:
                                     "choice": wheel_choice,
                                     "choice_side": selected_side,
                                     "chosen_shape": chosen_shape,
+                                    "trial_mode": trial_mode,
+                                    "forced_shape": forced_shape,
+                                    "modality": runtime.modality,
                                     "force_direction": force_direction,
                                     "matched": chosen_shape == "star",
                                     "response_time_s": response_time_s,
                                     "reward_duration_s": reward_s,
+                                    "reward_delay_s": reward_delay_s,
+                                    "reward_delivered": reward_s > 0.0,
+                                    "risk_star_probability": runtime.risk_star_probability,
                                     "host_to_bpod_softcode": (
                                         sc.CHOICE_HIGH
                                         if chosen_shape == "star"
@@ -1595,9 +1764,14 @@ class HFDecisionSession:
                                     "choice": wheel_choice,
                                     "choice_side": selected_side,
                                     "chosen_shape": chosen_shape,
+                                    "trial_mode": trial_mode,
+                                    "forced_shape": forced_shape,
+                                    "modality": runtime.modality,
                                     "matched": chosen_shape == "star",
                                     "response_time_s": response_time_s,
                                     "reward_duration_s": reward_s,
+                                    "reward_delay_s": reward_delay_s,
+                                    "reward_delivered": reward_s > 0.0,
                                 },
                             )
                             self.bpod.send_softcode(
@@ -1670,13 +1844,8 @@ class HFDecisionSession:
             if state["choice_detected_mono_s"] is None or choice_start_mono_s is None
             else max(0.0, float(state["choice_detected_mono_s"]) - choice_start_mono_s)
         )
-        reward_s = (
-            self.config.reward.matched_pump_s
-            if chosen_shape == "star"
-            else self.config.reward.opposite_pump_s
-            if chosen_shape == "circle"
-            else 0.0
-        )
+        reward_s = self._runtime_reward_duration(runtime, chosen_shape)
+        reward_delay_s = self._runtime_reward_delay(runtime, chosen_shape)
         final_position_deg = (
             final_left_deg
             if choice_side == "left"
@@ -1704,6 +1873,9 @@ class HFDecisionSession:
             "force_direction": force_direction,
             "star_side": star_side,
             "circle_side": circle_side,
+            "trial_mode": trial_mode,
+            "forced_shape": forced_shape,
+            "modality": runtime.modality,
             "choice": wheel_choice,
             "choice_side": choice_side,
             "chosen_shape": chosen_shape,
@@ -1711,6 +1883,9 @@ class HFDecisionSession:
             "responded": responded,
             "response_time_s": response_time_s,
             "reward_duration_s": reward_s,
+            "reward_delay_s": reward_delay_s,
+            "reward_delivered": reward_s > 0.0,
+            "risk_star_probability": runtime.risk_star_probability,
             "final_position_deg": final_position_deg,
             "runtime": state,
         }
@@ -2103,9 +2278,17 @@ class HFDecisionSession:
         trial_mono = time.perf_counter()
         camera_start_idx = len(self.dio.get_camera_events())
         lick_start_idx = self._lick_event_count()
+        spec = self._trial_spec(trial_index)
+        trial_mode = str(spec.get("trial_mode") or "free")
+        forced_shape = spec.get("forced_shape")
+        forced_shape = forced_shape if forced_shape in ("star", "circle") else None
+        forced_shape_typed: Shape | None = forced_shape  # type: ignore[assignment]
         star_side = self._choose_star_side(trial_index)
         circle_side = self._opposite_side(star_side)
-        force_direction = self._wheel_direction_for_side(star_side)
+        if trial_mode == "forced" and forced_shape_typed == "circle":
+            force_direction = self._wheel_direction_for_side(circle_side)
+        else:
+            force_direction = self._wheel_direction_for_side(star_side)
         self.recorder.log_event(
             "trial_start",
             {
@@ -2113,6 +2296,9 @@ class HFDecisionSession:
                 "star_side": star_side,
                 "circle_side": circle_side,
                 "force_direction": force_direction,
+                "trial_mode": trial_mode,
+                "forced_shape": forced_shape_typed,
+                "modality": self.config.task.modality,
                 "trial_controller": "bpod_core_fsm",
             },
         )
@@ -2124,10 +2310,18 @@ class HFDecisionSession:
                 "star_side": star_side,
                 "circle_side": circle_side,
                 "force_direction": force_direction,
+                "trial_mode": trial_mode,
+                "forced_shape": forced_shape_typed,
+                "modality": self.config.task.modality,
             },
         )
 
-        result = self._run_bpod_decision_epoch(star_side=star_side, trial_index=trial_index)
+        result = self._run_bpod_decision_epoch(
+            star_side=star_side,
+            trial_index=trial_index,
+            trial_mode=trial_mode,
+            forced_shape=forced_shape_typed,
+        )
         loop_stats = dict(self._last_choice_loop_stats)
         snap = self.wheel.snapshot()
         cam_events = self.dio.get_camera_events()[camera_start_idx:]
@@ -2157,6 +2351,12 @@ class HFDecisionSession:
                 circle_side=result["circle_side"],
                 choice_side=result["choice_side"],
                 chosen_shape=result["chosen_shape"],
+                trial_mode=str(result["trial_mode"]),
+                forced_shape=result["forced_shape"],
+                modality=str(result["modality"]),
+                reward_delay_s=float(result["reward_delay_s"]),
+                reward_delivered=bool(result["reward_delivered"]),
+                risk_star_probability=result["risk_star_probability"],
                 bpod_state_entries=len(result["runtime"]["state_entries"]),
                 camera_ttl_timestamps_us=[ts for ts, _ in cam_events],
                 lick_count=len(lick_events),

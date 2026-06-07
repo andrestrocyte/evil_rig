@@ -589,6 +589,59 @@ def _mono_frame_to_rgb_netpbm(frame: dict[str, Any] | None) -> bytes | None:
     return header + bytes(rgb)
 
 
+def _frame_to_pillow_image(
+    frame: dict[str, Any] | None,
+    *,
+    max_width: int,
+    max_height: int,
+) -> Any | None:
+    if not frame:
+        return None
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        width = int(frame["width"])
+        height = int(frame["height"])
+        channels = int(frame.get("channels", 1))
+        data = frame["data"]
+    except Exception:
+        return None
+    if not isinstance(data, (bytes, bytearray)) or width <= 0 or height <= 0:
+        return None
+    raw = bytes(data)
+    pixels = width * height
+    try:
+        if channels == 1:
+            if len(raw) < pixels:
+                return None
+            image = Image.frombytes("L", (width, height), raw[:pixels])
+        elif channels >= 3:
+            needed = pixels * channels
+            if len(raw) < needed:
+                return None
+            if channels == 3:
+                rgb = raw[: pixels * 3]
+            else:
+                rgb_buffer = bytearray(pixels * 3)
+                out = 0
+                for idx in range(0, needed, channels):
+                    rgb_buffer[out : out + 3] = raw[idx : idx + 3]
+                    out += 3
+                rgb = bytes(rgb_buffer)
+            image = Image.frombytes("RGB", (width, height), rgb)
+        else:
+            return None
+        if image.width > max_width or image.height > max_height:
+            resampling = getattr(getattr(Image, "Resampling", Image), "BILINEAR")
+            image = image.copy()
+            image.thumbnail((max(1, int(max_width)), max(1, int(max_height))), resampling)
+        return image
+    except Exception:
+        return None
+
+
 def _run_monitor_process(
     config: MonitorConfig,
     event_q: Any,
@@ -641,7 +694,7 @@ class _MonitorWindow:
         self.width = max(980, int(config.width))
         self.height = max(720, int(config.height))
         self._images: list[Any] = []
-        self._photo_cache: dict[str, tuple[int, int, int, Any]] = {}
+        self._photo_cache: dict[str, tuple[tuple[Any, ...], int, int, Any]] = {}
 
         self.root.title("HF Decision Monitor")
         self.root.configure(bg="#edf0f2")
@@ -1319,19 +1372,35 @@ class _MonitorWindow:
         if frame is None:
             self._photo_cache.pop(cache_key, None)
             return None
-        token = id(frame)
+        token = self._frame_cache_token(frame)
         cached = self._photo_cache.get(cache_key)
         if cached is not None and cached[:3] == (token, int(max_width), int(max_height)):
             return cached[3]
+        photo = self._pillow_photo_from_frame(
+            frame,
+            max_width=max_width,
+            max_height=max_height,
+        )
+        if photo is not None:
+            self._photo_cache[cache_key] = (
+                token,
+                int(max_width),
+                int(max_height),
+                photo,
+            )
+            return photo
         data = _frame_to_netpbm(frame)
         if data is None:
             self._photo_cache.pop(cache_key, None)
             return None
-        for candidate in (data, _mono_frame_to_rgb_netpbm(frame)):
+        for candidate, image_format in (
+            (data, "PGM" if int(frame.get("channels", 1)) == 1 else "PPM"),
+            (_mono_frame_to_rgb_netpbm(frame), "PPM"),
+        ):
             if candidate is None:
                 continue
             try:
-                photo = self.tk.PhotoImage(data=candidate, format="PPM")
+                photo = self.tk.PhotoImage(data=candidate, format=image_format)
                 if photo.width() > max_width or photo.height() > max_height:
                     factor = max(
                         1,
@@ -1350,6 +1419,39 @@ class _MonitorWindow:
                 continue
         self._photo_cache.pop(cache_key, None)
         return None
+
+    def _pillow_photo_from_frame(
+        self,
+        frame: dict[str, Any],
+        *,
+        max_width: int,
+        max_height: int,
+    ) -> Any | None:
+        image = _frame_to_pillow_image(
+            frame,
+            max_width=max_width,
+            max_height=max_height,
+        )
+        if image is None:
+            return None
+        try:
+            from PIL import ImageTk
+
+            return ImageTk.PhotoImage(image, master=self.root)
+        except Exception:
+            return None
+
+    def _frame_cache_token(self, frame: dict[str, Any]) -> tuple[Any, ...]:
+        data = frame.get("data")
+        return (
+            frame.get("frame_index"),
+            frame.get("camera_timestamp_ns"),
+            frame.get("monotonic_s"),
+            frame.get("width"),
+            frame.get("height"),
+            frame.get("channels"),
+            len(data) if isinstance(data, (bytes, bytearray)) else None,
+        )
 
     def _draw_speaker_icon(self, cx: int, cy: int, *, active: bool, small: bool = False) -> None:
         scale = 0.65 if small else 1.0

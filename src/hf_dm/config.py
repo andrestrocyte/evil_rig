@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -73,6 +73,19 @@ class TimingConfig:
 class RewardConfig:
     matched_pump_s: float = 0.08
     opposite_pump_s: float = 0.04
+
+
+@dataclass
+class TaskDesignConfig:
+    modality: str = "force"
+    profile_name: str = "config"
+    n_free_trials: int | None = None
+    n_forced_trials: int = 0
+    risk_star_probability: float = 0.66
+    delay_star_extra_s: float = 2.0
+    selected_mouse_dir: str | None = None
+    session_name: str | None = None
+    session_dir: str | None = None
 
 
 @dataclass
@@ -153,6 +166,7 @@ class SessionConfig:
     display: DisplayConfig = field(default_factory=DisplayConfig)
     timing: TimingConfig = field(default_factory=TimingConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
+    task: TaskDesignConfig = field(default_factory=TaskDesignConfig)
     licks: LickConfig = field(default_factory=LickConfig)
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     engagement: EngagementConfig = field(default_factory=EngagementConfig)
@@ -175,6 +189,7 @@ class SessionConfig:
         )
         timing_raw = raw.get("timing", {})
         reward_raw = raw.get("reward", {})
+        task_raw = raw.get("task", raw.get("session_design", {}))
         lick_raw = raw.get("licks", raw.get("cap_touch", {}))
         speaker_raw = raw.get("speaker", {})
         display_raw = raw.get("display", {})
@@ -282,6 +297,33 @@ class SessionConfig:
                 matched_pump_s=float(reward_raw.get("matched_pump_s", 0.08)),
                 opposite_pump_s=float(reward_raw.get("opposite_pump_s", 0.04)),
             ),
+            task=TaskDesignConfig(
+                modality=str(task_raw.get("modality", "force")).lower(),
+                profile_name=str(task_raw.get("profile_name", "config")),
+                n_free_trials=(
+                    int(task_raw["n_free_trials"])
+                    if task_raw.get("n_free_trials") not in (None, "")
+                    else None
+                ),
+                n_forced_trials=int(task_raw.get("n_forced_trials", 0)),
+                risk_star_probability=float(task_raw.get("risk_star_probability", 0.66)),
+                delay_star_extra_s=float(task_raw.get("delay_star_extra_s", 2.0)),
+                selected_mouse_dir=(
+                    str(task_raw["selected_mouse_dir"])
+                    if task_raw.get("selected_mouse_dir") not in (None, "")
+                    else None
+                ),
+                session_name=(
+                    str(task_raw["session_name"])
+                    if task_raw.get("session_name") not in (None, "")
+                    else None
+                ),
+                session_dir=(
+                    str(task_raw["session_dir"])
+                    if task_raw.get("session_dir") not in (None, "")
+                    else None
+                ),
+            ),
             licks=LickConfig(
                 channels=channels(
                     "channels",
@@ -382,3 +424,20 @@ class SessionConfig:
             ),
             results_dir=str(raw.get("results_dir", "data/sessions")),
         )
+
+
+def config_to_dict(config: SessionConfig) -> dict[str, Any]:
+    def convert(value: Any) -> Any:
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, tuple):
+            return [convert(item) for item in value]
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): convert(item) for key, item in value.items()}
+        return value
+
+    return convert(asdict(config))
