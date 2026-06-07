@@ -459,6 +459,7 @@ def task_design_summary(config: SessionConfig) -> dict[str, Any]:
         "effect": modality,
         "reward_duration_s": float(config.reward.matched_pump_s),
         "relative_reward": "long",
+        "physical_force_output": modality == "force",
     }
     if modality == "risk":
         reward_probability = max(0.0, min(1.0, float(task.risk_star_probability)))
@@ -485,6 +486,7 @@ def task_design_summary(config: SessionConfig) -> dict[str, Any]:
                 "reward_probability": 1.0,
                 "extra_delay_s": 0.0,
                 "relative_reward": "short",
+                "physical_force_output": False,
             },
         },
     }

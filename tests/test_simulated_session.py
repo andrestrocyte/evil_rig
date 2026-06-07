@@ -115,5 +115,51 @@ def test_simulated_forced_risk_star_can_omit_pump_and_records_metadata(tmp_path)
     assert trial.risk_star_probability == 0.0
     assert "pump_omitted" in event_types
     assert "pump_start" not in event_types
+    assert "force_on" not in event_types
+    assert "force_skipped" in event_types
+    assert trial.force_direction is None
+    assert trial.force_output_direction is None
+    assert all(op[0] != "force" for op in session.relay.ops)
     assert session.recorder.metadata["task_summary"]["symbols"]["star"]["effect"] == "risk"
     assert session.recorder.metadata["task_summary"]["symbols"]["star"]["reward_probability"] == 0.0
+
+
+def test_simulated_force_modality_does_not_force_forced_circle(tmp_path):
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    config = SessionConfig(n_trials=2, random_seed=1, results_dir=str(tmp_path))
+    config.camera.save_dir = str(tmp_path / "videos")
+    config.task.modality = "force"
+    config.task.n_free_trials = 0
+    config.task.n_forced_trials = 2
+    shorten_for_simulation(config)
+    session = SimulatedHFDecisionSession(
+        config,
+        SimulationOptions(choice_mode="matched", frames_to_choice=4),
+    )
+
+    session.connect()
+    summary = session.run()
+
+    assert summary.n_trials_completed == 2
+    by_shape = {trial.forced_shape: trial for trial in session.recorder.trials}
+    star_trial = by_shape["star"]
+    circle_trial = by_shape["circle"]
+    assert star_trial.force_output_direction in ("cw", "ccw")
+    assert star_trial.force_direction == star_trial.star_direction
+    assert circle_trial.chosen_shape == "circle"
+    assert circle_trial.force_direction is None
+    assert circle_trial.force_output_direction is None
+    assert circle_trial.choice_target_direction == circle_trial.circle_direction
+
+    force_on_trials = [
+        event.payload["trial_index"]
+        for event in session.recorder.events
+        if event.event_type == "force_on"
+    ]
+    skipped_trials = [
+        event.payload["trial_index"]
+        for event in session.recorder.events
+        if event.event_type == "force_skipped"
+    ]
+    assert force_on_trials == [star_trial.trial_index]
+    assert skipped_trials == [circle_trial.trial_index]

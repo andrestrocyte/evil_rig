@@ -212,7 +212,7 @@ class TaskDisplay:
         star_side: Side,
         left_position_deg: float,
         right_position_deg: float,
-        force_direction: Direction,
+        force_direction: Direction | None,
         visible_shape: Shape | None = None,
         trial_index: int | None = None,
         response_time_s: float | None = None,
@@ -422,13 +422,13 @@ class TaskDisplay:
 
     def _draw_debug_overlay(
         self,
-        force_direction: Direction,
+        force_direction: Direction | None,
         trial_index: int | None,
         response_time_s: float | None,
     ) -> None:
         lines = [
             f"trial {trial_index}" if trial_index is not None else "trial",
-            f"force cue: {force_direction.upper()}",
+            f"force cue: {force_direction.upper()}" if force_direction else "force cue: off",
         ]
         if response_time_s is not None:
             lines.append(f"response time: {response_time_s:.3f}s")

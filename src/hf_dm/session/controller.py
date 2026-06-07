@@ -635,6 +635,11 @@ class HFDecisionSession:
                 {
                     "trial_index": runtime.trial_index,
                     "force_direction": runtime.force_direction,
+                    "force_output_direction": runtime.force_direction,
+                    "force_output_active": runtime.force_direction is not None,
+                    "choice_target_direction": runtime.choice_target_direction,
+                    "star_direction": runtime.star_direction,
+                    "circle_direction": runtime.circle_direction,
                     "star_side": runtime.star_side,
                     "circle_side": runtime.circle_side,
                     "chosen_shape": runtime.chosen_shape,
@@ -719,6 +724,11 @@ class HFDecisionSession:
                 "final_position_deg": trial.final_position_deg,
                 "star_side": trial.star_side,
                 "circle_side": trial.circle_side,
+                "star_direction": trial.star_direction,
+                "circle_direction": trial.circle_direction,
+                "choice_target_direction": trial.choice_target_direction,
+                "force_output_direction": trial.force_output_direction,
+                "force_output_active": trial.force_output_direction is not None,
                 "lick_count": trial.lick_count,
             },
         )
@@ -1238,18 +1248,37 @@ class HFDecisionSession:
 
             if softcode == sc.STATE_CHOICE:
                 self.wheel.reset_trial()
-                transition = self.relay.set_force_direction(runtime.force_direction)
-                actual_on = self._actual_transition_time(transition)
-                self.recorder.log_event(
-                    "force_on",
-                    {
-                        "trial_index": runtime.trial_index,
-                        "force_direction": runtime.force_direction,
-                        "transitions": transition,
-                        "actual_on_mono_s": actual_on,
-                        "trigger": "bpod_state_entry",
-                    },
-                )
+                if runtime.force_direction is None:
+                    transition = self.relay.force_off()
+                    self.recorder.log_event(
+                        "force_skipped",
+                        {
+                            "trial_index": runtime.trial_index,
+                            "modality": runtime.modality,
+                            "trial_mode": runtime.trial_mode,
+                            "forced_shape": runtime.forced_shape,
+                            "choice_target_direction": runtime.choice_target_direction,
+                            "reason": self._force_skip_reason(runtime),
+                            "transitions": transition,
+                            "actual_off_mono_s": self._actual_transition_time(transition),
+                            "trigger": "bpod_state_entry",
+                        },
+                    )
+                else:
+                    transition = self.relay.set_force_direction(runtime.force_direction)
+                    actual_on = self._actual_transition_time(transition)
+                    self.recorder.log_event(
+                        "force_on",
+                        {
+                            "trial_index": runtime.trial_index,
+                            "force_direction": runtime.force_direction,
+                            "force_output_direction": runtime.force_direction,
+                            "choice_target_direction": runtime.choice_target_direction,
+                            "transitions": transition,
+                            "actual_on_mono_s": actual_on,
+                            "trigger": "bpod_state_entry",
+                        },
+                    )
                 self._on_choice_window_started(runtime)
                 self._publish_fsm_state("ChoiceWindow", runtime=runtime, phase="choice")
                 runtime.enter("choice", softcode=softcode, output_result=transition)
@@ -1458,6 +1487,14 @@ class HFDecisionSession:
     def _wheel_direction_for_side(side: Side) -> Direction:
         return "cw" if side == "left" else "ccw"
 
+    @staticmethod
+    def _force_skip_reason(runtime: TrialRuntime) -> str:
+        if runtime.modality != "force":
+            return f"{runtime.modality}_modality_no_physical_force"
+        if runtime.trial_mode == "forced" and runtime.forced_shape == "circle":
+            return "forced_circle_baseline"
+        return "no_star_force_effect"
+
     def _choose_star_side(self, trial_index: int) -> Side:
         del trial_index
         return self.rng.choice(["left", "right"])
@@ -1538,13 +1575,24 @@ class HFDecisionSession:
         assert self.speaker_relay is not None
 
         circle_side = self._opposite_side(star_side)
-        force_direction = self._wheel_direction_for_side(star_side)
-        if forced_shape == "circle":
-            force_direction = self._wheel_direction_for_side(circle_side)
         reward_plan = self._reward_plan_for_trial()
+        star_direction = self._wheel_direction_for_side(star_side)
+        circle_direction = self._wheel_direction_for_side(circle_side)
+        choice_target_direction = (
+            circle_direction if trial_mode == "forced" and forced_shape == "circle" else star_direction
+        )
+        force_output_direction: Direction | None = (
+            star_direction
+            if reward_plan["modality"] == "force"
+            and not (trial_mode == "forced" and forced_shape == "circle")
+            else None
+        )
         runtime = TrialRuntime(
             trial_index=trial_index,
-            force_direction=force_direction,
+            force_direction=force_output_direction,
+            choice_target_direction=choice_target_direction,
+            star_direction=star_direction,
+            circle_direction=circle_direction,
             star_side=star_side,
             circle_side=circle_side,
             trial_mode=str(trial_mode),
@@ -1661,7 +1709,7 @@ class HFDecisionSession:
                         star_side=star_side,
                         left_position_deg=final_left_deg,
                         right_position_deg=final_right_deg,
-                        force_direction=force_direction,
+                        force_direction=force_output_direction,
                         visible_shape=forced_shape if trial_mode == "forced" else None,
                         trial_index=trial_index,
                     )
@@ -1674,7 +1722,12 @@ class HFDecisionSession:
                             "phase": phase,
                             "star_side": star_side,
                             "circle_side": circle_side,
-                            "force_direction": force_direction,
+                            "force_direction": force_output_direction,
+                            "force_output_direction": force_output_direction,
+                            "force_output_active": force_output_direction is not None,
+                            "choice_target_direction": choice_target_direction,
+                            "star_direction": star_direction,
+                            "circle_direction": circle_direction,
                             "trial_mode": trial_mode,
                             "forced_shape": forced_shape,
                             "modality": runtime.modality,
@@ -1696,6 +1749,12 @@ class HFDecisionSession:
                                 "trial_mode": trial_mode,
                                 "forced_shape": forced_shape,
                                 "modality": runtime.modality,
+                                "force_direction": force_output_direction,
+                                "force_output_direction": force_output_direction,
+                                "force_output_active": force_output_direction is not None,
+                                "choice_target_direction": choice_target_direction,
+                                "star_direction": star_direction,
+                                "circle_direction": circle_direction,
                                 "left_position_deg": final_left_deg,
                                 "right_position_deg": final_right_deg,
                                 "display_flip_mono_s": flip_mono_s,
@@ -1740,7 +1799,12 @@ class HFDecisionSession:
                                     "trial_mode": trial_mode,
                                     "forced_shape": forced_shape,
                                     "modality": runtime.modality,
-                                    "force_direction": force_direction,
+                                    "force_direction": force_output_direction,
+                                    "force_output_direction": force_output_direction,
+                                    "force_output_active": force_output_direction is not None,
+                                    "choice_target_direction": choice_target_direction,
+                                    "star_direction": star_direction,
+                                    "circle_direction": circle_direction,
                                     "matched": chosen_shape == "star",
                                     "response_time_s": response_time_s,
                                     "reward_duration_s": reward_s,
@@ -1806,7 +1870,10 @@ class HFDecisionSession:
                             "choice_timeout",
                             {
                                 "trial_index": trial_index,
-                                "force_direction": force_direction,
+                                "force_direction": force_output_direction,
+                                "force_output_direction": force_output_direction,
+                                "force_output_active": force_output_direction is not None,
+                                "choice_target_direction": choice_target_direction,
                                 "response_time_s": self.config.timing.choice_timeout_s,
                                 "trigger": "bpod_choice_window_tup",
                             },
@@ -1868,7 +1935,11 @@ class HFDecisionSession:
             reward_duration_s=reward_s,
         )
         return {
-            "force_direction": force_direction,
+            "force_direction": force_output_direction,
+            "force_output_direction": force_output_direction,
+            "choice_target_direction": choice_target_direction,
+            "star_direction": star_direction,
+            "circle_direction": circle_direction,
             "star_side": star_side,
             "circle_side": circle_side,
             "trial_mode": trial_mode,
@@ -2283,17 +2354,32 @@ class HFDecisionSession:
         forced_shape_typed: Shape | None = forced_shape  # type: ignore[assignment]
         star_side = self._choose_star_side(trial_index)
         circle_side = self._opposite_side(star_side)
-        if trial_mode == "forced" and forced_shape_typed == "circle":
-            force_direction = self._wheel_direction_for_side(circle_side)
-        else:
-            force_direction = self._wheel_direction_for_side(star_side)
+        star_direction = self._wheel_direction_for_side(star_side)
+        circle_direction = self._wheel_direction_for_side(circle_side)
+        choice_target_direction = (
+            circle_direction
+            if trial_mode == "forced" and forced_shape_typed == "circle"
+            else star_direction
+        )
+        modality = str(self.config.task.modality or "force").lower()
+        force_output_direction: Direction | None = (
+            star_direction
+            if modality == "force"
+            and not (trial_mode == "forced" and forced_shape_typed == "circle")
+            else None
+        )
         self.recorder.log_event(
             "trial_start",
             {
                 "trial_index": trial_index,
                 "star_side": star_side,
                 "circle_side": circle_side,
-                "force_direction": force_direction,
+                "force_direction": force_output_direction,
+                "force_output_direction": force_output_direction,
+                "force_output_active": force_output_direction is not None,
+                "choice_target_direction": choice_target_direction,
+                "star_direction": star_direction,
+                "circle_direction": circle_direction,
                 "trial_mode": trial_mode,
                 "forced_shape": forced_shape_typed,
                 "modality": self.config.task.modality,
@@ -2307,7 +2393,12 @@ class HFDecisionSession:
                 "phase": self.config.phase.value,
                 "star_side": star_side,
                 "circle_side": circle_side,
-                "force_direction": force_direction,
+                "force_direction": force_output_direction,
+                "force_output_direction": force_output_direction,
+                "force_output_active": force_output_direction is not None,
+                "choice_target_direction": choice_target_direction,
+                "star_direction": star_direction,
+                "circle_direction": circle_direction,
                 "trial_mode": trial_mode,
                 "forced_shape": forced_shape_typed,
                 "modality": self.config.task.modality,
@@ -2347,6 +2438,10 @@ class HFDecisionSession:
                 trial_start_mono_s=trial_mono,
                 star_side=result["star_side"],
                 circle_side=result["circle_side"],
+                star_direction=result["star_direction"],
+                circle_direction=result["circle_direction"],
+                choice_target_direction=result["choice_target_direction"],
+                force_output_direction=result["force_output_direction"],
                 choice_side=result["choice_side"],
                 chosen_shape=result["chosen_shape"],
                 trial_mode=str(result["trial_mode"]),

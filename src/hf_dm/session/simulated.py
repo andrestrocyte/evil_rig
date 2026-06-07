@@ -440,26 +440,26 @@ class SimulatedHFDecisionSession(HFDecisionSession):
 
     def _choice_for_trial(
         self,
-        force_direction: Direction,
+        choice_target_direction: Direction,
         trial_index: int,
     ) -> Literal["cw", "ccw", "timeout"]:
         mode = self.options.choice_mode
         if mode == "matched":
-            return force_direction
+            return choice_target_direction
         if mode == "opposite":
-            return "ccw" if force_direction == "cw" else "cw"
+            return "ccw" if choice_target_direction == "cw" else "cw"
         if mode in ("cw", "ccw", "timeout"):
             return mode
         cycle = ("matched", "opposite", "timeout")[(trial_index - 1) % 3]
         if cycle == "matched":
-            return force_direction
+            return choice_target_direction
         if cycle == "opposite":
-            return "ccw" if force_direction == "cw" else "cw"
+            return "ccw" if choice_target_direction == "cw" else "cw"
         return "timeout"
 
     def _prepare_decision_trial(self, runtime: TrialRuntime) -> None:
         runtime.simulated_choice = self._choice_for_trial(  # type: ignore[attr-defined]
-            runtime.force_direction,
+            runtime.choice_target_direction,
             runtime.trial_index,
         )
 

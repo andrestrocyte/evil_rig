@@ -16,7 +16,10 @@ Shape = Literal["star", "circle"]
 @dataclass
 class TrialRuntime:
     trial_index: int
-    force_direction: Direction
+    force_direction: Direction | None
+    choice_target_direction: Direction
+    star_direction: Direction
+    circle_direction: Direction
     star_side: Side
     circle_side: Side
     trial_mode: str = "free"
@@ -111,6 +114,11 @@ class TrialRuntime:
                 "chosen_shape": self.chosen_shape,
                 "choice_side": self.choice_side,
                 "wheel_choice": self.wheel_choice,
+                "choice_target_direction": self.choice_target_direction,
+                "star_direction": self.star_direction,
+                "circle_direction": self.circle_direction,
+                "force_output_active": self.force_direction is not None,
+                "force_output_direction": self.force_direction,
                 "trial_mode": self.trial_mode,
                 "forced_shape": self.forced_shape,
                 "modality": self.modality,

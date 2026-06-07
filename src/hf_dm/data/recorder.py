@@ -47,6 +47,10 @@ class TrialRecord:
     trial_start_mono_s: float
     star_side: str | None = None
     circle_side: str | None = None
+    star_direction: str | None = None
+    circle_direction: str | None = None
+    choice_target_direction: str | None = None
+    force_output_direction: str | None = None
     choice_side: str | None = None
     chosen_shape: str | None = None
     trial_mode: str = "free"
@@ -278,6 +282,10 @@ class SessionRecorder:
             ("trial_start_mono_s", "f8"),
             ("star_side", "U8"),
             ("circle_side", "U8"),
+            ("star_direction", "U8"),
+            ("circle_direction", "U8"),
+            ("choice_target_direction", "U8"),
+            ("force_output_direction", "U8"),
             ("choice_side", "U8"),
             ("chosen_shape", "U8"),
             ("trial_mode", "U12"),
@@ -319,6 +327,10 @@ class SessionRecorder:
                     t.trial_start_mono_s,
                     t.star_side or "",
                     t.circle_side or "",
+                    t.star_direction or "",
+                    t.circle_direction or "",
+                    t.choice_target_direction or "",
+                    t.force_output_direction or "",
                     t.choice_side or "",
                     t.chosen_shape or "",
                     t.trial_mode,

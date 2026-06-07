@@ -46,7 +46,7 @@ class HardwareSelfTestSession(HFDecisionSession):
 
     def _on_choice_window_started(self, runtime: TrialRuntime) -> None:
         trial_index = runtime.trial_index
-        force_direction = runtime.force_direction
+        force_direction = runtime.force_direction or runtime.choice_target_direction
         plan = self._sequence[(trial_index - 1) % len(self._sequence)]
         planned_choice: Literal["cw", "ccw", "timeout"]
         if plan == "matched":
