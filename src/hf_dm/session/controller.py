@@ -416,6 +416,7 @@ class HFDecisionSession:
         dropped = monitor.dropped_messages
         dropped_frames = monitor.dropped_frames
         monitor.stop()
+        child_status = monitor.child_status
         self.monitor = None
         if self.recorder is not None:
             self.recorder.log_event(
@@ -424,6 +425,7 @@ class HFDecisionSession:
                     "dropped_messages": int(dropped),
                     "dropped_frames": int(dropped_frames),
                     "published_counts": published_counts,
+                    "child_status": child_status,
                 },
         )
 

@@ -259,6 +259,17 @@ def test_operator_monitor_replaces_stale_frames_per_source_queue():
     assert monitor.dropped_frames == 1
 
 
+def test_operator_monitor_drains_latest_child_status():
+    monitor = OperatorMonitor(MonitorConfig(enabled=True))
+    status_queue = FakeBoundedQueue(maxsize=3)
+    status_queue.put_nowait({"camera_frames_consumed": 1, "camera_frames_rendered": 1})
+    status_queue.put_nowait({"camera_frames_consumed": 2, "camera_frames_rendered": 2})
+    monitor._status_queue = status_queue
+
+    assert monitor.child_status == {"camera_frames_consumed": 2, "camera_frames_rendered": 2}
+    assert monitor.child_status == {"camera_frames_consumed": 2, "camera_frames_rendered": 2}
+
+
 def test_streamdio_callback_publishes_monitor_signals():
     session = HFDecisionSession(SessionConfig())
     monitor = FakeMonitor()

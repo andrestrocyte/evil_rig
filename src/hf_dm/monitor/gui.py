@@ -116,10 +116,12 @@ class OperatorMonitor:
         self._event_queue: Any = None
         self._camera_frame_queue: Any = None
         self._task_frame_queue: Any = None
+        self._status_queue: Any = None
         self._last_by_key: dict[str, float] = {}
         self._dropped_messages = 0
         self._dropped_frames = 0
         self._published_counts: Counter[str] = Counter()
+        self._last_child_status: dict[str, Any] = {}
 
     @property
     def running(self) -> bool:
@@ -137,6 +139,10 @@ class OperatorMonitor:
     def published_counts(self) -> dict[str, int]:
         return dict(self._published_counts)
 
+    @property
+    def child_status(self) -> dict[str, Any]:
+        return self._drain_status_queue()
+
     def start(self) -> None:
         if not self.config.enabled:
             return
@@ -147,6 +153,7 @@ class OperatorMonitor:
             self._event_queue = ctx.Queue(maxsize=max(16, int(self.config.queue_size)))
             self._camera_frame_queue = ctx.Queue(maxsize=2)
             self._task_frame_queue = ctx.Queue(maxsize=2)
+            self._status_queue = ctx.Queue(maxsize=16)
             self._process = ctx.Process(
                 target=_run_monitor_process,
                 args=(
@@ -154,6 +161,7 @@ class OperatorMonitor:
                     self._event_queue,
                     self._camera_frame_queue,
                     self._task_frame_queue,
+                    self._status_queue,
                 ),
                 name="hf-dm-operator-monitor",
                 daemon=True,
@@ -165,6 +173,7 @@ class OperatorMonitor:
             self._event_queue = None
             self._camera_frame_queue = None
             self._task_frame_queue = None
+            self._status_queue = None
 
     def _queue_for_event(self, event_type: str) -> Any:
         if event_type == "camera_frame":
@@ -256,7 +265,13 @@ class OperatorMonitor:
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=0.5)
-        for q in (self._event_queue, self._camera_frame_queue, self._task_frame_queue):
+        self._drain_status_queue()
+        for q in (
+            self._event_queue,
+            self._camera_frame_queue,
+            self._task_frame_queue,
+            self._status_queue,
+        ):
             if q is None:
                 continue
             try:
@@ -271,6 +286,25 @@ class OperatorMonitor:
         self._event_queue = None
         self._camera_frame_queue = None
         self._task_frame_queue = None
+        self._status_queue = None
+
+    def _drain_status_queue(self) -> dict[str, Any]:
+        status = self._last_child_status
+        if self._status_queue is None:
+            return dict(status)
+        drained = 0
+        while drained < 128:
+            try:
+                message = self._status_queue.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
+            drained += 1
+            if isinstance(message, dict):
+                status = dict(message)
+        self._last_child_status = dict(status)
+        return dict(status)
 
 
 class OperatorMonitorState:
@@ -647,6 +681,7 @@ def _run_monitor_process(
     event_q: Any,
     camera_frame_q: Any,
     task_frame_q: Any,
+    status_q: Any,
 ) -> None:
     try:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -659,7 +694,7 @@ def _run_monitor_process(
 
     root = tk.Tk()
     try:
-        window = _MonitorWindow(root, config, event_q, camera_frame_q, task_frame_q, tk)
+        window = _MonitorWindow(root, config, event_q, camera_frame_q, task_frame_q, status_q, tk)
         window.start()
         root.mainloop()
     except Exception:
@@ -679,6 +714,7 @@ class _MonitorWindow:
         event_q: Any,
         camera_frame_q: Any,
         task_frame_q: Any,
+        status_q: Any,
         tk: Any,
     ):
         self.root = root
@@ -686,6 +722,7 @@ class _MonitorWindow:
         self.event_queue = event_q
         self.camera_frame_queue = camera_frame_q
         self.task_frame_queue = task_frame_q
+        self.status_queue = status_q
         self.tk = tk
         self.state = OperatorMonitorState(
             history_s=config.history_s,
@@ -695,6 +732,16 @@ class _MonitorWindow:
         self.height = max(720, int(config.height))
         self._images: list[Any] = []
         self._photo_cache: dict[str, tuple[tuple[Any, ...], int, int, Any]] = {}
+        self._render_count = 0
+        self._last_status_mono_s = 0.0
+        self._last_rendered_camera_token: tuple[Any, ...] | None = None
+        self._last_rendered_task_token: tuple[Any, ...] | None = None
+        self._last_rendered_camera_frame_index: Any = None
+        self._last_rendered_task_frame_index: Any = None
+        self._unique_camera_frames_rendered = 0
+        self._unique_task_frames_rendered = 0
+        self._camera_photo_failures = 0
+        self._task_photo_failures = 0
 
         self.root.title("HF Decision Monitor")
         self.root.configure(bg="#edf0f2")
@@ -732,8 +779,16 @@ class _MonitorWindow:
         self.height = max(720, int(event.height))
 
     def _tick(self) -> None:
-        shutdown = self._drain_queue()
-        self._render()
+        try:
+            shutdown = self._drain_queue()
+            self._render()
+            self._emit_status(force=shutdown)
+        except Exception as exc:
+            self._emit_status(
+                force=True,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
         if shutdown:
             self.root.quit()
             return
@@ -783,6 +838,7 @@ class _MonitorWindow:
     def _render(self) -> None:
         self.state.prune()
         self._images.clear()
+        self._render_count += 1
         c = self.canvas
         c.delete("all")
         c.create_rectangle(0, 0, self.width, self.height, fill="#edf0f2", outline="")
@@ -847,7 +903,7 @@ class _MonitorWindow:
     def _draw_video_panel(self, x: int, y: int, w: int, h: int) -> None:
         ix, iy, iw, ih = self._panel(x, y, w, h, "Video")
         frame = self.state.latest_camera_frame
-        self._draw_image_or_placeholder(
+        drew_frame = self._draw_image_or_placeholder(
             ix,
             iy,
             iw,
@@ -857,6 +913,16 @@ class _MonitorWindow:
             cache_key="camera",
         )
         now = time.perf_counter()
+        if frame and drew_frame:
+            token = self._frame_cache_token(frame)
+            if token != self._last_rendered_camera_token:
+                self._last_rendered_camera_token = token
+                self._unique_camera_frames_rendered += 1
+                self._last_rendered_camera_frame_index = frame.get("frame_index")
+        elif frame:
+            self._camera_photo_failures += 1
+        if frame:
+            self._draw_frame_overlay(ix, iy, frame, drew_frame, self.state.last_camera_frame_mono_s, now)
         meta = [f"frames {self.state.camera_frame_count}"]
         if frame:
             meta.append(f"frame {frame.get('frame_index', 0)}")
@@ -873,18 +939,26 @@ class _MonitorWindow:
 
     def _draw_task_panel(self, x: int, y: int, w: int, h: int) -> None:
         ix, iy, iw, ih = self._panel(x, y, w, h, "Task Screen")
-        self._draw_image_or_placeholder(
+        frame = self.state.latest_task_frame
+        drew_frame = self._draw_image_or_placeholder(
             ix,
             iy,
             iw,
             ih,
-            self.state.latest_task_frame,
+            frame,
             "waiting for task frame",
             cache_key="task",
         )
         now = time.perf_counter()
+        if frame and drew_frame:
+            token = self._frame_cache_token(frame)
+            if token != self._last_rendered_task_token:
+                self._last_rendered_task_token = token
+                self._unique_task_frames_rendered += 1
+                self._last_rendered_task_frame_index = frame.get("frame_index")
+        elif frame:
+            self._task_photo_failures += 1
         meta = [f"frames {self.state.task_frame_count}"]
-        frame = self.state.latest_task_frame
         if frame and frame.get("frame_index") is not None:
             meta.append(f"frame {frame.get('frame_index')}")
         meta.append(_frame_age_text(self.state.last_task_frame_mono_s, now))
@@ -1339,7 +1413,7 @@ class _MonitorWindow:
         placeholder: str,
         *,
         cache_key: str,
-    ) -> None:
+    ) -> bool:
         self.canvas.create_rectangle(x, y, x + w, y + h, fill="#11161b", outline="#11161b")
         photo = self._photo_from_frame(
             frame,
@@ -1355,11 +1429,90 @@ class _MonitorWindow:
                 fill="#98a5ad",
                 font=("Segoe UI", 10),
             )
-            return
+            return False
         self._images.append(photo)
         px = x + max(0, (w - photo.width()) // 2)
         py = y + max(0, (h - photo.height()) // 2)
         self.canvas.create_image(px, py, anchor="nw", image=photo)
+        return True
+
+    def _draw_frame_overlay(
+        self,
+        x: int,
+        y: int,
+        frame: dict[str, Any],
+        drew_frame: bool,
+        last_frame_mono_s: float | None,
+        now: float,
+    ) -> None:
+        age_s = None if last_frame_mono_s is None else max(0.0, now - float(last_frame_mono_s))
+        fill = "#2bc46f" if drew_frame and (age_s is None or age_s < 0.75) else "#d8a91e"
+        if not drew_frame:
+            fill = "#e06060"
+        frame_index = frame.get("frame_index", "-")
+        text = f"#{frame_index}"
+        self.canvas.create_rectangle(
+            x + 8,
+            y + 8,
+            x + 96,
+            y + 32,
+            fill="#10161b",
+            outline="#26323a",
+        )
+        self.canvas.create_oval(x + 15, y + 15, x + 23, y + 23, fill=fill, outline="")
+        self.canvas.create_text(
+            x + 30,
+            y + 20,
+            anchor="w",
+            text=text,
+            fill="#edf0f2",
+            font=("Segoe UI", 9, "bold"),
+        )
+
+    def _emit_status(self, *, force: bool = False, error: str | None = None) -> None:
+        if self.status_queue is None:
+            return
+        now = time.perf_counter()
+        if not force and now - self._last_status_mono_s < 0.5:
+            return
+        status = {
+            "wall_time_s": time.time(),
+            "monotonic_s": now,
+            "render_count": int(self._render_count),
+            "camera_frames_consumed": int(self.state.camera_frame_count),
+            "task_frames_consumed": int(self.state.task_frame_count),
+            "camera_frames_rendered": int(self._unique_camera_frames_rendered),
+            "task_frames_rendered": int(self._unique_task_frames_rendered),
+            "last_camera_frame_index": self.state.latest_camera_frame.get("frame_index")
+            if self.state.latest_camera_frame
+            else None,
+            "last_rendered_camera_frame_index": self._last_rendered_camera_frame_index,
+            "last_task_frame_index": self.state.latest_task_frame.get("frame_index")
+            if self.state.latest_task_frame
+            else None,
+            "last_rendered_task_frame_index": self._last_rendered_task_frame_index,
+            "last_camera_frame_age_s": (
+                None
+                if self.state.last_camera_frame_mono_s is None
+                else max(0.0, now - float(self.state.last_camera_frame_mono_s))
+            ),
+            "camera_photo_failures": int(self._camera_photo_failures),
+            "task_photo_failures": int(self._task_photo_failures),
+        }
+        if error is not None:
+            status["error"] = error
+        while True:
+            try:
+                self.status_queue.put_nowait(status)
+                self._last_status_mono_s = now
+                return
+            except queue.Full:
+                try:
+                    self.status_queue.get_nowait()
+                except Exception:
+                    return
+            except Exception:
+                return
 
     def _photo_from_frame(
         self,
