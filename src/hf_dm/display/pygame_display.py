@@ -135,11 +135,48 @@ class TaskDisplay:
         self.font = pygame.font.Font(None, 28)
         self.small_font = pygame.font.Font(None, 22)
         self._decision_shapes, self.shape_bright_pixel_counts = self._make_decision_shapes()
+        self._preview_frame_index = 0
 
     def fill_black(self) -> float:
         self.screen.fill((0, 0, 0))
         pygame.display.flip()
         return time.perf_counter()
+
+    def preview_frame(
+        self,
+        max_width: int,
+        max_height: int,
+        *,
+        rotate_left: bool = False,
+    ) -> dict | None:
+        """Return a small RGB copy of the current task window for the operator GUI."""
+        max_width = int(max_width)
+        max_height = int(max_height)
+        if max_width <= 0 or max_height <= 0:
+            return None
+        surface = self.screen.copy()
+        if rotate_left:
+            surface = pygame.transform.rotate(surface, 90)
+        src_width, src_height = surface.get_size()
+        if src_width <= 0 or src_height <= 0:
+            return None
+        scale = min(max_width / float(src_width), max_height / float(src_height), 1.0)
+        dst_width = max(1, int(round(src_width * scale)))
+        dst_height = max(1, int(round(src_height * scale)))
+        if dst_width != src_width or dst_height != src_height:
+            surface = pygame.transform.smoothscale(surface, (dst_width, dst_height))
+        frame_index = self._preview_frame_index
+        self._preview_frame_index += 1
+        return {
+            "frame_index": frame_index,
+            "width": dst_width,
+            "height": dst_height,
+            "channels": 3,
+            "format": "RGB",
+            "data": pygame.image.tostring(surface, "RGB"),
+            "monotonic_s": time.perf_counter(),
+            "rotation_deg": 90 if rotate_left else 0,
+        }
 
     def pump_events(self) -> None:
         self._pump_quit()
@@ -175,7 +212,8 @@ class TaskDisplay:
         star_side: Side,
         left_position_deg: float,
         right_position_deg: float,
-        force_direction: Direction,
+        force_direction: Direction | None,
+        visible_shape: Shape | None = None,
         trial_index: int | None = None,
         response_time_s: float | None = None,
     ) -> float:
@@ -191,8 +229,10 @@ class TaskDisplay:
         )
         left_shape = "star" if star_side == "left" else "circle"
         right_shape = "circle" if star_side == "left" else "star"
-        self._blit_shape(left_shape, self._shape_center(left_position_deg))
-        self._blit_shape(right_shape, self._shape_center(right_position_deg))
+        if visible_shape in (None, left_shape):
+            self._blit_shape(left_shape, self._shape_center(left_position_deg))
+        if visible_shape in (None, right_shape):
+            self._blit_shape(right_shape, self._shape_center(right_position_deg))
         if self.config.show_debug_overlay:
             self._draw_debug_overlay(force_direction, trial_index, response_time_s)
         pygame.display.flip()
@@ -382,13 +422,13 @@ class TaskDisplay:
 
     def _draw_debug_overlay(
         self,
-        force_direction: Direction,
+        force_direction: Direction | None,
         trial_index: int | None,
         response_time_s: float | None,
     ) -> None:
         lines = [
             f"trial {trial_index}" if trial_index is not None else "trial",
-            f"force cue: {force_direction.upper()}",
+            f"force cue: {force_direction.upper()}" if force_direction else "force cue: off",
         ]
         if response_time_s is not None:
             lines.append(f"response time: {response_time_s:.3f}s")

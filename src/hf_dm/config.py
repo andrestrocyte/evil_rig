@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -76,11 +76,27 @@ class RewardConfig:
 
 
 @dataclass
+class TaskDesignConfig:
+    modality: str = "force"
+    profile_name: str = "config"
+    n_free_trials: int | None = None
+    n_forced_trials: int = 0
+    risk_star_probability: float = 0.66
+    delay_star_extra_s: float = 2.0
+    selected_mouse_dir: str | None = None
+    session_name: str | None = None
+    session_dir: str | None = None
+
+
+@dataclass
 class LickConfig:
     channels: tuple[int, ...] = (LICK_INPUT_CHANNEL,)
     high_only: bool = True
     power_output_channel: int = CAP_TOUCH_POWER_OUTPUT_CHANNEL
     power_required: bool = True
+    cap_touch_min_high_threshold: int | None = None
+    cap_touch_delta_high: int | None = None
+    cap_touch_delta_low: int | None = None
 
 
 @dataclass
@@ -115,6 +131,29 @@ class CameraConfig:
 
 
 @dataclass
+class MonitorConfig:
+    enabled: bool = False
+    display_index: int | None = 0
+    window_x: int | None = None
+    window_y: int | None = None
+    width: int = 1500
+    height: int = 940
+    fps: int = 30
+    history_s: float = 20.0
+    trial_history: int = 12
+    queue_size: int = 512
+    force_sample_hz: float = 80.0
+    wheel_sample_hz: float = 60.0
+    screen_fps: float = 12.0
+    camera_fps: float = 10.0
+    camera_preview_width: int = 520
+    camera_preview_height: int = 390
+    task_preview_width: int = 220
+    task_preview_height: int = 120
+    task_preview_rotate_left: bool = True
+
+
+@dataclass
 class SessionConfig:
     subject_id: str = "mouse01"
     phase: TrainingPhase = TrainingPhase.DECISION_MAKING
@@ -127,10 +166,12 @@ class SessionConfig:
     display: DisplayConfig = field(default_factory=DisplayConfig)
     timing: TimingConfig = field(default_factory=TimingConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
+    task: TaskDesignConfig = field(default_factory=TaskDesignConfig)
     licks: LickConfig = field(default_factory=LickConfig)
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     engagement: EngagementConfig = field(default_factory=EngagementConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
     results_dir: str = "data/sessions"
 
     @staticmethod
@@ -148,11 +189,13 @@ class SessionConfig:
         )
         timing_raw = raw.get("timing", {})
         reward_raw = raw.get("reward", {})
+        task_raw = raw.get("task", raw.get("session_design", {}))
         lick_raw = raw.get("licks", raw.get("cap_touch", {}))
         speaker_raw = raw.get("speaker", {})
         display_raw = raw.get("display", {})
         engagement_raw = raw.get("engagement", {})
         camera_raw = raw.get("camera", {})
+        monitor_raw = raw.get("monitor", {})
         wheel_raw = raw.get("wheel", {})
 
         def channels(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
@@ -172,6 +215,12 @@ class SessionConfig:
             if not isinstance(value, (list, tuple)) or len(value) != 3:
                 return default
             return tuple(max(0, min(255, int(part))) for part in value)
+
+        def optional_lick_int(name: str) -> int | None:
+            value = lick_raw.get(name)
+            if value in (None, ""):
+                return None
+            return int(value)
 
         return SessionConfig(
             subject_id=str(raw.get("subject_id", "mouse01")),
@@ -248,6 +297,33 @@ class SessionConfig:
                 matched_pump_s=float(reward_raw.get("matched_pump_s", 0.08)),
                 opposite_pump_s=float(reward_raw.get("opposite_pump_s", 0.04)),
             ),
+            task=TaskDesignConfig(
+                modality=str(task_raw.get("modality", "force")).lower(),
+                profile_name=str(task_raw.get("profile_name", "config")),
+                n_free_trials=(
+                    int(task_raw["n_free_trials"])
+                    if task_raw.get("n_free_trials") not in (None, "")
+                    else None
+                ),
+                n_forced_trials=int(task_raw.get("n_forced_trials", 0)),
+                risk_star_probability=float(task_raw.get("risk_star_probability", 0.66)),
+                delay_star_extra_s=float(task_raw.get("delay_star_extra_s", 2.0)),
+                selected_mouse_dir=(
+                    str(task_raw["selected_mouse_dir"])
+                    if task_raw.get("selected_mouse_dir") not in (None, "")
+                    else None
+                ),
+                session_name=(
+                    str(task_raw["session_name"])
+                    if task_raw.get("session_name") not in (None, "")
+                    else None
+                ),
+                session_dir=(
+                    str(task_raw["session_dir"])
+                    if task_raw.get("session_dir") not in (None, "")
+                    else None
+                ),
+            ),
             licks=LickConfig(
                 channels=channels(
                     "channels",
@@ -258,6 +334,11 @@ class SessionConfig:
                     lick_raw.get("power_output_channel", CAP_TOUCH_POWER_OUTPUT_CHANNEL)
                 ),
                 power_required=bool(lick_raw.get("power_required", True)),
+                cap_touch_min_high_threshold=optional_lick_int(
+                    "cap_touch_min_high_threshold"
+                ),
+                cap_touch_delta_high=optional_lick_int("cap_touch_delta_high"),
+                cap_touch_delta_low=optional_lick_int("cap_touch_delta_low"),
             ),
             speaker=SpeakerConfig(
                 sample_interval_us=int(
@@ -306,5 +387,106 @@ class SessionConfig:
                 acquisition_timeout_ms=int(camera_raw.get("acquisition_timeout_ms", 1000)),
                 save_dir=str(camera_raw.get("save_dir", "data/videos")),
             ),
+            monitor=MonitorConfig(
+                enabled=bool(monitor_raw.get("enabled", False)),
+                display_index=(
+                    int(monitor_raw["display_index"])
+                    if monitor_raw.get("display_index") not in (None, "")
+                    else None
+                ),
+                window_x=(
+                    int(monitor_raw["window_x"])
+                    if monitor_raw.get("window_x") not in (None, "")
+                    else None
+                ),
+                window_y=(
+                    int(monitor_raw["window_y"])
+                    if monitor_raw.get("window_y") not in (None, "")
+                    else None
+                ),
+                width=int(monitor_raw.get("width", 1500)),
+                height=int(monitor_raw.get("height", 940)),
+                fps=int(monitor_raw.get("fps", 30)),
+                history_s=float(monitor_raw.get("history_s", 20.0)),
+                trial_history=int(monitor_raw.get("trial_history", 12)),
+                queue_size=int(monitor_raw.get("queue_size", 512)),
+                force_sample_hz=float(monitor_raw.get("force_sample_hz", 80.0)),
+                wheel_sample_hz=float(monitor_raw.get("wheel_sample_hz", 60.0)),
+                screen_fps=float(monitor_raw.get("screen_fps", 12.0)),
+                camera_fps=float(monitor_raw.get("camera_fps", 10.0)),
+                camera_preview_width=int(monitor_raw.get("camera_preview_width", 520)),
+                camera_preview_height=int(monitor_raw.get("camera_preview_height", 390)),
+                task_preview_width=int(monitor_raw.get("task_preview_width", 220)),
+                task_preview_height=int(monitor_raw.get("task_preview_height", 120)),
+                task_preview_rotate_left=bool(
+                    monitor_raw.get("task_preview_rotate_left", True)
+                ),
+            ),
             results_dir=str(raw.get("results_dir", "data/sessions")),
         )
+
+
+def config_to_dict(config: SessionConfig) -> dict[str, Any]:
+    def convert(value: Any) -> Any:
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, tuple):
+            return [convert(item) for item in value]
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): convert(item) for key, item in value.items()}
+        return value
+
+    return convert(asdict(config))
+
+
+def task_design_summary(config: SessionConfig) -> dict[str, Any]:
+    task = config.task
+    modality = str(task.modality or "force").lower()
+    if modality not in {"force", "risk", "delay"}:
+        modality = "force"
+    n_forced = max(0, int(task.n_forced_trials))
+    if task.n_free_trials is None:
+        n_free = max(0, int(config.n_trials) - n_forced)
+    else:
+        n_free = max(0, int(task.n_free_trials))
+    total = n_free + n_forced
+    star_summary: dict[str, Any] = {
+        "shape": "star",
+        "effect": modality,
+        "reward_duration_s": float(config.reward.matched_pump_s),
+        "relative_reward": "long",
+        "physical_force_output": modality == "force",
+    }
+    if modality == "risk":
+        reward_probability = max(0.0, min(1.0, float(task.risk_star_probability)))
+        star_summary["reward_probability"] = reward_probability
+        star_summary["omission_probability"] = 1.0 - reward_probability
+    if modality == "delay":
+        star_summary["extra_delay_s"] = max(0.0, float(task.delay_star_extra_s))
+    return {
+        "modality": modality,
+        "profile_name": task.profile_name,
+        "n_trials": total,
+        "n_free_trials": n_free,
+        "n_forced_trials": n_forced,
+        "choice_modes": {
+            "free": "star and circle both visible; either centered shape ends the trial",
+            "forced": "only the forced shape is visible; only that side can end the trial before timeout",
+        },
+        "symbols": {
+            "star": star_summary,
+            "circle": {
+                "shape": "circle",
+                "effect": "baseline",
+                "reward_duration_s": float(config.reward.opposite_pump_s),
+                "reward_probability": 1.0,
+                "extra_delay_s": 0.0,
+                "relative_reward": "short",
+                "physical_force_output": False,
+            },
+        },
+    }

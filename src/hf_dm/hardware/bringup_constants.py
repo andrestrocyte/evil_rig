@@ -14,6 +14,11 @@ from dataclasses import dataclass
 # StreamDIO discovery bytes (stream_dio_protocol.py)
 STREAMDIO_CONFIG_DISCOVERY = 222
 STREAMDIO_STREAM_DISCOVERY = 223
+STREAMDIO_DIO_INPUT_EVENT_BASE = 1
+STREAMDIO_DIO_OUTPUT_EVENT_BASE = 29
+STREAMDIO_ANALOG_INPUT_EVENT_BASE = 55
+STREAMDIO_CAP_TOUCH_DIGITIZER_FIRMWARE_VERSION = 3
+STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION = 4
 
 # Serial / USB defaults (all bringups)
 DEFAULT_BAUDRATE = 1_312_500
@@ -28,9 +33,13 @@ INPUT_REFRACTORY_PERIOD_US = 300
 
 # Capacitive touch (cap_touch_bringup_pin15_power_pin14_touch.ipynb)
 CAP_TOUCH_POWER_OUTPUT_CHANNEL = 13  # output channel 13 / physical pin 15
+CAP_TOUCH_POWER_PIN = 15
 CAP_TOUCH_INPUT_CHANNEL = 14         # input channel 14 / physical pin 25
 CAP_TOUCH_INPUT_PIN = 25
 LICK_INPUT_CHANNEL = CAP_TOUCH_INPUT_CHANNEL
+CAP_TOUCH_DEFAULT_MIN_HIGH_THRESHOLD = 700
+CAP_TOUCH_DEFAULT_DELTA_HIGH = 350
+CAP_TOUCH_DEFAULT_DELTA_LOW = 160
 
 # Force-direction + pump outputs (screen_bringup_shape_force_discount.ipynb)
 PUMP_OUTPUT_CHANNEL = 1        # pin 23

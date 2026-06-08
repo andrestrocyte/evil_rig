@@ -103,6 +103,30 @@ The session writes a frame sequence, `frame_timestamps.csv`, and `recording_summ
 `data/videos/<subject>_<phase>_<timestamp>_spinnaker/`. With `required: true`, the task refuses to
 run if recording cannot start.
 
+### Operator monitor GUI
+
+The official configs enable a separate lightweight monitor on the computer/main screen
+(`monitor.display_index: 0`), while the task stimulus remains on the behavior display
+(`display.display_index: 1`). The monitor runs in its own process and receives only nonblocking,
+drop-safe telemetry, so closing or slowing the GUI does not stall the Bpod/StreamDIO task loop.
+
+It shows a low-rate camera preview, a compact left-rotated task screen copy, the active Bpod FSM
+state, latest star/circle/timeout outcome squares, lick-edge/pump/noise event rails, raw cap-touch
+pin status, a live force-effort ADC trace with a session-held y-axis maximum, and the wheel trace
+reset every trial.
+Use `--no-monitor` for command-line checks, or `--monitor` to force it on when a YAML file has it
+disabled. `--simulate-headless` disables the monitor automatically.
+
+Cap touch uses StreamDIO input channel 14 / physical pin 25 for the lick detector and output
+channel 13 / physical pin 15 for detector power. The GUI shows both the power output and the raw
+input channel value so detector transitions are visible even before trial-level counted licks.
+Because the firmware can stream only one configured analog input at a time, force remains on analog
+channel 13 and the vendored StreamDIO firmware in `firmware/` digitizes cap-touch pin 25 locally
+into normal channel-14 high/low input events. Flash that firmware if the detector LED changes but no
+lick events appear in the GUI. With firmware version 3 or newer, the operator monitor also polls the
+firmware digitizer status at low rate so the cap-touch ADC value/baseline is visible without moving
+force off analog channel 13.
+
 ## Run
 
 ```bash
@@ -112,6 +136,9 @@ python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration
 # Controlled live check. WARNING: activates real force, pump, speaker, camera, and StreamDIO.
 python -m hf_dm.cli --config configs/dm_50.yaml --hardware-self-test
 
+# Cap-touch input check only. Touch the lick detector during the window.
+python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-touch-duration 15
+
 # Stage 1 - centering shaping (bring a lateral cue into the center target)
 python -m hf_dm.cli --config configs/centering_50.yaml
 
@@ -119,6 +146,9 @@ python -m hf_dm.cli --config configs/centering_50.yaml
 python -m hf_dm.cli --config configs/dm_50.yaml
 python -m hf_dm.cli --config configs/dm_100.yaml
 python -m hf_dm.cli --config configs/dm_200.yaml
+
+# Same tasks without the operator GUI
+python -m hf_dm.cli --config configs/dm_50.yaml --no-monitor
 ```
 
 Outputs: `data/sessions/<subject>_<phase>_<timestamp>.npz` and `.json`.
@@ -149,6 +179,40 @@ process and rerun the preflight.
 
 If StreamDIO reports `Access is denied` on COM7/COM8, another process owns the StreamDIO USB port.
 Close old notebooks, serial monitors, or task processes, then unplug/replug StreamDIO if needed.
+
+`--cap-touch-diagnostic` does not start Bpod trials. It opens StreamDIO, keeps force streaming on
+analog channel 13, powers the cap-touch detector on output channel 13 / pin 15, polls the firmware
+digitizer on input channel 14 / pin 25, and prints ADC value, baseline, threshold, and high/low lick
+edge counts. If `hi_edges` increments while touching the detector, the task GUI should also show
+licks. If ADC stays near zero or `hi_edges` never increments while the detector is touched, check
+the cap-touch sensor wiring/power first, then the firmware threshold.
+Firmware v4 supports runtime threshold tuning from YAML:
+
+```yaml
+licks:
+  cap_touch_min_high_threshold: 250
+  cap_touch_delta_high: 120
+  cap_touch_delta_low: 90
+```
+
+or for one diagnostic run:
+
+```bash
+python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-touch-min-high-threshold 250 --cap-touch-delta-high 120 --cap-touch-delta-low 90
+```
+
+To reproduce the old bringup-style analog readout, temporarily stream cap-touch
+pin 25 as the single analog input:
+
+```bash
+python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-touch-raw-analog --cap-touch-duration 15
+```
+
+That mode disables the force ADC only for the diagnostic. During the task, force
+stays on analog channel 13 and cap touch is digitized locally in firmware.
+The diagnostic report includes a `diagnosis` field such as
+`raw_adc_swing_detected`, `raw_adc_below_threshold`,
+`digitizer_edges_detected`, or `digitizer_adc_below_threshold`.
 
 `--hardware-self-test` runs the production Bpod FSM with synthetic wheel choices but real rig
 outputs. It fails unless both effort directions and pump transitions have firmware output events,

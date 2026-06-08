@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import math
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Callable, Literal
 
 from hf_dm.config import SessionConfig
 from hf_dm.data.recorder import SessionRecorder
 from hf_dm.display.pygame_display import TaskDisplay
 from hf_dm.fsm.relay import RelayMessageIds
 from hf_dm.fsm.runtime import TrialRuntime
-from hf_dm.hardware.bringup_constants import LICK_INPUT_CHANNEL
+from hf_dm.hardware.bringup_constants import (
+    CAP_TOUCH_POWER_OUTPUT_CHANNEL,
+    CAP_TOUCH_POWER_PIN,
+    LICK_INPUT_CHANNEL,
+)
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.simulated_bpod import SimulatedBpod
 from hf_dm.streamdio.wheel import Direction, WheelKinematics
@@ -247,25 +253,84 @@ class SimulatedDIO:
 
 
 class SimulatedVideoRecorder:
-    def __init__(self, save_dir: Path, subject_id: str, phase: str) -> None:
+    def __init__(
+        self,
+        save_dir: Path,
+        subject_id: str,
+        phase: str,
+        *,
+        preview_callback: Callable[[dict[str, Any]], None] | None = None,
+        preview_width: int = 320,
+        preview_height: int = 240,
+        fps: int = 10,
+    ) -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.session_dir = Path(save_dir) / f"{subject_id}_{phase}_{stamp}_spinnaker_sim"
         self._start_wall_s = time.time()
+        self._preview_callback = preview_callback
+        self._preview_width = max(64, int(preview_width))
+        self._preview_height = max(48, int(preview_height))
+        self._fps = max(1, int(fps))
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._frames = 0
 
     def start(self) -> Path:
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        if self._preview_callback is not None:
+            self._running = True
+            self._thread = threading.Thread(
+                target=self._preview_loop,
+                name="spinnaker-sim-preview",
+                daemon=True,
+            )
+            self._thread.start()
         return self.session_dir
 
     def stop(self) -> dict:
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
         return {
             "backend": "spinnaker_sim",
             "session_dir": str(self.session_dir),
             "frames_saved": 0,
+            "preview_frames": self._frames,
             "start_wall_s": self._start_wall_s,
             "stop_wall_s": time.time(),
             "capture_error": None,
             "cleanup_error": None,
         }
+
+    def _preview_loop(self) -> None:
+        period_s = 1.0 / float(self._fps)
+        while self._running:
+            frame_index = self._frames
+            data = bytearray(self._preview_width * self._preview_height)
+            for y in range(self._preview_height):
+                base = y * self._preview_width
+                band = int(55 + 45 * math.sin((frame_index * 0.11) + y * 0.045))
+                for x in range(self._preview_width):
+                    data[base + x] = max(
+                        0,
+                        min(255, band + ((x + frame_index * 3) % 90)),
+                    )
+            now = time.perf_counter()
+            self._preview_callback(
+                {
+                    "frame_index": frame_index,
+                    "camera_timestamp_ns": int(now * 1_000_000_000),
+                    "width": self._preview_width,
+                    "height": self._preview_height,
+                    "channels": 1,
+                    "format": "L",
+                    "data": bytes(data),
+                    "monotonic_s": now,
+                    "backend": "spinnaker_sim",
+                }
+            )
+            self._frames += 1
+            time.sleep(period_s)
 
 
 class SimulatedHFDecisionSession(HFDecisionSession):
@@ -291,11 +356,19 @@ class SimulatedHFDecisionSession(HFDecisionSession):
             self.config.subject_id,
             self.config.phase.value,
         )
+        self.recorder.set_metadata(self._session_metadata())
+        self._start_operator_monitor()
         if self.config.camera.record_video:
             video = SimulatedVideoRecorder(
                 Path(self.config.camera.save_dir),
                 self.config.subject_id,
                 self.config.phase.value,
+                preview_callback=(
+                    self._handle_camera_preview if self.monitor is not None else None
+                ),
+                preview_width=self.config.monitor.camera_preview_width,
+                preview_height=self.config.monitor.camera_preview_height,
+                fps=int(max(1.0, float(self.config.monitor.camera_fps))),
             )
             session_dir = video.start()
             self.camera_recorder = video
@@ -315,12 +388,28 @@ class SimulatedHFDecisionSession(HFDecisionSession):
                 "simulated": True,
             },
         )
+        cap_touch_transition = self.relay.cap_touch_power(True)
+        self._publish_monitor(
+            "cap_touch_power",
+            {
+                "active": True,
+                "state": 1,
+                "channel": self.config.licks.power_output_channel,
+                "pin": (
+                    CAP_TOUCH_POWER_PIN
+                    if self.config.licks.power_output_channel == CAP_TOUCH_POWER_OUTPUT_CHANNEL
+                    else None
+                ),
+                "source": "connect_command",
+                "transition": cap_touch_transition,
+            },
+        )
         self.recorder.log_event(
             "cap_touch_power_on",
             {
                 "output_channel": self.config.licks.power_output_channel,
                 "input_channels": list(self.config.licks.channels),
-                "transition": self.relay.cap_touch_power(True),
+                "transition": cap_touch_transition,
                 "simulated": True,
             },
         )
@@ -351,26 +440,26 @@ class SimulatedHFDecisionSession(HFDecisionSession):
 
     def _choice_for_trial(
         self,
-        force_direction: Direction,
+        choice_target_direction: Direction,
         trial_index: int,
     ) -> Literal["cw", "ccw", "timeout"]:
         mode = self.options.choice_mode
         if mode == "matched":
-            return force_direction
+            return choice_target_direction
         if mode == "opposite":
-            return "ccw" if force_direction == "cw" else "cw"
+            return "ccw" if choice_target_direction == "cw" else "cw"
         if mode in ("cw", "ccw", "timeout"):
             return mode
         cycle = ("matched", "opposite", "timeout")[(trial_index - 1) % 3]
         if cycle == "matched":
-            return force_direction
+            return choice_target_direction
         if cycle == "opposite":
-            return "ccw" if force_direction == "cw" else "cw"
+            return "ccw" if choice_target_direction == "cw" else "cw"
         return "timeout"
 
     def _prepare_decision_trial(self, runtime: TrialRuntime) -> None:
         runtime.simulated_choice = self._choice_for_trial(  # type: ignore[attr-defined]
-            runtime.force_direction,
+            runtime.choice_target_direction,
             runtime.trial_index,
         )
 
@@ -393,7 +482,20 @@ class SimulatedHFDecisionSession(HFDecisionSession):
 
 def shorten_for_simulation(config: SessionConfig, *, n_trials: int | None = None) -> None:
     if n_trials is not None:
-        config.n_trials = int(n_trials)
+        n_trials = max(0, int(n_trials))
+        if config.task.n_free_trials is not None or config.task.n_forced_trials:
+            old_free = (
+                int(config.task.n_free_trials)
+                if config.task.n_free_trials is not None
+                else max(0, int(config.n_trials) - int(config.task.n_forced_trials))
+            )
+            old_forced = max(0, int(config.task.n_forced_trials))
+            old_total = max(1, old_free + old_forced)
+            forced = int(round(n_trials * (old_forced / old_total)))
+            forced = max(0, min(n_trials, forced))
+            config.task.n_free_trials = n_trials - forced
+            config.task.n_forced_trials = forced
+        config.n_trials = n_trials
     config.timing.quiescence_s = 0.0
     config.timing.inter_trial_min_s = min(config.timing.inter_trial_min_s, 0.05)
     config.timing.choice_timeout_s = min(config.timing.choice_timeout_s, 0.5)

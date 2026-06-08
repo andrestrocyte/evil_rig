@@ -47,8 +47,18 @@ class TrialRecord:
     trial_start_mono_s: float
     star_side: str | None = None
     circle_side: str | None = None
+    star_direction: str | None = None
+    circle_direction: str | None = None
+    choice_target_direction: str | None = None
+    force_output_direction: str | None = None
     choice_side: str | None = None
     chosen_shape: str | None = None
+    trial_mode: str = "free"
+    forced_shape: str | None = None
+    modality: str = "force"
+    reward_delay_s: float = 0.0
+    reward_delivered: bool = False
+    risk_star_probability: float | None = None
     bpod_state_entries: int = 0
     camera_ttl_timestamps_us: list[int] = field(default_factory=list)
     lick_count: int = 0
@@ -86,10 +96,15 @@ class SessionRecorder:
         self.streamdio_events: list[tuple[str, int, int, int, float, float]] = []
         self.bpod_trials: list[dict[str, Any]] = []
         self.fsm_definitions: dict[str, str] = {}
+        self.metadata: dict[str, Any] = {}
         self.summary: SessionSummary | None = None
         self._session_start_wall = time.time()
         self._session_start_mono = time.perf_counter()
         self.log_event("session_start", {"subject_id": subject_id, "phase": phase})
+
+    def set_metadata(self, metadata: dict[str, Any]) -> None:
+        self.metadata.update(json.loads(json.dumps(metadata, default=str)))
+        self.log_event("session_metadata", self.metadata)
 
     def log_fsm_definition(self, fsm_name: str, fsm: Any) -> None:
         """Store an optional bpod-core FSM template (JSON serialization)."""
@@ -199,12 +214,32 @@ class SessionRecorder:
                 [json.dumps(trial) for trial in self.bpod_trials],
                 dtype=object,
             ),
+            trials_json=np.array(
+                [json.dumps(asdict(trial), default=str) for trial in self.trials],
+                dtype=object,
+            ),
+            events_json=np.array(
+                [json.dumps(asdict(event), default=str) for event in self.events],
+                dtype=object,
+            ),
+            fsm_definitions_json=np.array(
+                [
+                    json.dumps({"fsm_name": name, "fsm_json": fsm_json}, default=str)
+                    for name, fsm_json in self.fsm_definitions.items()
+                ],
+                dtype=object,
+            ),
             summary_json=np.array([json.dumps(asdict(summary))], dtype=object),
+            session_metadata_json=np.array(
+                [json.dumps(self.metadata, default=str)],
+                dtype=object,
+            ),
         )
 
         streamdio_counts = Counter(event[0] for event in self.streamdio_events)
         meta = {
             "summary": asdict(summary),
+            "metadata": self.metadata,
             "trials": [asdict(t) for t in self.trials],
             "events": [asdict(e) for e in self.events],
             "streamdio": {
@@ -247,8 +282,18 @@ class SessionRecorder:
             ("trial_start_mono_s", "f8"),
             ("star_side", "U8"),
             ("circle_side", "U8"),
+            ("star_direction", "U8"),
+            ("circle_direction", "U8"),
+            ("choice_target_direction", "U8"),
+            ("force_output_direction", "U8"),
             ("choice_side", "U8"),
             ("chosen_shape", "U8"),
+            ("trial_mode", "U12"),
+            ("forced_shape", "U8"),
+            ("modality", "U12"),
+            ("reward_delay_s", "f8"),
+            ("reward_delivered", "?"),
+            ("risk_star_probability", "f8"),
             ("bpod_state_entries", "i4"),
             ("lick_count", "i4"),
             ("choice_loop_frames", "i4"),
@@ -282,8 +327,22 @@ class SessionRecorder:
                     t.trial_start_mono_s,
                     t.star_side or "",
                     t.circle_side or "",
+                    t.star_direction or "",
+                    t.circle_direction or "",
+                    t.choice_target_direction or "",
+                    t.force_output_direction or "",
                     t.choice_side or "",
                     t.chosen_shape or "",
+                    t.trial_mode,
+                    t.forced_shape or "",
+                    t.modality,
+                    t.reward_delay_s,
+                    t.reward_delivered,
+                    (
+                        t.risk_star_probability
+                        if t.risk_star_probability is not None
+                        else np.nan
+                    ),
                     t.bpod_state_entries,
                     t.lick_count,
                     t.choice_loop_frames,

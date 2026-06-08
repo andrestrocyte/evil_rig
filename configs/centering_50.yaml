@@ -33,6 +33,9 @@ licks:
   high_only: true
   power_output_channel: 13
   power_required: true
+  cap_touch_min_high_threshold: 250
+  cap_touch_delta_high: 120
+  cap_touch_delta_low: 90
 
 speaker:
   sample_interval_us: 100
@@ -70,5 +73,23 @@ camera:
   required: true
   backend: spinnaker
   save_dir: data/videos
+
+monitor:
+  enabled: true
+  display_index: 0
+  width: 1500
+  height: 940
+  fps: 30
+  history_s: 20.0
+  trial_history: 12
+  force_sample_hz: 80.0
+  wheel_sample_hz: 60.0
+  screen_fps: 12.0
+  camera_fps: 10.0
+  camera_preview_width: 520
+  camera_preview_height: 390
+  task_preview_width: 220
+  task_preview_height: 120
+  task_preview_rotate_left: true
 
 results_dir: data/sessions

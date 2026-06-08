@@ -9,6 +9,11 @@ from collections import defaultdict
 from typing import Any, Callable
 
 from hf_dm.hardware.bringup_constants import (
+    CAP_TOUCH_DEFAULT_DELTA_HIGH,
+    CAP_TOUCH_DEFAULT_DELTA_LOW,
+    CAP_TOUCH_DEFAULT_MIN_HIGH_THRESHOLD,
+    CAP_TOUCH_INPUT_CHANNEL,
+    CAP_TOUCH_INPUT_PIN,
     DEFAULT_CAMERA_EXPOSURE_US,
     DEFAULT_CAMERA_FREQUENCY_HZ,
     DIRECTION_INPUT_CHANNEL,
@@ -18,8 +23,17 @@ from hf_dm.hardware.bringup_constants import (
     INPUT_REFRACTORY_PERIOD_US,
     LICK_INPUT_CHANNEL,
     PULSE_INPUT_CHANNEL,
+    STREAMDIO_ANALOG_INPUT_EVENT_BASE,
+    STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION,
+    STREAMDIO_CAP_TOUCH_DIGITIZER_FIRMWARE_VERSION,
+    STREAMDIO_DIO_INPUT_EVENT_BASE,
+    STREAMDIO_DIO_OUTPUT_EVENT_BASE,
 )
 from hf_dm.hardware.discovery import resolve_streamdio_ports
+
+
+def _uint12(value: int) -> int:
+    return max(0, min(4095, int(value)))
 
 
 class StreamDIOClient:
@@ -39,6 +53,9 @@ class StreamDIOClient:
                 "pybpod_streamDIO_module is not installed. Install MM_PyBpod2 "
                 "into this environment, or vendor the StreamDIO driver explicitly."
             ) from exc
+        StreamDIOProtocol.DIO_INPUT_EVENT_BASE = STREAMDIO_DIO_INPUT_EVENT_BASE
+        StreamDIOProtocol.DIO_OUTPUT_EVENT_BASE = STREAMDIO_DIO_OUTPUT_EVENT_BASE
+        StreamDIOProtocol.ANALOG_INPUT_EVENT_BASE = STREAMDIO_ANALOG_INPUT_EVENT_BASE
 
         self._protocol_cls = StreamDIOProtocol
         self.config_port = config_port
@@ -46,6 +63,7 @@ class StreamDIOClient:
         self.baudrate = baudrate
         self._dio: Any = None
         self._callback: Callable[..., None] | None = None
+        self._config_lock = threading.Lock()
         self._output_condition = threading.Condition()
         self._output_states: dict[int, int] = {}
         self._output_sequences: dict[int, int] = defaultdict(int)
@@ -84,30 +102,74 @@ class StreamDIOClient:
     def configure_rotary_and_force(self, lick_channels: tuple[int, ...] = (LICK_INPUT_CHANNEL,)) -> None:
         if self._dio is None:
             raise RuntimeError("StreamDIO not connected")
-        enable_vector = [False] * int(self._dio.module_info["n_input_channels"])
-        enable_vector[PULSE_INPUT_CHANNEL - 1] = True
-        enable_vector[DIRECTION_INPUT_CHANNEL - 1] = True
-        for channel in lick_channels:
-            if 1 <= int(channel) <= len(enable_vector):
-                enable_vector[int(channel) - 1] = True
-        ok = self._dio.configure_module(
-            refractory_period=INPUT_REFRACTORY_PERIOD_US,
-            input_channels_enabled=enable_vector,
-            analog_input={
-                "channel": FORCE_ANALOG_CHANNEL,
-                "enabled": True,
-                "sample_interval_us": FORCE_ANALOG_SAMPLE_INTERVAL_US,
-            },
-        )
-        if not ok:
-            raise RuntimeError("StreamDIO configure_module failed")
-        status = self._dio.get_analog_input_status()
+        with self._config_lock:
+            if LICK_INPUT_CHANNEL in {int(channel) for channel in lick_channels}:
+                firmware_version = int(self._dio.module_info.get("firmware_version", 0))
+                if firmware_version < STREAMDIO_CAP_TOUCH_DIGITIZER_FIRMWARE_VERSION:
+                    raise RuntimeError(
+                        "StreamDIO firmware does not include the cap-touch digitizer. "
+                        f"Found firmware version {firmware_version}; expected "
+                        f"{STREAMDIO_CAP_TOUCH_DIGITIZER_FIRMWARE_VERSION} or newer. "
+                        "Flash firmware/Module_DIO_streeaming_100us_cycle before running "
+                        "with cap-touch licks on channel 14."
+                    )
+            enable_vector = [False] * int(self._dio.module_info["n_input_channels"])
+            enable_vector[PULSE_INPUT_CHANNEL - 1] = True
+            enable_vector[DIRECTION_INPUT_CHANNEL - 1] = True
+            for channel in lick_channels:
+                if 1 <= int(channel) <= len(enable_vector):
+                    enable_vector[int(channel) - 1] = True
+            ok = self._dio.configure_module(
+                refractory_period=INPUT_REFRACTORY_PERIOD_US,
+                input_channels_enabled=enable_vector,
+                analog_input={
+                    "channel": FORCE_ANALOG_CHANNEL,
+                    "enabled": True,
+                    "sample_interval_us": FORCE_ANALOG_SAMPLE_INTERVAL_US,
+                },
+            )
+            if not ok:
+                raise RuntimeError("StreamDIO configure_module failed")
+            status = self._dio.get_analog_input_status()
         if not status.get("enabled"):
             raise RuntimeError(f"Analog force not enabled: {status}")
         if int(status.get("channel", -1)) != FORCE_ANALOG_CHANNEL:
             raise RuntimeError(f"Unexpected force channel: {status}")
         if int(status.get("pin", -1)) != FORCE_ANALOG_PIN:
             raise RuntimeError(f"Unexpected force pin: {status}")
+
+    def configure_cap_touch_analog_diagnostic(
+        self,
+        *,
+        sample_interval_us: int = FORCE_ANALOG_SAMPLE_INTERVAL_US,
+    ) -> dict[str, Any]:
+        """Temporarily stream cap-touch pin 25 as the only analog channel."""
+        if self._dio is None:
+            raise RuntimeError("StreamDIO not connected")
+        with self._config_lock:
+            enable_vector = [False] * int(self._dio.module_info["n_input_channels"])
+            ok = self._dio.configure_module(
+                refractory_period=INPUT_REFRACTORY_PERIOD_US,
+                input_channels_enabled=enable_vector,
+                analog_input={
+                    "channel": CAP_TOUCH_INPUT_CHANNEL,
+                    "enabled": True,
+                    "sample_interval_us": int(sample_interval_us),
+                },
+            )
+            if not ok:
+                raise RuntimeError("StreamDIO cap-touch analog diagnostic config failed")
+            status = self._dio.get_analog_input_status()
+        if not status.get("enabled"):
+            raise RuntimeError(f"Analog cap-touch not enabled: {status}")
+        if int(status.get("channel", -1)) != CAP_TOUCH_INPUT_CHANNEL:
+            raise RuntimeError(f"Unexpected cap-touch analog channel: {status}")
+        if int(status.get("pin", -1)) != CAP_TOUCH_INPUT_PIN:
+            raise RuntimeError(f"Unexpected cap-touch analog pin: {status}")
+        return {
+            str(key): value.item() if hasattr(value, "item") else value
+            for key, value in dict(status).items()
+        }
 
     def start_camera_session(
         self,
@@ -116,12 +178,14 @@ class StreamDIOClient:
     ) -> None:
         if self._dio is None:
             raise RuntimeError("StreamDIO not connected")
-        if not self._dio.start_camera_triggers(frequency=frequency_hz, exposure_us=exposure_us):
-            raise RuntimeError("Failed to start camera triggers on StreamDIO")
+        with self._config_lock:
+            if not self._dio.start_camera_triggers(frequency=frequency_hz, exposure_us=exposure_us):
+                raise RuntimeError("Failed to start camera triggers on StreamDIO")
 
     def stop_camera(self) -> None:
         if self._dio is not None:
-            self._dio.stop_camera_triggers()
+            with self._config_lock:
+                self._dio.stop_camera_triggers()
 
     def start_streaming(self, callback: Callable[..., None] | None = None) -> None:
         if self._dio is None:
@@ -186,9 +250,10 @@ class StreamDIOClient:
             prior_state = self._output_states.get(channel_i)
             prior_sequence = self._output_sequences[channel_i]
 
-        command_start = time.perf_counter()
-        acknowledged = bool(self._dio.manual_override_output(channel_i, state_i))
-        command_end = time.perf_counter()
+        with self._config_lock:
+            command_start = time.perf_counter()
+            acknowledged = bool(self._dio.manual_override_output(channel_i, state_i))
+            command_end = time.perf_counter()
         if not acknowledged:
             raise RuntimeError(
                 f"StreamDIO rejected output channel {channel_i} state {state_i}"
@@ -247,20 +312,21 @@ class StreamDIOClient:
         """Control firmware-generated white noise and verify module status."""
         if self._dio is None:
             raise RuntimeError("StreamDIO not connected")
-        command_start = time.perf_counter()
-        acknowledged = bool(
-            self._dio.configure_speaker_noise(
-                bool(enabled),
-                sample_interval_us=int(sample_interval_us),
+        with self._config_lock:
+            command_start = time.perf_counter()
+            acknowledged = bool(
+                self._dio.configure_speaker_noise(
+                    bool(enabled),
+                    sample_interval_us=int(sample_interval_us),
+                )
             )
-        )
-        command_end = time.perf_counter()
-        if not acknowledged:
-            raise RuntimeError(f"StreamDIO rejected speaker noise enabled={bool(enabled)}")
-        status = {
-            str(key): value.item() if hasattr(value, "item") else value
-            for key, value in dict(self._dio.get_speaker_status()).items()
-        }
+            command_end = time.perf_counter()
+            if not acknowledged:
+                raise RuntimeError(f"StreamDIO rejected speaker noise enabled={bool(enabled)}")
+            status = {
+                str(key): value.item() if hasattr(value, "item") else value
+                for key, value in dict(self._dio.get_speaker_status()).items()
+            }
         if bool(status.get("enabled")) != bool(enabled):
             raise RuntimeError(f"Unexpected StreamDIO speaker status: {status}")
         return {
@@ -270,6 +336,73 @@ class StreamDIOClient:
             "command_end_mono_s": command_end,
             "status": status,
         }
+
+    def get_cap_touch_status(self) -> dict[str, Any]:
+        """Read the firmware-local cap-touch ADC digitizer status from USB1."""
+        if self._dio is None:
+            raise RuntimeError("StreamDIO not connected")
+        config_arcom = getattr(self._dio, "_config_arcom", None)
+        if config_arcom is None:
+            raise RuntimeError("StreamDIO driver does not expose the config ArCOM port")
+        with self._config_lock:
+            config_arcom.write(ord("l"), "uint8")
+            status = {
+                "enabled": bool(config_arcom.read(1, "uint8", "builtin")),
+                "channel": int(config_arcom.read(1, "uint8", "builtin")),
+                "pin": int(config_arcom.read(1, "uint8", "builtin")),
+                "state": int(config_arcom.read(1, "uint8", "builtin")),
+                "polarity": int(config_arcom.read(1, "uint8", "builtin")),
+                "last_value": int(config_arcom.read(1, "uint16", "builtin")),
+                "baseline": int(config_arcom.read(1, "uint16", "builtin")),
+                "rising_high_threshold": int(config_arcom.read(1, "uint16", "builtin")),
+                "rising_low_threshold": int(config_arcom.read(1, "uint16", "builtin")),
+                "falling_high_threshold": int(config_arcom.read(1, "uint16", "builtin")),
+                "falling_low_threshold": int(config_arcom.read(1, "uint16", "builtin")),
+            }
+        return status
+
+    def configure_cap_touch_digitizer(
+        self,
+        *,
+        min_high_threshold: int | None = None,
+        delta_high: int | None = None,
+        delta_low: int | None = None,
+    ) -> dict[str, Any]:
+        """Configure firmware-local cap-touch ADC-to-digital thresholds."""
+        if self._dio is None:
+            raise RuntimeError("StreamDIO not connected")
+        firmware_version = int(self._dio.module_info.get("firmware_version", 0))
+        if firmware_version < STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION:
+            raise RuntimeError(
+                "StreamDIO firmware does not support runtime cap-touch threshold "
+                f"configuration. Found firmware version {firmware_version}; expected "
+                f"{STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION} or newer. Flash "
+                "firmware/Module_DIO_streeaming_100us_cycle before using tuned "
+                "cap-touch thresholds."
+            )
+        config_arcom = getattr(self._dio, "_config_arcom", None)
+        if config_arcom is None:
+            raise RuntimeError("StreamDIO driver does not expose the config ArCOM port")
+        min_high = _uint12(
+            CAP_TOUCH_DEFAULT_MIN_HIGH_THRESHOLD
+            if min_high_threshold is None
+            else min_high_threshold
+        )
+        high_delta = _uint12(
+            CAP_TOUCH_DEFAULT_DELTA_HIGH if delta_high is None else delta_high
+        )
+        low_delta = _uint12(CAP_TOUCH_DEFAULT_DELTA_LOW if delta_low is None else delta_low)
+        if low_delta > high_delta:
+            low_delta = high_delta
+        with self._config_lock:
+            config_arcom.write(ord("t"), "uint8")
+            config_arcom.write(min_high, "uint16")
+            config_arcom.write(high_delta, "uint16")
+            config_arcom.write(low_delta, "uint16")
+            acknowledged = bool(config_arcom.read(1, "uint8", "builtin"))
+        if not acknowledged:
+            raise RuntimeError("StreamDIO rejected cap-touch threshold configuration")
+        return self.get_cap_touch_status()
 
     def stop_streaming(self) -> None:
         if self._dio is not None and getattr(self._dio, "streaming_active", False):
