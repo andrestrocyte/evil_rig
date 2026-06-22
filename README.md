@@ -1,4 +1,6 @@
-# bpod-hf-dm
+# Head-Fixed Discounting Bpod Task
+
+![Cartoon mouse choosing between low- and high-effort wheel directions](assets/hf-dm-experiment-cartoon.png)
 
 Head-fixed **decision-making with effort** (wheel + force cue), implemented on **[bpod-core](https://github.com/int-brain-lab/bpod-core)** with StreamDIO hardware.
 
