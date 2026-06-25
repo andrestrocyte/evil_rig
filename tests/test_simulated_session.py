@@ -4,6 +4,7 @@ import os
 import numpy as np
 
 from hf_dm.config import SessionConfig, TrainingPhase
+from hf_dm.hardware.bringup_constants import FRAME2TTL_INPUT_CHANNEL
 from hf_dm.session.simulated import (
     SimulatedHFDecisionSession,
     SimulationOptions,
@@ -45,6 +46,16 @@ def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
     assert len(session.recorder.streamdio_events) > 0
     assert all(trial.lick_count >= 1 for trial in session.recorder.trials)
     assert all(trial.force_samples > 0 for trial in session.recorder.trials)
+    assert session.recorder.trials[0].frame2ttl_choice_edge_count > 0
+    assert session.recorder.trials[1].frame2ttl_choice_edge_count > 0
+    assert session.recorder.trials[2].choice_loop_frames == 1
+    assert session.recorder.trials[2].frame2ttl_choice_edge_count <= 2
+    assert any(
+        event[0] == "dio_input" and int(event[1]) == FRAME2TTL_INPUT_CHANNEL
+        for event in session.recorder.streamdio_events
+    )
+    assert any(event[0] == "bpod_state" for event in session.recorder.streamdio_events)
+    assert "bpod_state_marker" in event_types
     assert len(session.recorder.bpod_trials) == 3
     with np.load(session.recorder.base_path.with_suffix(".npz"), allow_pickle=True) as data:
         assert "trials_json" in data.files
@@ -57,7 +68,16 @@ def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
         for row in session.recorder.bpod_trials[2]["events"]
         if row["type"] == "StateStart"
     ]
-    assert timeout_states == ["Quiescence", "ChoiceWindow", "TimeoutNoise", "PostTimeout"]
+    assert timeout_states == [
+        "Quiescence_Pre",
+        "Quiescence",
+        "ChoiceWindow_Pre",
+        "ChoiceWindow",
+        "TimeoutNoise_Pre",
+        "TimeoutNoise",
+        "PostTimeout_Pre",
+        "PostTimeout",
+    ]
 
 
 def test_simulated_centering_requires_wheel_motion_and_rewards_at_center(tmp_path):
@@ -84,6 +104,103 @@ def test_simulated_centering_requires_wheel_motion_and_rewards_at_center(tmp_pat
     assert abs(trial.final_position_deg) <= config.centering_threshold_deg
     assert abs(trial.net_pulses) > 0
     assert "pump_start" in event_types
+
+
+def test_simulated_frame2ttl_barcode_decodes_when_quiescence_allows_full_code(tmp_path):
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    config = SessionConfig(n_trials=1, results_dir=str(tmp_path))
+    config.camera.save_dir = str(tmp_path / "videos")
+    shorten_for_simulation(config)
+    config.timing.quiescence_s = 3.0
+    session = SimulatedHFDecisionSession(
+        config,
+        SimulationOptions(choice_mode="matched", frames_to_choice=4),
+    )
+
+    session.connect()
+    summary = session.run()
+
+    trial = session.recorder.trials[0]
+    assert summary.n_trials_completed == 1
+    assert trial.frame2ttl_barcode_complete
+    assert trial.frame2ttl_barcode_decoded
+    assert trial.frame2ttl_barcode_match
+    assert trial.frame2ttl_first_ttl_timestamp_us is not None
+    assert trial.frame2ttl_first_ttl_latency_from_bpod_s is not None
+
+
+def test_simulated_frame2ttl_diagnostic_counts_sync_square_edges(tmp_path):
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    config = SessionConfig(n_trials=1, results_dir=str(tmp_path))
+    config.camera.save_dir = str(tmp_path / "videos")
+    shorten_for_simulation(config)
+    session = SimulatedHFDecisionSession(
+        config,
+        SimulationOptions(choice_mode="matched", frames_to_choice=4),
+    )
+
+    session.connect()
+    summary = session.frame2ttl_diagnostic(n_flips=4, hold_s=0.01, settle_s=0.0)
+
+    assert summary.end_reason == "frame2ttl_diagnostic"
+    diagnostic_end = [
+        event
+        for event in session.recorder.events
+        if event.event_type == "frame2ttl_diagnostic_end"
+    ][-1]
+    assert diagnostic_end.payload["detected"]
+    assert diagnostic_end.payload["edges_seen"] >= 4
+    assert diagnostic_end.payload["states_seen"] == [0, 1]
+
+
+def test_simulated_frame2ttl_barcode_diagnostic_decodes_all_cases(tmp_path):
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    config = SessionConfig(n_trials=1, results_dir=str(tmp_path))
+    config.camera.save_dir = str(tmp_path / "videos")
+    shorten_for_simulation(config)
+    config.display.fps = 120
+    session = SimulatedHFDecisionSession(
+        config,
+        SimulationOptions(choice_mode="matched", frames_to_choice=4),
+    )
+
+    session.connect()
+    summary = session.frame2ttl_barcode_diagnostic(repetitions=1, settle_s=0.0)
+
+    assert summary.end_reason == "frame2ttl_barcode_diagnostic"
+    diagnostic_end = [
+        event
+        for event in session.recorder.events
+        if event.event_type == "frame2ttl_barcode_diagnostic_end"
+    ][-1]
+    assert diagnostic_end.payload["cases_run"] == 6
+    assert diagnostic_end.payload["decoded_count"] == 6
+    assert diagnostic_end.payload["match_count"] == 6
+    assert diagnostic_end.payload["all_match"]
+
+
+def test_simulated_bpod_opcode_diagnostic_reports_marker_sequence(tmp_path):
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    config = SessionConfig(n_trials=1, results_dir=str(tmp_path))
+    config.camera.save_dir = str(tmp_path / "videos")
+    shorten_for_simulation(config)
+    session = SimulatedHFDecisionSession(
+        config,
+        SimulationOptions(choice_mode="matched", frames_to_choice=4),
+    )
+
+    session.connect()
+    summary = session.bpod_opcode_diagnostic(hold_s=0.001)
+
+    assert summary.end_reason == "bpod_opcode_diagnostic"
+    diagnostic_end = [
+        event
+        for event in session.recorder.events
+        if event.event_type == "bpod_opcode_diagnostic_end"
+    ][-1]
+    assert diagnostic_end.payload["matched"]
+    assert diagnostic_end.payload["seen_ids"] == diagnostic_end.payload["expected_ids"]
+    assert diagnostic_end.payload["markers_seen"] == len(diagnostic_end.payload["expected_ids"])
 
 
 def test_simulated_forced_risk_star_can_omit_pump_and_records_metadata(tmp_path):

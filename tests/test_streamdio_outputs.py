@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from hf_dm.hardware.bringup_constants import (
     CAP_TOUCH_INPUT_PIN,
+    FRAME2TTL_INPUT_CHANNEL,
     FORCE_ANALOG_CHANNEL,
     FORCE_ANALOG_PIN,
     LICK_INPUT_CHANNEL,
@@ -125,10 +126,14 @@ def test_rotary_force_config_requires_cap_touch_digitizer_firmware():
 def test_rotary_force_config_accepts_digitizer_firmware():
     client = _client()
 
-    client.configure_rotary_and_force(lick_channels=(LICK_INPUT_CHANNEL,))
+    client.configure_rotary_and_force(
+        lick_channels=(LICK_INPUT_CHANNEL,),
+        extra_input_channels=(FRAME2TTL_INPUT_CHANNEL,),
+    )
 
     enabled = client.raw.configured["input_channels_enabled"]
     assert enabled[LICK_INPUT_CHANNEL - 1]
+    assert enabled[FRAME2TTL_INPUT_CHANNEL - 1]
     assert client.raw.configured["analog_input"]["channel"] == FORCE_ANALOG_CHANNEL
 
 

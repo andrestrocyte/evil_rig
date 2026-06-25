@@ -15,6 +15,10 @@ from hf_dm.fsm.builders import (
 )
 from hf_dm.fsm.relay import RelayMessageIds, SerialRelay
 from hf_dm.data.recorder import SessionRecorder
+from hf_dm.hardware.bringup_constants import (
+    STREAMDIO_BPOD_STATE_OPCODE,
+    STREAMDIO_STATE_MARKER_MESSAGE_IDS,
+)
 
 
 @pytest.fixture
@@ -77,14 +81,29 @@ def test_production_fsm_owns_quiescence_choice_reward_and_timeout(mock_relay):
     )
 
     fsm.check()
+    assert next(iter(fsm.states)) == "Quiescence_Pre"
+    assert fsm.states["Quiescence_Pre"].timer == 0.001
+    assert (
+        fsm.states["Quiescence_Pre"].actions[mock_relay.module_name]
+        == STREAMDIO_STATE_MARKER_MESSAGE_IDS["Quiescence"]
+    )
     assert fsm.states["Quiescence"].transitions["SoftCode2"] == "QuiescenceReset"
+    assert fsm.states["Quiescence"].transitions["Tup"] == "ChoiceWindow_Pre"
+    assert fsm.states["QuiescenceReset"].transitions["Tup"] == "Quiescence_Pre"
     assert fsm.states["Quiescence"].timer == 3.0
     assert fsm.states["ChoiceWindow"].timer == 20.0
-    assert fsm.states["ChoiceWindow"].transitions["Tup"] == "TimeoutNoise"
+    assert fsm.states["ChoiceWindow"].transitions["SoftCode0"] == "ChoiceBlankHigh_Pre"
+    assert fsm.states["ChoiceWindow"].transitions["SoftCode1"] == "ChoiceBlankLow_Pre"
+    assert fsm.states["ChoiceWindow"].transitions["Tup"] == "TimeoutNoise_Pre"
     assert fsm.states["ChoiceBlankHigh"].timer == 1.0
+    assert fsm.states["ChoiceBlankHigh"].transitions["Tup"] == "RewardHigh_Pre"
     assert fsm.states["RewardHigh"].timer == 0.08
     assert fsm.states["RewardLow"].timer == 0.04
     assert fsm.states["PostRewardHigh"].timer == 1.0
+    assert (
+        fsm.states["TimeoutNoise_Pre"].actions[mock_relay.module_name]
+        == STREAMDIO_STATE_MARKER_MESSAGE_IDS["TimeoutNoise"]
+    )
     assert fsm.states["TimeoutNoise"].actions[mock_relay.module_name] == 210
     assert fsm.states["PostTimeout"].actions[mock_relay.module_name] == 211
 
@@ -139,6 +158,30 @@ def test_iti_fsm_validates():
 def test_message_ids():
     ids = RelayMessageIds()
     assert ids.speaker_gate_on == 210
+
+
+def test_serial_relay_preloads_streamdio_state_markers():
+    bpod = MagicMock()
+    module = MagicMock()
+    module.is_connected = True
+    module.index = 0
+    module.load_serial_message.return_value = True
+    bpod.modules = {"Serial1": module}
+
+    SerialRelay(bpod, serial_channel_index=0)
+
+    loaded = {
+        call.args[0]: list(call.args[1])
+        for call in module.load_serial_message.call_args_list
+    }
+    assert loaded[STREAMDIO_STATE_MARKER_MESSAGE_IDS["Quiescence"]] == [
+        STREAMDIO_BPOD_STATE_OPCODE,
+        1,
+    ]
+    assert loaded[STREAMDIO_STATE_MARKER_MESSAGE_IDS["TimeoutNoise"]] == [
+        STREAMDIO_BPOD_STATE_OPCODE,
+        9,
+    ]
 
 
 def test_serial_relay_sends_immediate_bytes_on_configured_output():

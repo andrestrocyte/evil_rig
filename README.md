@@ -17,6 +17,7 @@ All pin/channel/timing defaults are defined in this repository, mainly in `src/h
 | `camera_bringup_pin32_ttl.ipynb` | StreamDIO camera 30 Hz, 10 ms exposure |
 | `speaker_bringup_pin27_whitenoise.ipynb` | Continuous PC white noise, gated by Bpod serial action on pin 27 |
 | `cap_touch_bringup_pin15_power_pin14_touch.ipynb` | Cap-touch power output ch13/pin15; lick edges on input ch14/pin25 |
+| `frame2ttl_v3_bringup_di05_pin6.ipynb` | Frame2TTL v3 TTL output into StreamDIO DI05 / pin 6 |
 
 The task does not read rig parameters from a sister checkout. MM_PyBpod2 is needed as an installed
 driver package for `pybpod_streamDIO_module` unless that driver is deliberately vendored later.
@@ -141,6 +142,15 @@ python -m hf_dm.cli --config configs/dm_50.yaml --hardware-self-test
 # Cap-touch input check only. Touch the lick detector during the window.
 python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-touch-duration 15
 
+# Frame2TTL photodiode check only. Flashes the lower-right sync square and counts DI05 edges.
+python -m hf_dm.cli --config configs/dm_50.yaml --frame2ttl-diagnostic --frame2ttl-flips 20
+
+# Frame2TTL barcode check only. Displays representative slow count barcodes and reports decode/match accuracy.
+python -m hf_dm.cli --config configs/dm_50.yaml --frame2ttl-barcode-diagnostic
+
+# Bpod -> StreamDIO opcode check only. Sends state-marker serial messages without task outputs.
+python -m hf_dm.cli --config configs/dm_50.yaml --bpod-opcode-diagnostic
+
 # Stage 1 - centering shaping (bring a lateral cue into the center target)
 python -m hf_dm.cli --config configs/centering_50.yaml
 
@@ -216,6 +226,33 @@ The diagnostic report includes a `diagnosis` field such as
 `raw_adc_swing_detected`, `raw_adc_below_threshold`,
 `digitizer_edges_detected`, or `digitizer_adc_below_threshold`.
 
+### Frame2TTL screen sync
+
+The official configs enable Frame2TTL v3 on StreamDIO DI05 / physical pin 6. The task draws a
+64 px sync square in the lower-right corner of the behavior screen, with size, margin, corner,
+input channel, and input pin controlled by the `frame2ttl:` YAML block.
+
+At the beginning of each Bpod decision trial, the square emits a slow two-group pulse-count barcode
+during the existing quiescence period. The first group encodes modality (force/risk/delay/other) and
+the second group encodes trial kind (free left/right, forced-star left/right, forced-circle
+left/right). Pulses and short gaps are 6 frames each at 60 Hz, with 12-frame preamble/separator
+intervals, so the worst case is about 2.6 s. During the choice window the same square alternates
+black/white only when a wheel movement changes the rendered cue positions; if the cues do not move,
+the display is polled but no new frame is flipped.
+
+The production Bpod decision FSM also inserts 1 ms `*_Pre` transition states before each task state.
+Those pre-states send preloaded StreamDIO state-marker messages (`[ord("S"), state_id]`, message IDs
+50+) so the module timestamps trial-state transitions as `bpod_state` events.
+
+The operator monitor includes a Frame2TTL readout in the inputs/events panel: live DI05 edge ticks,
+last TTL state, channel/pin labels, and latest barcode decode/match status. The Bpod FSM panel also
+shows a rolling color-coded transition-opcode timeline from StreamDIO `bpod_state` events. Raw DI05
+transitions remain in the NPZ `streamdio_events` array as `dio_input` events on channel 5.
+Before running trials, use `--frame2ttl-diagnostic` to confirm the photodiode sees both black and
+white transitions at the configured lower-right patch location, `--frame2ttl-barcode-diagnostic`
+to verify barcode decode/match accuracy, and `--bpod-opcode-diagnostic` to verify Bpod state-marker
+timestamps reach StreamDIO.
+
 `--hardware-self-test` runs the production Bpod FSM with synthetic wheel choices but real rig
 outputs. It fails unless both effort directions and pump transitions have firmware output events,
 choice-to-pump timing matches the configured blank state, pump duration error is below 10 ms, force
@@ -227,10 +264,10 @@ the saved `preflight_end` event reports wheel pulse/direction edges and cap-touc
 
 ## Data logged
 
-- Per-trial: star/circle sides, chosen shape/side, force direction, choice, reward duration, RT, pulses, force ADC stats, licks, wall/mono timestamps, camera TTL list
+- Per-trial: star/circle sides, chosen shape/side, force direction, choice, reward duration, RT, pulses, force ADC stats, licks, wall/mono timestamps, camera TTL list, Frame2TTL barcode/edge summary
 - Exact bpod-core state/event rows for every trial in JSON and NPZ `bpod_trials_json`
 - Raw NPZ `streamdio_events`: every wheel/direction edge, force sample, camera TTL, lick, module timestamp, and high-resolution host timestamp
-- Events: `session_start`, `trial_start`, `stimulus_on`, `force_on`, `choice_detected`, `feedback_on`, `pump_start`, `pump_end`, `output_actual`, `lick`, `white_noise_*`, cleanup, `trial_end`, `session_end`
+- Events: `session_start`, `trial_start`, `stimulus_on`, `force_on`, `choice_detected`, `feedback_on`, `frame2ttl_*`, `pump_start`, `pump_end`, `output_actual`, `lick`, `white_noise_*`, cleanup, `trial_end`, `session_end`
 - Video: every camera frame with camera and host timestamps in `frame_timestamps.csv`
 - Session summary: end reason (`completed`, `idle_timeout`, `max_consecutive_failures`)
 

@@ -17,6 +17,7 @@ STREAMDIO_STREAM_DISCOVERY = 223
 STREAMDIO_DIO_INPUT_EVENT_BASE = 1
 STREAMDIO_DIO_OUTPUT_EVENT_BASE = 29
 STREAMDIO_ANALOG_INPUT_EVENT_BASE = 55
+STREAMDIO_BPOD_STATE_EVENT_BASE = 100
 STREAMDIO_CAP_TOUCH_DIGITIZER_FIRMWARE_VERSION = 3
 STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION = 4
 
@@ -53,9 +54,42 @@ SERIAL_GATE_ON_MESSAGE_ID = 210
 SERIAL_GATE_OFF_MESSAGE_ID = 211
 SPEAKER_NOISE_SAMPLE_INTERVAL_US = 100
 
+# Bpod -> StreamDIO state markers.
+# Message IDs 50+ match the MM_PyBpod2 examples; each preloaded message sends
+# [ord('S'), state_id] to StreamDIO so the module timestamps the state entry.
+STREAMDIO_BPOD_STATE_OPCODE = 83  # ord('S')
+STREAMDIO_STATE_MESSAGE_ID_BASE = 50
+STREAMDIO_STATE_MARKERS = (
+    ("Quiescence", 1),
+    ("ChoiceWindow", 2),
+    ("ChoiceBlankHigh", 3),
+    ("ChoiceBlankLow", 4),
+    ("RewardHigh", 5),
+    ("RewardLow", 6),
+    ("PostRewardHigh", 7),
+    ("PostRewardLow", 8),
+    ("TimeoutNoise", 9),
+    ("PostTimeout", 10),
+    ("Abort", 11),
+)
+STREAMDIO_STATE_MARKER_IDS = {name: state_id for name, state_id in STREAMDIO_STATE_MARKERS}
+STREAMDIO_STATE_MARKER_NAMES = {state_id: name for name, state_id in STREAMDIO_STATE_MARKERS}
+STREAMDIO_STATE_MARKER_MESSAGE_IDS = {
+    name: STREAMDIO_STATE_MESSAGE_ID_BASE + index
+    for index, (name, _state_id) in enumerate(STREAMDIO_STATE_MARKERS)
+}
+STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID = {
+    STREAMDIO_STATE_MESSAGE_ID_BASE + index: state_id
+    for index, (_name, state_id) in enumerate(STREAMDIO_STATE_MARKERS)
+}
+
 # Camera TTL via StreamDIO (camera_bringup_pin32_ttl.ipynb defaults)
 DEFAULT_CAMERA_FREQUENCY_HZ = 30
 DEFAULT_CAMERA_EXPOSURE_US = 10_000
+
+# Frame2TTL v3 TTL input (frame2ttl_v3_bringup_di05_pin6.ipynb)
+FRAME2TTL_INPUT_CHANNEL = 5      # DI05 / Teensy pin 6
+FRAME2TTL_INPUT_PIN = 6
 
 # Wheel kinematics (screen_shape_force_discount_task.py)
 DEFAULT_WHEEL_RADIUS_MM = 31.5

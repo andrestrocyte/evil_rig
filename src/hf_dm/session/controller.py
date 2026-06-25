@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 from bpod_core.bpod import Bpod
+from bpod_core.fsm import StateMachine
 
 from hf_dm.audio.white_noise import WhiteNoisePlayer
 from hf_dm.config import SessionConfig, TrainingPhase, config_to_dict, task_design_summary
@@ -17,6 +18,12 @@ from hf_dm.camera.spinnaker import HeadlessSpinnakerRecorder
 from hf_dm.hardware.discovery import connect_bpod_core
 from hf_dm.data.recorder import SessionRecorder, SessionSummary, TrialRecord
 from hf_dm.display.pygame_display import TaskDisplay
+from hf_dm.frame2ttl import (
+    TOTAL_BITS as FRAME2TTL_TOTAL_BITS,
+    decode_frame2ttl_barcode_events,
+    encode_frame2ttl_trial_code,
+    frame2ttl_barcode_states,
+)
 from hf_dm.fsm import softcodes as sc
 from hf_dm.fsm.builders import build_host_supervised_decision_fsm
 from hf_dm.fsm.relay import SerialRelay, wait_until_perf_counter
@@ -31,6 +38,8 @@ from hf_dm.hardware.bringup_constants import (
     FORCE_ANALOG_CHANNEL,
     PUMP_OUTPUT_CHANNEL,
     STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION,
+    STREAMDIO_STATE_MARKER_IDS,
+    STREAMDIO_STATE_MARKER_NAMES,
 )
 from hf_dm.monitor import OperatorMonitor
 from hf_dm.streamdio.client import StreamDIOClient
@@ -58,6 +67,8 @@ class HFDecisionSession:
         self._consecutive_failures = 0
         self._lick_lock = threading.Lock()
         self._lick_events: list[dict[str, float | int]] = []
+        self._frame2ttl_lock = threading.Lock()
+        self._frame2ttl_events: list[dict[str, float | int]] = []
         self._closed = False
         self._last_choice_loop_stats: dict[str, float | int | str | bool] = {}
         self._active_trial_runtime: TrialRuntime | None = None
@@ -79,8 +90,11 @@ class HFDecisionSession:
         )
         excluded = self._bpod_serial_ports()
         self.dio.open(excluded_bpod_ports=excluded)
-        self.dio.configure_rotary_and_force(lick_channels=self.config.licks.channels)
-        self.display = TaskDisplay(self.config.display)
+        self.dio.configure_rotary_and_force(
+            lick_channels=self.config.licks.channels,
+            extra_input_channels=self._frame2ttl_input_channels(),
+        )
+        self.display = TaskDisplay(self.config.display, self.config.frame2ttl)
         out = Path(self.config.results_dir)
         self.recorder = SessionRecorder(out, self.config.subject_id, self.config.phase.value)
         self.recorder.set_metadata(self._session_metadata())
@@ -175,6 +189,7 @@ class HFDecisionSession:
                 "camera_hz": self.config.camera.frequency_hz,
                 "camera_backend": self.config.camera.backend,
                 "lick_channels": list(self.config.licks.channels),
+                "frame2ttl": self._frame2ttl_descriptor(),
                 "cap_touch_power_output_channel": self.config.licks.power_output_channel,
                 "output_control": "bpod_fsm_softcode_to_verified_streamdio_usb",
                 "speaker_control": "bpod_fsm_serial_pin27_gate_plus_pc_white_noise",
@@ -363,6 +378,7 @@ class HFDecisionSession:
                 "lick_channels": list(self.config.licks.channels),
                 "lick_high_only": self.config.licks.high_only,
                 "lick_inputs": self._lick_input_descriptors(),
+                "frame2ttl": self._frame2ttl_descriptor(),
                 "cap_touch_power": {
                     "channel": self.config.licks.power_output_channel,
                     "pin": (
@@ -554,6 +570,28 @@ class HFDecisionSession:
             )
         return descriptors
 
+    def _frame2ttl_input_channels(self) -> tuple[int, ...]:
+        cfg = self.config.frame2ttl
+        if not cfg.enabled:
+            return ()
+        channel = int(cfg.input_channel)
+        if channel <= 0:
+            return ()
+        return (channel,)
+
+    def _frame2ttl_descriptor(self) -> dict:
+        cfg = self.config.frame2ttl
+        return {
+            "enabled": bool(cfg.enabled),
+            "input_channel": int(cfg.input_channel),
+            "input_pin": int(cfg.input_pin),
+            "patch_size_px": int(cfg.patch_size_px),
+            "patch_margin_px": int(cfg.patch_margin_px),
+            "patch_corner": str(cfg.patch_corner),
+            "barcode_enabled": bool(cfg.barcode_enabled),
+            "choice_flash_enabled": bool(cfg.choice_flash_enabled),
+        }
+
     def _fsm_monitor_states(self) -> list[dict]:
         timing = self.config.timing
         reward = self.config.reward
@@ -730,6 +768,16 @@ class HFDecisionSession:
                 "force_output_direction": trial.force_output_direction,
                 "force_output_active": trial.force_output_direction is not None,
                 "lick_count": trial.lick_count,
+                "frame2ttl_code_word": trial.frame2ttl_code_word,
+                "frame2ttl_trial_type_code": trial.frame2ttl_trial_type_code,
+                "frame2ttl_barcode_complete": trial.frame2ttl_barcode_complete,
+                "frame2ttl_barcode_decoded": trial.frame2ttl_barcode_decoded,
+                "frame2ttl_barcode_match": trial.frame2ttl_barcode_match,
+                "frame2ttl_edge_count": trial.frame2ttl_edge_count,
+                "frame2ttl_choice_edge_count": trial.frame2ttl_choice_edge_count,
+                "frame2ttl_first_ttl_latency_from_bpod_s": (
+                    trial.frame2ttl_first_ttl_latency_from_bpod_s
+                ),
             },
         )
 
@@ -751,6 +799,32 @@ class HFDecisionSession:
             )
         normalized_channel = -1 if channel is None else int(channel)
         normalized_value = -1 if value is None else int(value)
+        event_host_mono_s = time.perf_counter()
+        if self._is_frame2ttl_edge(event_type, normalized_channel):
+            self._record_frame2ttl_edge(
+                normalized_value,
+                timestamp_us,
+                relative_time,
+                event_host_mono_s,
+            )
+        if event_type == "bpod_state" and self.recorder is not None:
+            state_id = normalized_channel
+            state_name = STREAMDIO_STATE_MARKER_NAMES.get(state_id, f"state_{state_id}")
+            trial_index = (
+                None
+                if self._active_trial_runtime is None
+                else self._active_trial_runtime.trial_index
+            )
+            payload = {
+                "trial_index": trial_index,
+                "state_id": state_id,
+                "state_name": state_name,
+                "module_timestamp_us": int(timestamp_us),
+                "relative_time_s": float(relative_time),
+                "host_perf_counter_s": float(event_host_mono_s),
+            }
+            self.recorder.log_event("bpod_state_marker", payload)
+            self._publish_monitor("bpod_state_marker", payload)
         if event_type == "dio_output" and self.recorder is not None:
             output_names = {
                 PUMP_OUTPUT_CHANNEL: "pump",
@@ -876,6 +950,161 @@ class HFDecisionSession:
         self._publish_monitor("lick", lick_event)
         if self.recorder is not None:
             self.recorder.log_event("lick", lick_event)
+
+    def _is_frame2ttl_edge(self, event_type: str, channel: int) -> bool:
+        cfg = self.config.frame2ttl
+        return (
+            bool(cfg.enabled)
+            and event_type == "dio_input"
+            and int(channel) == int(cfg.input_channel)
+        )
+
+    def _record_frame2ttl_edge(
+        self,
+        state: int,
+        timestamp_us: int,
+        relative_time: float,
+        host_mono_s: float,
+    ) -> None:
+        cfg = self.config.frame2ttl
+        event = {
+            "channel": int(cfg.input_channel),
+            "pin": int(cfg.input_pin),
+            "state": int(state),
+            "timestamp_us": int(timestamp_us),
+            "relative_time_s": float(relative_time),
+            "host_perf_counter_s": float(host_mono_s),
+            "wall_time_s": time.time(),
+        }
+        with self._frame2ttl_lock:
+            self._frame2ttl_events.append(event)
+        self._publish_monitor("frame2ttl_edge", event)
+
+    def _frame2ttl_events_between(self, start_mono_s: float, end_mono_s: float) -> list[dict]:
+        with self._frame2ttl_lock:
+            return [
+                dict(event)
+                for event in self._frame2ttl_events
+                if start_mono_s <= float(event["host_perf_counter_s"]) <= end_mono_s
+            ]
+
+    def _frame2ttl_event_count(self) -> int:
+        with self._frame2ttl_lock:
+            return len(self._frame2ttl_events)
+
+    def _frame2ttl_events_since(self, start_index: int) -> list[dict]:
+        with self._frame2ttl_lock:
+            return [dict(event) for event in self._frame2ttl_events[start_index:]]
+
+    def _notify_frame2ttl_display_state(
+        self,
+        state: bool,
+        flip_mono_s: float,
+        *,
+        trial_index: int,
+        source: str,
+        frame_index: int,
+    ) -> None:
+        del state, flip_mono_s, trial_index, source, frame_index
+
+    def _build_frame2ttl_barcode(self, runtime: TrialRuntime) -> tuple[dict, list[bool]]:
+        cfg = self.config.frame2ttl
+        code = encode_frame2ttl_trial_code(
+            trial_index=runtime.trial_index,
+            star_side=runtime.star_side,
+            trial_mode=runtime.trial_mode,
+            forced_shape=runtime.forced_shape,
+            modality=runtime.modality,
+        )
+        states = frame2ttl_barcode_states(
+            code,
+            preamble_high_frames=cfg.barcode_preamble_high_frames,
+            preamble_low_frames=cfg.barcode_preamble_low_frames,
+            one_high_frames=cfg.barcode_one_high_frames,
+            zero_high_frames=cfg.barcode_zero_high_frames,
+            inter_bit_low_frames=cfg.barcode_inter_bit_low_frames,
+        )
+        payload = code.to_dict()
+        payload["barcode_frame_count"] = len(states)
+        return payload, states
+
+    def _finalize_frame2ttl_trial(
+        self,
+        *,
+        trial_index: int,
+        code: dict | None,
+        barcode_flips: list[dict],
+        bpod_choice_start_mono_s: float | None,
+        choice_end_mono_s: float | None,
+    ) -> dict:
+        cfg = self.config.frame2ttl
+        result: dict = {
+            "enabled": bool(cfg.enabled),
+            "code_word": None if code is None else int(code["word"]),
+            "trial_type_code": None if code is None else int(code["trial_type_code"]),
+            "barcode_complete": False,
+            "barcode_decoded": False,
+            "barcode_match": False,
+            "edge_count": 0,
+            "choice_edge_count": 0,
+            "first_ttl_timestamp_us": None,
+            "first_ttl_relative_time_s": None,
+            "first_ttl_latency_from_bpod_s": None,
+        }
+        if not cfg.enabled:
+            return result
+        if bpod_choice_start_mono_s is not None and choice_end_mono_s is not None:
+            result["choice_edge_count"] = len(
+                self._frame2ttl_events_between(
+                    float(bpod_choice_start_mono_s),
+                    float(choice_end_mono_s) + 0.05,
+                )
+            )
+        if code is None or not barcode_flips:
+            self._publish_monitor("frame2ttl_decode", {"trial_index": trial_index, **result})
+            return result
+
+        complete = len(barcode_flips) >= int(code.get("barcode_frame_count", len(barcode_flips)))
+        result["barcode_complete"] = complete
+        start = float(barcode_flips[0]["display_flip_mono_s"]) - 0.05
+        end = float(barcode_flips[-1]["display_flip_mono_s"]) + 0.25
+        edges = self._frame2ttl_events_between(start, end)
+        result["edge_count"] = len(edges)
+        if edges:
+            first = edges[0]
+            result["first_ttl_timestamp_us"] = int(first["timestamp_us"])
+            result["first_ttl_relative_time_s"] = float(first["relative_time_s"])
+            bpod_start = barcode_flips[0].get("bpod_state_started_mono_s")
+            if bpod_start is not None:
+                result["first_ttl_latency_from_bpod_s"] = (
+                    float(first["host_perf_counter_s"]) - float(bpod_start)
+                )
+        decoded = decode_frame2ttl_barcode_events(
+            edges,
+            frame_period_s=1.0 / max(1, int(self.config.display.fps)),
+            expected_bits=FRAME2TTL_TOTAL_BITS,
+            preamble_high_frames=cfg.barcode_preamble_high_frames,
+            preamble_low_frames=cfg.barcode_preamble_low_frames,
+            one_high_frames=cfg.barcode_one_high_frames,
+            zero_high_frames=cfg.barcode_zero_high_frames,
+            inter_bit_low_frames=cfg.barcode_inter_bit_low_frames,
+        )
+        result["decode"] = decoded
+        result["barcode_decoded"] = bool(decoded.get("decoded"))
+        result["barcode_match"] = (
+            bool(decoded.get("decoded"))
+            and int(decoded.get("word", -1)) == int(code["word"])
+            and bool(decoded.get("checksum_ok", False))
+        )
+        payload = {
+            "trial_index": trial_index,
+            "expected": code,
+            **result,
+        }
+        if self.recorder is not None:
+            self.recorder.log_event("frame2ttl_barcode_decode", payload)
+        self._publish_monitor("frame2ttl_decode", payload)
+        return result
 
     def _lick_event_count(self) -> int:
         with self._lick_lock:
@@ -1104,6 +1333,12 @@ class HFDecisionSession:
                     "lick_input_edges_seen": sum(
                         digital_counts.get(channel, 0) for channel in self.config.licks.channels
                     ),
+                    "frame2ttl_input_edges_seen": digital_counts.get(
+                        int(self.config.frame2ttl.input_channel),
+                        0,
+                    )
+                    if self.config.frame2ttl.enabled
+                    else 0,
                 },
             )
         except BaseException as exc:
@@ -1132,6 +1367,442 @@ class HFDecisionSession:
             path = self.recorder.finalize(summary)
             logger.info("Preflight data saved to %s", path)
         return summary
+
+    def frame2ttl_diagnostic(
+        self,
+        *,
+        n_flips: int = 20,
+        hold_s: float = 0.25,
+        settle_s: float = 0.5,
+    ) -> SessionSummary:
+        """Flash the configured sync square and count Frame2TTL DI transitions."""
+        assert self.display is not None and self.recorder is not None
+        n_flips = max(1, int(n_flips))
+        hold_s = max(0.01, float(hold_s))
+        settle_s = max(0.0, float(settle_s))
+        start_idx = self._frame2ttl_event_count()
+        flip_log: list[dict] = []
+        self.recorder.log_event(
+            "frame2ttl_diagnostic_start",
+            {
+                "n_flips": n_flips,
+                "hold_s": hold_s,
+                "settle_s": settle_s,
+                "frame2ttl": self._frame2ttl_descriptor(),
+            },
+        )
+        end_reason = "frame2ttl_diagnostic"
+        try:
+            start_flip = self.display.draw_sync_square_frame(False)
+            self._notify_frame2ttl_display_state(
+                False,
+                start_flip,
+                trial_index=0,
+                source="diagnostic",
+                frame_index=-1,
+            )
+            self._publish_task_screen(force=True)
+            self._wait_display(settle_s)
+            for index in range(n_flips):
+                state = index % 2 == 0
+                flip_mono_s = self.display.draw_sync_square_frame(state)
+                self._notify_frame2ttl_display_state(
+                    state,
+                    flip_mono_s,
+                    trial_index=0,
+                    source="diagnostic",
+                    frame_index=index,
+                )
+                row = {
+                    "flip_index": index + 1,
+                    "state": int(state),
+                    "display_flip_mono_s": flip_mono_s,
+                }
+                flip_log.append(row)
+                self._publish_monitor(
+                    "frame2ttl_diagnostic_flip",
+                    {"n_flips": n_flips, **row},
+                )
+                self._publish_task_screen()
+                self._wait_display(hold_s)
+            final_flip = self.display.draw_sync_square_frame(False)
+            self._notify_frame2ttl_display_state(
+                False,
+                final_flip,
+                trial_index=0,
+                source="diagnostic",
+                frame_index=n_flips,
+            )
+            self._publish_task_screen(force=True)
+            self._wait_display(settle_s)
+            edges = self._frame2ttl_events_since(start_idx)
+            states_seen = sorted({int(event["state"]) for event in edges})
+            result = {
+                "n_flips": n_flips,
+                "hold_s": hold_s,
+                "settle_s": settle_s,
+                "edges_seen": len(edges),
+                "states_seen": states_seen,
+                "detected": len(edges) > 0 and len(states_seen) >= 2,
+                "first_ttl_timestamp_us": (
+                    None if not edges else int(edges[0]["timestamp_us"])
+                ),
+                "first_ttl_relative_time_s": (
+                    None if not edges else float(edges[0]["relative_time_s"])
+                ),
+                "first_ttl_host_perf_counter_s": (
+                    None if not edges else float(edges[0]["host_perf_counter_s"])
+                ),
+                "flips": flip_log,
+            }
+            self.recorder.log_event("frame2ttl_diagnostic_end", result)
+            self._publish_monitor("frame2ttl_decode", {"trial_index": 0, **result})
+        except BaseException as exc:
+            end_reason = (
+                "keyboard_interrupt"
+                if isinstance(exc, KeyboardInterrupt)
+                else "frame2ttl_diagnostic_error"
+            )
+            self.recorder.log_event(
+                "frame2ttl_diagnostic_error",
+                {"type": type(exc).__name__, "message": str(exc)},
+            )
+            raise
+        finally:
+            self.close(stop_monitor=False)
+            if self.display is not None:
+                self.display.close()
+            summary = SessionSummary(
+                subject_id=self.config.subject_id,
+                phase=self.config.phase.value,
+                n_trials_planned=0,
+                n_trials_completed=0,
+                end_reason=end_reason,
+                consecutive_failures=self._consecutive_failures,
+                session_start_wall_s=self.recorder._session_start_wall,
+                session_end_wall_s=time.time(),
+                engagement_idle_triggered=False,
+            )
+            self._stop_operator_monitor(summary)
+            path = self.recorder.finalize(summary)
+            logger.info("Frame2TTL diagnostic data saved to %s", path)
+        return summary
+
+    def frame2ttl_barcode_diagnostic(
+        self,
+        *,
+        repetitions: int = 1,
+        settle_s: float = 0.25,
+    ) -> SessionSummary:
+        """Display representative trial-start barcodes and decode DI transitions."""
+        assert self.display is not None and self.recorder is not None
+        cfg = self.config.frame2ttl
+        repetitions = max(1, int(repetitions))
+        settle_s = max(0.0, float(settle_s))
+        cases = self._frame2ttl_barcode_diagnostic_cases()
+        case_results: list[dict] = []
+        self.recorder.log_event(
+            "frame2ttl_barcode_diagnostic_start",
+            {
+                "repetitions": repetitions,
+                "settle_s": settle_s,
+                "cases": cases,
+                "frame2ttl": self._frame2ttl_descriptor(),
+            },
+        )
+        end_reason = "frame2ttl_barcode_diagnostic"
+        try:
+            initial_flip = self.display.draw_sync_square_frame(False)
+            self._notify_frame2ttl_display_state(
+                False,
+                initial_flip,
+                trial_index=0,
+                source="barcode_diagnostic",
+                frame_index=-1,
+            )
+            self._publish_task_screen(force=True)
+            self._wait_display(settle_s)
+            for repeat_index in range(repetitions):
+                for case_index, case in enumerate(cases, start=1):
+                    trial_index = repeat_index * len(cases) + case_index
+                    code = encode_frame2ttl_trial_code(
+                        trial_index=trial_index,
+                        star_side=case["star_side"],
+                        trial_mode=case["trial_mode"],
+                        forced_shape=case["forced_shape"],
+                        modality=case["modality"],
+                    )
+                    states = frame2ttl_barcode_states(
+                        code,
+                        preamble_high_frames=cfg.barcode_preamble_high_frames,
+                        preamble_low_frames=cfg.barcode_preamble_low_frames,
+                        one_high_frames=cfg.barcode_one_high_frames,
+                        zero_high_frames=cfg.barcode_zero_high_frames,
+                        inter_bit_low_frames=cfg.barcode_inter_bit_low_frames,
+                    )
+                    start_idx = self._frame2ttl_event_count()
+                    started_mono_s = time.perf_counter()
+                    start_payload = {
+                        "trial_index": trial_index,
+                        "repeat_index": repeat_index + 1,
+                        "case_index": case_index,
+                        "expected": code.to_dict(),
+                        "frame_count": len(states),
+                    }
+                    self.recorder.log_event(
+                        "frame2ttl_barcode_diagnostic_case_start",
+                        start_payload,
+                    )
+                    self._publish_monitor("frame2ttl_barcode", start_payload)
+                    for frame_index, state in enumerate(states):
+                        flip_mono_s = self.display.draw_sync_square_frame(bool(state))
+                        self._notify_frame2ttl_display_state(
+                            bool(state),
+                            flip_mono_s,
+                            trial_index=trial_index,
+                            source="barcode_diagnostic",
+                            frame_index=frame_index,
+                        )
+                        self.display.clock.tick(max(1, int(self.config.display.fps)))
+                    final_flip = self.display.draw_sync_square_frame(False)
+                    self._notify_frame2ttl_display_state(
+                        False,
+                        final_flip,
+                        trial_index=trial_index,
+                        source="barcode_diagnostic",
+                        frame_index=len(states),
+                    )
+                    self._publish_task_screen(force=True)
+                    self._wait_display(settle_s)
+                    edges = self._frame2ttl_events_since(start_idx)
+                    decoded = decode_frame2ttl_barcode_events(
+                        edges,
+                        frame_period_s=1.0 / max(1, int(self.config.display.fps)),
+                        expected_bits=FRAME2TTL_TOTAL_BITS,
+                        preamble_high_frames=cfg.barcode_preamble_high_frames,
+                        preamble_low_frames=cfg.barcode_preamble_low_frames,
+                        one_high_frames=cfg.barcode_one_high_frames,
+                        zero_high_frames=cfg.barcode_zero_high_frames,
+                        inter_bit_low_frames=cfg.barcode_inter_bit_low_frames,
+                    )
+                    match = (
+                        bool(decoded.get("decoded"))
+                        and int(decoded.get("word", -1)) == int(code.word)
+                        and bool(decoded.get("checksum_ok", False))
+                    )
+                    case_result = {
+                        **start_payload,
+                        "edges_seen": len(edges),
+                        "states_seen": sorted({int(event["state"]) for event in edges}),
+                        "started_mono_s": started_mono_s,
+                        "ended_mono_s": time.perf_counter(),
+                        "decode": decoded,
+                        "barcode_decoded": bool(decoded.get("decoded")),
+                        "barcode_match": match,
+                    }
+                    case_results.append(case_result)
+                    self.recorder.log_event(
+                        "frame2ttl_barcode_diagnostic_case_end",
+                        case_result,
+                    )
+                    self._publish_monitor(
+                        "frame2ttl_decode",
+                        {
+                            "trial_index": trial_index,
+                            "code_word": int(code.word),
+                            **case_result,
+                        },
+                    )
+            result = {
+                "repetitions": repetitions,
+                "cases_run": len(case_results),
+                "decoded_count": sum(
+                    1 for item in case_results if item["barcode_decoded"]
+                ),
+                "match_count": sum(1 for item in case_results if item["barcode_match"]),
+                "all_match": bool(case_results)
+                and all(item["barcode_match"] for item in case_results),
+                "case_results": case_results,
+            }
+            self.recorder.log_event("frame2ttl_barcode_diagnostic_end", result)
+        except BaseException as exc:
+            end_reason = (
+                "keyboard_interrupt"
+                if isinstance(exc, KeyboardInterrupt)
+                else "frame2ttl_barcode_diagnostic_error"
+            )
+            self.recorder.log_event(
+                "frame2ttl_barcode_diagnostic_error",
+                {"type": type(exc).__name__, "message": str(exc)},
+            )
+            raise
+        finally:
+            self.close(stop_monitor=False)
+            if self.display is not None:
+                self.display.close()
+            summary = SessionSummary(
+                subject_id=self.config.subject_id,
+                phase=self.config.phase.value,
+                n_trials_planned=0,
+                n_trials_completed=0,
+                end_reason=end_reason,
+                consecutive_failures=self._consecutive_failures,
+                session_start_wall_s=self.recorder._session_start_wall,
+                session_end_wall_s=time.time(),
+                engagement_idle_triggered=False,
+            )
+            self._stop_operator_monitor(summary)
+            path = self.recorder.finalize(summary)
+            logger.info("Frame2TTL barcode diagnostic data saved to %s", path)
+        return summary
+
+    def bpod_opcode_diagnostic(self, *, hold_s: float = 0.01) -> SessionSummary:
+        """Send StreamDIO state-marker opcodes from Bpod without task outputs."""
+        assert self.bpod is not None and self.speaker_relay is not None
+        assert self.recorder is not None
+        hold_s = max(0.001, float(hold_s))
+        sequence = [
+            "Quiescence",
+            "ChoiceWindow",
+            "ChoiceBlankHigh",
+            "RewardHigh",
+            "PostRewardHigh",
+            "TimeoutNoise",
+            "PostTimeout",
+            "Abort",
+        ]
+        expected_ids = [STREAMDIO_STATE_MARKER_IDS[name] for name in sequence]
+        start_streamdio_idx = len(self.recorder.streamdio_events)
+        self.recorder.log_event(
+            "bpod_opcode_diagnostic_start",
+            {"hold_s": hold_s, "sequence": sequence, "expected_ids": expected_ids},
+        )
+        end_reason = "bpod_opcode_diagnostic"
+        try:
+            fsm = StateMachine(name="BpodOpcodeDiagnostic")
+            for index, state_name in enumerate(sequence):
+                next_state = (
+                    f"{sequence[index + 1]}_Opcode"
+                    if index + 1 < len(sequence)
+                    else ">exit"
+                )
+                fsm.add_state(
+                    name=f"{state_name}_Opcode",
+                    timer=hold_s,
+                    transitions={"Tup": next_state},
+                    actions=self.speaker_relay.bpod_state_marker_act(state_name),
+                )
+            self.recorder.log_fsm_definition("bpod_opcode_diagnostic", fsm)
+            self.bpod.run(fsm, trial_number=0)
+            while self.bpod.is_running:
+                if self.display is not None:
+                    self.display.pump_events()
+                time.sleep(0.002)
+            self._wait_for_bpod_trial_threads()
+            self.recorder.log_bpod_trial(0, self.bpod.get_data(concat=False))
+            events = [
+                event
+                for event in self.recorder.streamdio_events[start_streamdio_idx:]
+                if event[0] == "bpod_state"
+            ]
+            seen_ids = [int(event[1]) for event in events]
+            result = {
+                "hold_s": hold_s,
+                "sequence": sequence,
+                "expected_ids": expected_ids,
+                "seen_ids": seen_ids,
+                "markers_seen": len(seen_ids),
+                "matched": seen_ids == expected_ids,
+                "streamdio_events": events,
+            }
+            self.recorder.log_event("bpod_opcode_diagnostic_end", result)
+            self._publish_monitor("bpod_opcode_diagnostic", result)
+        except BaseException as exc:
+            end_reason = (
+                "keyboard_interrupt"
+                if isinstance(exc, KeyboardInterrupt)
+                else "bpod_opcode_diagnostic_error"
+            )
+            self.recorder.log_event(
+                "bpod_opcode_diagnostic_error",
+                {"type": type(exc).__name__, "message": str(exc)},
+            )
+            raise
+        finally:
+            self.close(stop_monitor=False)
+            if self.display is not None:
+                self.display.close()
+            summary = SessionSummary(
+                subject_id=self.config.subject_id,
+                phase=self.config.phase.value,
+                n_trials_planned=0,
+                n_trials_completed=0,
+                end_reason=end_reason,
+                consecutive_failures=self._consecutive_failures,
+                session_start_wall_s=self.recorder._session_start_wall,
+                session_end_wall_s=time.time(),
+                engagement_idle_triggered=False,
+            )
+            self._stop_operator_monitor(summary)
+            path = self.recorder.finalize(summary)
+            logger.info("Bpod opcode diagnostic data saved to %s", path)
+        return summary
+
+    @staticmethod
+    def _frame2ttl_barcode_diagnostic_cases() -> list[dict[str, str | None]]:
+        return [
+            {
+                "label": "force_free_left",
+                "modality": "force",
+                "trial_mode": "free",
+                "forced_shape": None,
+                "star_side": "left",
+            },
+            {
+                "label": "force_free_right",
+                "modality": "force",
+                "trial_mode": "free",
+                "forced_shape": None,
+                "star_side": "right",
+            },
+            {
+                "label": "risk_forced_star_left",
+                "modality": "risk",
+                "trial_mode": "forced",
+                "forced_shape": "star",
+                "star_side": "left",
+            },
+            {
+                "label": "risk_forced_star_right",
+                "modality": "risk",
+                "trial_mode": "forced",
+                "forced_shape": "star",
+                "star_side": "right",
+            },
+            {
+                "label": "delay_forced_circle_left",
+                "modality": "delay",
+                "trial_mode": "forced",
+                "forced_shape": "circle",
+                "star_side": "left",
+            },
+            {
+                "label": "delay_forced_circle_right",
+                "modality": "delay",
+                "trial_mode": "forced",
+                "forced_shape": "circle",
+                "star_side": "right",
+            },
+        ]
+
+    def _wait_display(self, duration_s: float) -> None:
+        if self.display is None:
+            time.sleep(max(0.0, float(duration_s)))
+            return
+        deadline = time.perf_counter() + max(0.0, float(duration_s))
+        while time.perf_counter() < deadline:
+            self.display.pump_events()
+            self.display.clock.tick(self.config.display.fps)
 
     def _should_end_session(self) -> bool:
         idle_s = time.perf_counter() - self._last_wheel_movement_mono
@@ -1637,10 +2308,20 @@ class HFDecisionSession:
         stall_count = 0
         previous_frame_mono_s: float | None = None
         stimulus_visible = False
+        last_drawn_choice_signature: tuple[float, float, str | None] | None = None
+        choice_sync_square_state = False
         timeout_logged = False
         abort_sent = False
         last_phase = "starting"
         last_quiescence_edges = 0
+        frame2ttl_code: dict | None = None
+        frame2ttl_barcode_states: list[bool] = []
+        frame2ttl_barcode_flips: list[dict] = []
+        frame2ttl_barcode_index = 0
+        frame2ttl_barcode_started = False
+        frame2ttl_barcode_incomplete_logged = False
+        if self.config.frame2ttl.enabled and self.config.frame2ttl.barcode_enabled:
+            frame2ttl_code, frame2ttl_barcode_states = self._build_frame2ttl_barcode(runtime)
         stall_threshold_s = max(
             float(self.config.timing.choice_loop_stall_s),
             (1.0 / max(1, self.config.display.fps)) * 3.0,
@@ -1667,8 +2348,67 @@ class HFDecisionSession:
                             phase="quiescence_reset",
                         )
                         last_quiescence_edges = edges
-                    if last_phase != phase:
-                        self.display.fill_black()
+                    if frame2ttl_barcode_index < len(frame2ttl_barcode_states):
+                        patch_state = frame2ttl_barcode_states[frame2ttl_barcode_index]
+                        flip_mono_s = self.display.draw_sync_square_frame(patch_state)
+                        self._notify_frame2ttl_display_state(
+                            patch_state,
+                            flip_mono_s,
+                            trial_index=trial_index,
+                            source="barcode",
+                            frame_index=frame2ttl_barcode_index,
+                        )
+                        frame2ttl_barcode_flips.append(
+                            {
+                                "frame_index": frame2ttl_barcode_index,
+                                "state": int(patch_state),
+                                "display_flip_mono_s": flip_mono_s,
+                                "bpod_state_started_mono_s": state["phase_started_mono_s"],
+                            }
+                        )
+                        if not frame2ttl_barcode_started:
+                            frame2ttl_barcode_started = True
+                            payload = {
+                                "trial_index": trial_index,
+                                "expected": frame2ttl_code,
+                                "frame_count": len(frame2ttl_barcode_states),
+                                "first_display_flip_mono_s": flip_mono_s,
+                                "bpod_state_started_mono_s": state["phase_started_mono_s"],
+                            }
+                            self.recorder.log_event("frame2ttl_barcode_start", payload)
+                            self._publish_monitor("frame2ttl_barcode", payload)
+                        frame2ttl_barcode_index += 1
+                        if frame2ttl_barcode_index >= len(frame2ttl_barcode_states):
+                            payload = {
+                                "trial_index": trial_index,
+                                "expected": frame2ttl_code,
+                                "frame_count": len(frame2ttl_barcode_states),
+                                "last_display_flip_mono_s": flip_mono_s,
+                                "complete": True,
+                            }
+                            self.recorder.log_event("frame2ttl_barcode_end", payload)
+                            self._publish_monitor("frame2ttl_barcode", payload)
+                        self._publish_monitor_throttled(
+                            "task_state",
+                            min(30.0, float(self.config.display.fps)),
+                            "task_state",
+                            {
+                                "trial_index": trial_index,
+                                "phase": phase,
+                                "frame2ttl_barcode_frame": frame2ttl_barcode_index,
+                                "frame2ttl_barcode_frames": len(frame2ttl_barcode_states),
+                            },
+                        )
+                        self._publish_task_screen()
+                    elif last_phase != phase:
+                        flip_mono_s = self.display.fill_black()
+                        self._notify_frame2ttl_display_state(
+                            False,
+                            flip_mono_s,
+                            trial_index=trial_index,
+                            source="quiescence_black",
+                            frame_index=frame2ttl_barcode_index,
+                        )
                         self._publish_monitor(
                             "task_state",
                             {"trial_index": trial_index, "phase": phase},
@@ -1679,88 +2419,139 @@ class HFDecisionSession:
                     self._publish_wheel_snapshot(phase=phase, trial_index=trial_index)
 
                 elif phase == "choice":
-                    frame_mono_s = time.perf_counter()
+                    if (
+                        frame2ttl_barcode_states
+                        and frame2ttl_barcode_index < len(frame2ttl_barcode_states)
+                        and not frame2ttl_barcode_incomplete_logged
+                    ):
+                        frame2ttl_barcode_incomplete_logged = True
+                        payload = {
+                            "trial_index": trial_index,
+                            "expected": frame2ttl_code,
+                            "frames_drawn": frame2ttl_barcode_index,
+                            "frame_count": len(frame2ttl_barcode_states),
+                            "complete": False,
+                            "reason": "choice_window_started",
+                        }
+                        self.recorder.log_event("frame2ttl_barcode_incomplete", payload)
+                        self._publish_monitor("frame2ttl_barcode", payload)
                     if choice_start_mono_s is None:
                         choice_start_mono_s = float(state["phase_started_mono_s"])
-                    if previous_frame_mono_s is not None:
-                        interval_s = frame_mono_s - previous_frame_mono_s
-                        frame_interval_sum_s += interval_s
-                        frame_interval_max_s = max(frame_interval_max_s, interval_s)
-                        if interval_s >= stall_threshold_s:
-                            stall_count += 1
-                            self.recorder.log_event(
-                                "choice_loop_stall",
-                                {
-                                    "trial_index": trial_index,
-                                    "interval_s": interval_s,
-                                    "stall_threshold_s": stall_threshold_s,
-                                    "frame": frame_count + 1,
-                                },
-                            )
-                    previous_frame_mono_s = frame_mono_s
-                    frame_count += 1
                     self._track_engagement_from_wheel()
                     wheel_snap = self.wheel.snapshot()
                     net_position_deg = (
                         int(wheel_snap["net_pulses"]) * self.config.wheel.deg_per_pulse
                     )
                     final_left_deg, final_right_deg = self._decision_positions(net_position_deg)
-                    flip_mono_s = self.display.draw_decision(
-                        star_side=star_side,
-                        left_position_deg=final_left_deg,
-                        right_position_deg=final_right_deg,
-                        force_direction=force_output_direction,
-                        visible_shape=forced_shape if trial_mode == "forced" else None,
-                        trial_index=trial_index,
+                    visible_shape = forced_shape if trial_mode == "forced" else None
+                    draw_signature = (
+                        round(float(final_left_deg), 6),
+                        round(float(final_right_deg), 6),
+                        visible_shape,
                     )
-                    self._publish_monitor_throttled(
-                        "task_state",
-                        min(30.0, float(self.config.display.fps)),
-                        "task_state",
-                        {
-                            "trial_index": trial_index,
-                            "phase": phase,
-                            "star_side": star_side,
-                            "circle_side": circle_side,
-                            "force_direction": force_output_direction,
-                            "force_output_direction": force_output_direction,
-                            "force_output_active": force_output_direction is not None,
-                            "choice_target_direction": choice_target_direction,
-                            "star_direction": star_direction,
-                            "circle_direction": circle_direction,
-                            "trial_mode": trial_mode,
-                            "forced_shape": forced_shape,
-                            "modality": runtime.modality,
-                            "left_position_deg": final_left_deg,
-                            "right_position_deg": final_right_deg,
-                            "net_position_deg": net_position_deg,
-                        },
+                    should_draw = (not stimulus_visible) or (
+                        draw_signature != last_drawn_choice_signature
                     )
-                    self._publish_wheel_snapshot(phase=phase, trial_index=trial_index)
-                    self._publish_task_screen()
-                    if not stimulus_visible:
-                        stimulus_visible = True
-                        self.recorder.log_event(
-                            "stimulus_on",
+                    if should_draw:
+                        frame_mono_s = time.perf_counter()
+                        if previous_frame_mono_s is not None:
+                            interval_s = frame_mono_s - previous_frame_mono_s
+                            frame_interval_sum_s += interval_s
+                            frame_interval_max_s = max(frame_interval_max_s, interval_s)
+                            if interval_s >= stall_threshold_s:
+                                stall_count += 1
+                                self.recorder.log_event(
+                                    "choice_loop_stall",
+                                    {
+                                        "trial_index": trial_index,
+                                        "interval_s": interval_s,
+                                        "stall_threshold_s": stall_threshold_s,
+                                        "frame": frame_count + 1,
+                                    },
+                                )
+                        previous_frame_mono_s = frame_mono_s
+                        frame_count += 1
+                        sync_square_state = None
+                        if (
+                            self.config.frame2ttl.enabled
+                            and self.config.frame2ttl.choice_flash_enabled
+                        ):
+                            if stimulus_visible:
+                                choice_sync_square_state = not choice_sync_square_state
+                            sync_square_state = choice_sync_square_state
+                        flip_mono_s = self.display.draw_decision(
+                            star_side=star_side,
+                            left_position_deg=final_left_deg,
+                            right_position_deg=final_right_deg,
+                            force_direction=force_output_direction,
+                            visible_shape=visible_shape,
+                            trial_index=trial_index,
+                            sync_square_state=sync_square_state,
+                        )
+                        last_drawn_choice_signature = draw_signature
+                        if sync_square_state is not None:
+                            self._notify_frame2ttl_display_state(
+                                sync_square_state,
+                                flip_mono_s,
+                                trial_index=trial_index,
+                                source="choice",
+                                frame_index=frame_count,
+                            )
+                        self._publish_monitor_throttled(
+                            "task_state",
+                            min(30.0, float(self.config.display.fps)),
+                            "task_state",
                             {
                                 "trial_index": trial_index,
+                                "phase": phase,
                                 "star_side": star_side,
                                 "circle_side": circle_side,
-                                "trial_mode": trial_mode,
-                                "forced_shape": forced_shape,
-                                "modality": runtime.modality,
                                 "force_direction": force_output_direction,
                                 "force_output_direction": force_output_direction,
                                 "force_output_active": force_output_direction is not None,
                                 "choice_target_direction": choice_target_direction,
                                 "star_direction": star_direction,
                                 "circle_direction": circle_direction,
+                                "trial_mode": trial_mode,
+                                "forced_shape": forced_shape,
+                                "modality": runtime.modality,
                                 "left_position_deg": final_left_deg,
                                 "right_position_deg": final_right_deg,
-                                "display_flip_mono_s": flip_mono_s,
-                                "bright_pixel_counts": self.display.shape_bright_pixel_counts,
+                                "net_position_deg": net_position_deg,
+                                "frame2ttl_sync_state": sync_square_state,
+                                "frame2ttl_choice_frame": frame_count,
+                                "display_update_reason": (
+                                    "stimulus_on" if not stimulus_visible else "wheel_motion"
+                                ),
                             },
                         )
+                        self._publish_task_screen()
+                        if not stimulus_visible:
+                            stimulus_visible = True
+                            self.recorder.log_event(
+                                "stimulus_on",
+                                {
+                                    "trial_index": trial_index,
+                                    "star_side": star_side,
+                                    "circle_side": circle_side,
+                                    "trial_mode": trial_mode,
+                                    "forced_shape": forced_shape,
+                                    "modality": runtime.modality,
+                                    "force_direction": force_output_direction,
+                                    "force_output_direction": force_output_direction,
+                                    "force_output_active": force_output_direction is not None,
+                                    "choice_target_direction": choice_target_direction,
+                                    "star_direction": star_direction,
+                                    "circle_direction": circle_direction,
+                                    "left_position_deg": final_left_deg,
+                                    "right_position_deg": final_right_deg,
+                                    "display_flip_mono_s": flip_mono_s,
+                                    "bright_pixel_counts": self.display.shape_bright_pixel_counts,
+                                },
+                            )
+                    else:
+                        self.display.pump_events()
+                    self._publish_wheel_snapshot(phase=phase, trial_index=trial_index)
 
                     threshold = self.config.display.choice_center_threshold_deg
                     selected_side: Side | None = None
@@ -1843,6 +2634,13 @@ class HFDecisionSession:
                 else:
                     if stimulus_visible:
                         blank_flip_mono_s = self.display.fill_black()
+                        self._notify_frame2ttl_display_state(
+                            False,
+                            blank_flip_mono_s,
+                            trial_index=trial_index,
+                            source="stimulus_off",
+                            frame_index=frame_count,
+                        )
                         stimulus_visible = False
                         self._publish_monitor(
                             "task_state",
@@ -1923,6 +2721,13 @@ class HFDecisionSession:
             if state["choice_detected_mono_s"] is not None
             else (choice_start_mono_s or time.perf_counter()) + self.config.timing.choice_timeout_s
         )
+        frame2ttl_summary = self._finalize_frame2ttl_trial(
+            trial_index=trial_index,
+            code=frame2ttl_code,
+            barcode_flips=frame2ttl_barcode_flips,
+            bpod_choice_start_mono_s=choice_start_mono_s,
+            choice_end_mono_s=choice_end_mono_s,
+        )
         self._set_choice_loop_stats(
             trial_index=trial_index,
             outcome=str(wheel_choice),
@@ -1957,6 +2762,7 @@ class HFDecisionSession:
             "risk_star_probability": runtime.risk_star_probability,
             "final_position_deg": final_position_deg,
             "runtime": state,
+            "frame2ttl": frame2ttl_summary,
         }
 
     def _run_live_choice_epoch_legacy(
@@ -2259,6 +3065,7 @@ class HFDecisionSession:
         trial_mono = time.perf_counter()
         camera_start_idx = len(self.dio.get_camera_events())
         lick_start_idx = self._lick_event_count()
+        frame2ttl_start_idx = self._frame2ttl_event_count()
         self.recorder.log_event("trial_start", {"trial_index": trial_index, "force_direction": force_direction})
         self._publish_monitor(
             "trial_start",
@@ -2347,6 +3154,7 @@ class HFDecisionSession:
         trial_mono = time.perf_counter()
         camera_start_idx = len(self.dio.get_camera_events())
         lick_start_idx = self._lick_event_count()
+        frame2ttl_start_idx = self._frame2ttl_event_count()
         spec = self._trial_spec(trial_index)
         trial_mode = str(spec.get("trial_mode") or "free")
         forced_shape = spec.get("forced_shape")
@@ -2415,6 +3223,8 @@ class HFDecisionSession:
         snap = self.wheel.snapshot()
         cam_events = self.dio.get_camera_events()[camera_start_idx:]
         lick_events = self._lick_events_since(lick_start_idx)
+        frame2ttl_summary = dict(result.get("frame2ttl", {}))
+        frame2ttl_edges_total = max(0, self._frame2ttl_event_count() - frame2ttl_start_idx)
         self._add_trial_record(
             TrialRecord(
                 trial_index=trial_index,
@@ -2461,6 +3271,30 @@ class HFDecisionSession:
                 choice_loop_mean_frame_s=float(loop_stats.get("mean_frame_s", 0.0)),
                 choice_loop_max_frame_s=float(loop_stats.get("max_frame_s", 0.0)),
                 choice_loop_stall_count=int(loop_stats.get("stall_count", 0)),
+                frame2ttl_code_word=frame2ttl_summary.get("code_word"),
+                frame2ttl_trial_type_code=frame2ttl_summary.get("trial_type_code"),
+                frame2ttl_barcode_complete=bool(
+                    frame2ttl_summary.get("barcode_complete", False)
+                ),
+                frame2ttl_barcode_decoded=bool(
+                    frame2ttl_summary.get("barcode_decoded", False)
+                ),
+                frame2ttl_barcode_match=bool(
+                    frame2ttl_summary.get("barcode_match", False)
+                ),
+                frame2ttl_edge_count=frame2ttl_edges_total,
+                frame2ttl_choice_edge_count=int(
+                    frame2ttl_summary.get("choice_edge_count", 0) or 0
+                ),
+                frame2ttl_first_ttl_timestamp_us=frame2ttl_summary.get(
+                    "first_ttl_timestamp_us"
+                ),
+                frame2ttl_first_ttl_relative_time_s=frame2ttl_summary.get(
+                    "first_ttl_relative_time_s"
+                ),
+                frame2ttl_first_ttl_latency_from_bpod_s=frame2ttl_summary.get(
+                    "first_ttl_latency_from_bpod_s"
+                ),
             )
         )
         return bool(result["responded"])

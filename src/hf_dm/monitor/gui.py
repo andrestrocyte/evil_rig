@@ -29,8 +29,25 @@ _CRITICAL_EVENTS = {
     "lick",
     "lick_edge",
     "cap_touch_power",
+    "frame2ttl_barcode",
+    "frame2ttl_decode",
+    "bpod_state_marker",
     "fsm_states",
     "fsm_state",
+}
+
+_BPOD_STATE_COLORS = {
+    "Quiescence": "#7b8794",
+    "ChoiceWindow": "#2f80ed",
+    "ChoiceBlankHigh": "#7d5fff",
+    "ChoiceBlankLow": "#20a39e",
+    "RewardHigh": "#31a354",
+    "RewardLow": "#8bc34a",
+    "PostRewardHigh": "#b5d78c",
+    "PostRewardLow": "#c8dc8c",
+    "TimeoutNoise": "#e1a317",
+    "PostTimeout": "#d06b35",
+    "Abort": "#d64545",
 }
 
 
@@ -348,6 +365,15 @@ class OperatorMonitorState:
         self.last_lick_source = "-"
         self.cap_touch_power: dict[str, Any] = {}
         self.cap_touch_power_active = False
+        self.frame2ttl_info: dict[str, Any] = {}
+        self.frame2ttl_events: deque[float] = deque()
+        self.frame2ttl_edge_count = 0
+        self.frame2ttl_last_state: int | None = None
+        self.frame2ttl_last_edge_mono_s: float | None = None
+        self.frame2ttl_latest_decode: dict[str, Any] = {}
+        self.frame2ttl_decodes: deque[dict[str, Any]] = deque(maxlen=self.trial_history)
+        self.bpod_state_marker_events: deque[dict[str, Any]] = deque()
+        self.bpod_state_latest_marker: dict[str, Any] = {}
         self.pump_active = False
         self.noise_active = False
         self.last_update_mono_s = time.perf_counter()
@@ -371,6 +397,9 @@ class OperatorMonitorState:
             power = payload.get("cap_touch_power")
             if isinstance(power, dict):
                 self.cap_touch_power.update(power)
+            frame2ttl = payload.get("frame2ttl")
+            if isinstance(frame2ttl, dict):
+                self.frame2ttl_info.update(frame2ttl)
         elif event_type == "session_summary":
             self.summary.update(payload)
             self.current_phase = "finished"
@@ -433,6 +462,21 @@ class OperatorMonitorState:
         elif event_type == "cap_touch_power":
             self.cap_touch_power.update(payload)
             self.cap_touch_power_active = bool(payload.get("active", payload.get("state", False)))
+        elif event_type == "frame2ttl_edge":
+            self.frame2ttl_events.append(now)
+            self.frame2ttl_edge_count += 1
+            self.frame2ttl_last_state = _optional_int(
+                payload.get("state", payload.get("value"))
+            )
+            self.frame2ttl_last_edge_mono_s = now
+        elif event_type == "frame2ttl_decode":
+            self.frame2ttl_latest_decode = payload
+            self.frame2ttl_decodes.append(payload)
+        elif event_type == "bpod_state_marker":
+            marker = dict(payload)
+            marker["mono_s"] = now
+            self.bpod_state_marker_events.append(marker)
+            self.bpod_state_latest_marker = marker
         elif event_type == "pump":
             state = bool(payload.get("active", payload.get("state", False)))
             self.pump_active = state
@@ -495,6 +539,13 @@ class OperatorMonitorState:
             self.lick_events.popleft()
         while self.lick_edge_events and self.lick_edge_events[0] < cutoff:
             self.lick_edge_events.popleft()
+        while self.frame2ttl_events and self.frame2ttl_events[0] < cutoff:
+            self.frame2ttl_events.popleft()
+        while (
+            self.bpod_state_marker_events
+            and float(self.bpod_state_marker_events[0].get("mono_s", 0.0)) < cutoff
+        ):
+            self.bpod_state_marker_events.popleft()
 
 
 def _optional_float(value: Any) -> float | None:
@@ -997,16 +1048,18 @@ class _MonitorWindow:
             ("Noise", "ON" if self.state.noise_active else "off"),
         ]
         yy = iy
-        line_step = max(16, min(22, ih // max(1, len(status_lines))))
+        line_step = max(13, min(20, ih // max(1, len(status_lines))))
+        label_font = ("Segoe UI", 8 if line_step < 15 else 9)
+        value_font = ("Segoe UI", 9 if line_step < 15 else 10, "bold")
         for label, value in status_lines:
-            self.canvas.create_text(ix, yy, anchor="w", text=label, fill="#697782", font=("Segoe UI", 9))
+            self.canvas.create_text(ix, yy, anchor="w", text=label, fill="#697782", font=label_font)
             self.canvas.create_text(
                 ix + 112,
                 yy,
                 anchor="w",
                 text=str(value),
                 fill="#1f2933",
-                font=("Segoe UI", 10, "bold"),
+                font=value_font,
             )
             yy += line_step
 
@@ -1075,18 +1128,64 @@ class _MonitorWindow:
                 )
 
     def _draw_events_panel(self, x: int, y: int, w: int, h: int) -> None:
-        ix, iy, iw, ih = self._panel(x, y, w, h, "Lick / Pump / Noise")
+        ix, iy, iw, ih = self._panel(x, y, w, h, "Inputs / Events")
         now = time.perf_counter()
         pin_h = 66
         self._draw_touch_pin_status(ix, iy, iw, pin_h, now)
         rails_y = iy + pin_h + 8
-        rail_h = max(34, (ih - pin_h - 8) // 5)
-        labels = [("Lick", "#2f7dd3"), ("Pump", "#37a56b"), ("Noise", "#d9a516")]
+        rail_count = 4
+        wheel_reserved_h = max(76, min(120, ih // 4))
+        rail_h = max(58, min(66, (ih - pin_h - 18 - wheel_reserved_h) // rail_count))
+        labels = [
+            ("Frame2TTL", "#11161b"),
+            ("Lick", "#2f7dd3"),
+            ("Pump", "#37a56b"),
+            ("Noise", "#d9a516"),
+        ]
         for idx, (label, color) in enumerate(labels):
             yy = rails_y + idx * rail_h
             self.canvas.create_text(ix, yy + 14, anchor="w", text=label, fill="#40515f", font=("Segoe UI", 9, "bold"))
             self.canvas.create_line(ix + 64, yy + 18, ix + iw - 10, yy + 18, fill="#d8dee3")
-            if label == "Lick":
+            if label == "Frame2TTL":
+                self._draw_ticks(ix + 64, yy + 4, iw - 74, 30, now, self.state.frame2ttl_events, color)
+                decode_text = self._frame2ttl_decode_text()
+                channel = self.state.frame2ttl_info.get("input_channel", "-")
+                pin = self.state.frame2ttl_info.get("input_pin", "-")
+                signal_text = (
+                    f"DI{channel}/pin{pin}  edges {self.state.frame2ttl_edge_count}  "
+                    f"state {self.state.frame2ttl_last_state}"
+                )
+                self.canvas.create_text(
+                    ix + 64,
+                    yy + 36,
+                    anchor="w",
+                    text=_short_text(signal_text, max(18, iw // 8)),
+                    fill="#40515f",
+                    font=("Segoe UI", 8, "bold"),
+                )
+                self.canvas.create_text(
+                    ix + 64,
+                    yy + 48,
+                    anchor="w",
+                    text=_short_text(decode_text, max(16, iw // 8)),
+                    fill="#51606b",
+                    font=("Segoe UI", 8),
+                )
+                if (
+                    self.state.frame2ttl_last_edge_mono_s is not None
+                    and now - self.state.frame2ttl_last_edge_mono_s < 0.20
+                ):
+                    fill = "#ffffff" if self.state.frame2ttl_last_state else "#11161b"
+                    outline = "#11161b"
+                    self.canvas.create_rectangle(
+                        ix + 40,
+                        yy + 8,
+                        ix + 55,
+                        yy + 23,
+                        fill=fill,
+                        outline=outline,
+                    )
+            elif label == "Lick":
                 events = self.state.lick_edge_events if self.state.lick_edge_events else self.state.lick_events
                 self._draw_ticks(ix + 64, yy + 4, iw - 74, 30, now, events, color)
                 if (
@@ -1107,10 +1206,37 @@ class _MonitorWindow:
                 self._draw_state_intervals(ix + 64, yy + 4, iw - 74, 30, now, self.state.noise_events, color, self.state.noise_active)
                 self._draw_speaker_icon(ix + iw - 38, yy + 18, active=self.state.noise_active, small=True)
 
-        wheel_y = rails_y + rail_h * 3 + 10
+        wheel_y = rails_y + rail_h * rail_count + 12
         self.canvas.create_text(ix, wheel_y, anchor="w", text="Wheel (trial)", fill="#20262b", font=("Segoe UI", 10, "bold"))
         plot_y = wheel_y + 18
         self._draw_wheel_plot(ix, plot_y, iw, ih - (plot_y - iy))
+
+    def _frame2ttl_decode_text(self) -> str:
+        latest = self.state.frame2ttl_latest_decode
+        if not latest:
+            return "barcode waiting"
+        if "detected" in latest:
+            status = "detected" if bool(latest.get("detected")) else "no signal"
+            return f"diagnostic {status} edges {int(latest.get('edges_seen', 0) or 0)}"
+        decoded = bool(latest.get("barcode_decoded", latest.get("decoded", False)))
+        matched = bool(latest.get("barcode_match", False))
+        trial = latest.get("trial_index", "-")
+        word = latest.get("code_word")
+        if word is None and isinstance(latest.get("expected"), dict):
+            word = latest["expected"].get("word")
+        status = "match" if matched else "decoded" if decoded else "no decode"
+        text = f"trial {trial} {status}"
+        decode = latest.get("decode")
+        groups = None
+        if isinstance(decode, dict):
+            groups = decode.get("pulse_groups")
+        if groups is None:
+            groups = latest.get("pulse_groups")
+        if isinstance(groups, list) and len(groups) >= 2:
+            text += f" M{int(groups[0])}/K{int(groups[1])}"
+        if word is not None:
+            text += f" code {int(word):02X}"
+        return text
 
     def _draw_touch_pin_status(self, x: int, y: int, w: int, h: int, now: float) -> None:
         power_channel = self.state.cap_touch_power.get("channel")
@@ -1186,11 +1312,15 @@ class _MonitorWindow:
 
     def _draw_fsm_panel(self, x: int, y: int, w: int, h: int) -> None:
         ix, iy, iw, ih = self._panel(x, y, w, h, "Bpod FSM")
+        timeline_h = 46
+        self._draw_bpod_opcode_timeline(ix, iy, iw, timeline_h)
+        iy_states = iy + timeline_h + 8
+        ih_states = max(0, ih - timeline_h - 8)
         states = self.state.fsm_states
         if not states:
             self.canvas.create_text(
                 ix + iw / 2,
-                iy + ih / 2,
+                iy_states + ih_states / 2,
                 text="waiting for FSM definition",
                 fill="#8b99a4",
                 font=("Segoe UI", 10),
@@ -1198,9 +1328,12 @@ class _MonitorWindow:
             return
         active = self.state.active_fsm_state
         row_gap = 4
-        row_h = max(22, min(38, (ih - row_gap * (len(states) - 1)) // max(1, len(states))))
+        row_h = max(
+            20,
+            min(34, (ih_states - row_gap * (len(states) - 1)) // max(1, len(states))),
+        )
         compact = row_h < 30
-        yy = iy
+        yy = iy_states
         for state in states:
             name = str(state.get("name", ""))
             duration = _format_duration_s(state.get("duration_s"))
@@ -1238,8 +1371,61 @@ class _MonitorWindow:
                     font=("Segoe UI", 8),
                 )
             yy += row_h + row_gap
-            if yy + row_h > iy + ih + 2:
+            if yy + row_h > iy_states + ih_states + 2:
                 break
+
+    def _draw_bpod_opcode_timeline(self, x: int, y: int, w: int, h: int) -> None:
+        now = time.perf_counter()
+        label_y = y + 9
+        rail_y = y + 23
+        rail_h = max(12, h - 28)
+        self.canvas.create_text(
+            x,
+            label_y,
+            anchor="w",
+            text="Transition opcodes",
+            fill="#40515f",
+            font=("Segoe UI", 8, "bold"),
+        )
+        latest = self.state.bpod_state_latest_marker
+        if latest:
+            state_name = str(latest.get("state_name", latest.get("state_id", "-")))
+            state_id = _optional_int(latest.get("state_id"))
+            latest_text = f"{state_id}: {state_name}" if state_id is not None else state_name
+        else:
+            latest_text = "waiting"
+        self.canvas.create_text(
+            x + w,
+            label_y,
+            anchor="e",
+            text=_short_text(latest_text, max(14, w // 8)),
+            fill="#51606b",
+            font=("Segoe UI", 8),
+        )
+        self.canvas.create_rectangle(
+            x,
+            rail_y,
+            x + w,
+            rail_y + rail_h,
+            fill="#f6f8fa",
+            outline="#d8dee3",
+        )
+        cutoff = now - self.state.history_s
+        for marker in self.state.bpod_state_marker_events:
+            event_t = float(marker.get("mono_s", 0.0))
+            xx = x + ((event_t - cutoff) / self.state.history_s) * w
+            if not (x <= xx <= x + w):
+                continue
+            state_name = str(marker.get("state_name", ""))
+            color = _BPOD_STATE_COLORS.get(state_name, "#6d5dfc")
+            self.canvas.create_rectangle(
+                max(x, xx - 2),
+                rail_y,
+                min(x + w, xx + 3),
+                rail_y + rail_h,
+                fill=color,
+                outline="",
+            )
 
     def _draw_effort_panel(self, x: int, y: int, w: int, h: int) -> None:
         ix, iy, iw, ih = self._panel(x, y, w, h, "Effort ADC")

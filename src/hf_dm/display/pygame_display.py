@@ -11,7 +11,7 @@ from typing import Literal
 
 import pygame
 
-from hf_dm.config import DisplayConfig
+from hf_dm.config import DisplayConfig, Frame2TTLConfig
 from hf_dm.fsm.runtime import Side
 
 Direction = Literal["cw", "ccw"]
@@ -93,8 +93,9 @@ def pick_display_bounds(display_index: int | None) -> DisplayBounds | None:
 
 
 class TaskDisplay:
-    def __init__(self, config: DisplayConfig):
+    def __init__(self, config: DisplayConfig, frame2ttl_config: Frame2TTLConfig | None = None):
         self.config = config
+        self.frame2ttl_config = frame2ttl_config or Frame2TTLConfig(enabled=False)
         display_bounds = pick_display_bounds(config.display_index)
         width = config.width
         height = config.height
@@ -117,6 +118,8 @@ class TaskDisplay:
         scale = max(0.5, min(scale_x, scale_y))
         self.shape_radius_px = max(36, int(round(config.shape_radius_px * scale)))
         self.target_radius_px = max(48, int(round(config.target_radius_px * scale)))
+        self.sync_patch_size_px = max(4, int(self.frame2ttl_config.patch_size_px))
+        self.sync_patch_margin_px = max(0, int(self.frame2ttl_config.patch_margin_px))
 
         if window_x is not None and window_y is not None:
             os.environ["SDL_VIDEO_WINDOW_POS"] = f"{window_x},{window_y}"
@@ -216,6 +219,7 @@ class TaskDisplay:
         visible_shape: Shape | None = None,
         trial_index: int | None = None,
         response_time_s: float | None = None,
+        sync_square_state: bool | None = None,
     ) -> float:
         """Draw equal-luminance lateral options moving independently toward center."""
         self._pump_quit()
@@ -235,6 +239,7 @@ class TaskDisplay:
             self._blit_shape(right_shape, self._shape_center(right_position_deg))
         if self.config.show_debug_overlay:
             self._draw_debug_overlay(force_direction, trial_index, response_time_s)
+        self._draw_sync_square(sync_square_state)
         pygame.display.flip()
         return time.perf_counter()
 
@@ -245,6 +250,7 @@ class TaskDisplay:
         outcome: str | None = None,
         trial_index: int | None = None,
         response_time_s: float | None = None,
+        sync_square_state: bool | None = None,
     ) -> float:
         self._pump_quit()
         self.screen.fill(self.config.background_rgb)
@@ -265,6 +271,7 @@ class TaskDisplay:
         pygame.draw.polygon(self.screen, (25, 25, 25), points, width=3)
         if self.config.show_debug_overlay:
             self._draw_debug_overlay(force_direction, trial_index, response_time_s)
+        self._draw_sync_square(sync_square_state)
         pygame.display.flip()
         return time.perf_counter()
 
@@ -295,6 +302,7 @@ class TaskDisplay:
         outcome: str | None = None,
         trial_index: int | None = None,
         response_time_s: float | None = None,
+        sync_square_state: bool | None = None,
     ) -> float:
         """Draw the shaping task: move the lateral cue into the center target."""
         self._pump_quit()
@@ -318,6 +326,15 @@ class TaskDisplay:
         pygame.draw.polygon(self.screen, (25, 25, 25), points, width=3)
         if self.config.show_debug_overlay:
             self._draw_debug_overlay(movement_direction, trial_index, response_time_s)
+        self._draw_sync_square(sync_square_state)
+        pygame.display.flip()
+        return time.perf_counter()
+
+    def draw_sync_square_frame(self, state: bool) -> float:
+        """Draw one black-screen Frame2TTL barcode frame."""
+        self._pump_quit()
+        self.screen.fill(self.config.background_rgb)
+        self._draw_sync_square(bool(state))
         pygame.display.flip()
         return time.perf_counter()
 
@@ -347,6 +364,22 @@ class TaskDisplay:
         if self.config.axis == "vertical":
             return cx, cy + offset
         return cx + offset, cy
+
+    def _sync_square_rect(self) -> pygame.Rect:
+        size = min(self.sync_patch_size_px, self.width, self.height)
+        margin = self.sync_patch_margin_px
+        corner = str(self.frame2ttl_config.patch_corner or "bottom_right").lower()
+        left = margin if "left" in corner else self.width - margin - size
+        top = margin if "top" in corner else self.height - margin - size
+        left = max(0, min(self.width - size, left))
+        top = max(0, min(self.height - size, top))
+        return pygame.Rect(left, top, size, size)
+
+    def _draw_sync_square(self, state: bool | None) -> None:
+        if state is None or not self.frame2ttl_config.enabled:
+            return
+        color = (255, 255, 255) if bool(state) else (0, 0, 0)
+        pygame.draw.rect(self.screen, color, self._sync_square_rect())
 
     def _draw_targets(self) -> None:
         for signed_deg in (-self.config.choice_distance_deg, self.config.choice_distance_deg):

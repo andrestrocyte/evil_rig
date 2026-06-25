@@ -5,6 +5,8 @@ from hf_dm.hardware.bringup_constants import (
     CAP_TOUCH_INPUT_PIN,
     CAP_TOUCH_POWER_OUTPUT_CHANNEL,
     CAP_TOUCH_POWER_PIN,
+    FRAME2TTL_INPUT_CHANNEL,
+    FRAME2TTL_INPUT_PIN,
     FORCE_ANALOG_CHANNEL,
     LICK_INPUT_CHANNEL,
     PUMP_OUTPUT_CHANNEL,
@@ -74,6 +76,11 @@ def test_operator_monitor_state_tracks_trials_events_and_recent_frames():
                     "channel": CAP_TOUCH_POWER_OUTPUT_CHANNEL,
                     "pin": CAP_TOUCH_POWER_PIN,
                 },
+                "frame2ttl": {
+                    "enabled": True,
+                    "input_channel": FRAME2TTL_INPUT_CHANNEL,
+                    "input_pin": FRAME2TTL_INPUT_PIN,
+                },
             },
         }
     )
@@ -135,6 +142,41 @@ def test_operator_monitor_state_tracks_trials_events_and_recent_frames():
             },
         }
     )
+    state.apply(
+        {
+            "type": "frame2ttl_edge",
+            "payload": {
+                "channel": FRAME2TTL_INPUT_CHANNEL,
+                "pin": FRAME2TTL_INPUT_PIN,
+                "state": 1,
+                "timestamp_us": 2600,
+                "relative_time_s": 0.0026,
+            },
+        }
+    )
+    state.apply(
+        {
+            "type": "frame2ttl_decode",
+            "payload": {
+                "trial_index": 1,
+                "code_word": 0x12,
+                "barcode_decoded": True,
+                "barcode_match": True,
+                "decode": {"pulse_groups": [1, 2]},
+            },
+        }
+    )
+    state.apply(
+        {
+            "type": "bpod_state_marker",
+            "payload": {
+                "trial_index": 1,
+                "state_id": 2,
+                "state_name": "ChoiceWindow",
+                "module_timestamp_us": 1234,
+            },
+        }
+    )
     state.apply({"type": "pump", "payload": {"active": True}})
     state.apply({"type": "white_noise", "payload": {"active": True}})
     state.apply(
@@ -169,6 +211,12 @@ def test_operator_monitor_state_tracks_trials_events_and_recent_frames():
     assert state.lick_input_states[LICK_INPUT_CHANNEL]["source"] == "analog"
     assert state.cap_touch_power_active
     assert state.cap_touch_power["pin"] == CAP_TOUCH_POWER_PIN
+    assert state.frame2ttl_info["input_channel"] == FRAME2TTL_INPUT_CHANNEL
+    assert state.frame2ttl_edge_count == 1
+    assert state.frame2ttl_last_state == 1
+    assert state.frame2ttl_latest_decode["barcode_match"]
+    assert state.bpod_state_latest_marker["state_name"] == "ChoiceWindow"
+    assert len(state.bpod_state_marker_events) == 1
     assert state.last_lick_value == 740
     assert state.lick_count == 1
     assert state.pump_active
@@ -285,6 +333,7 @@ def test_streamdio_callback_publishes_monitor_signals():
         0.0022,
     )
     session._handle_streamdio_event("analog_input", LICK_INPUT_CHANNEL, 700, 2400, 0.0024)
+    session._handle_streamdio_event("dio_input", FRAME2TTL_INPUT_CHANNEL, 1, 2450, 0.00245)
     session._handle_streamdio_event("dio_input", LICK_INPUT_CHANNEL, 0, 2500, 0.0025)
     session._handle_streamdio_event("dio_input", LICK_INPUT_CHANNEL, 1, 3000, 0.003)
     session._handle_streamdio_event("camera", None, None, 4000, 0.004)
@@ -294,6 +343,7 @@ def test_streamdio_callback_publishes_monitor_signals():
     assert "pump" in event_types
     assert "cap_touch_power" in event_types
     assert "cap_touch_sample" in event_types
+    assert "frame2ttl_edge" in event_types
     assert "lick_edge" in event_types
     assert "lick" in event_types
     assert "camera_ttl" in event_types
