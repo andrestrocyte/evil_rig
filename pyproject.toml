@@ -30,3 +30,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 hf_dm = ["configs/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

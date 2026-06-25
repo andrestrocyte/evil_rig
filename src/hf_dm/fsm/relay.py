@@ -14,6 +14,10 @@ from hf_dm.hardware.bringup_constants import (
     SERIAL_GATE_OFF_MESSAGE_ID,
     SERIAL_GATE_ON_MESSAGE_ID,
     SPEAKER_GATE_OPCODE,
+    STREAMDIO_BPOD_STATE_OPCODE,
+    STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID,
+    STREAMDIO_STATE_MARKER_MESSAGE_IDS,
+    STREAMDIO_STATE_MARKERS,
 )
 
 
@@ -95,6 +99,13 @@ class SerialRelay:
                 [SPEAKER_GATE_OPCODE, 0 if self.speaker_gate_active_high else 1],
             ),
         ]
+        pairs.extend(
+            (
+                STREAMDIO_STATE_MARKER_MESSAGE_IDS[state_name],
+                [STREAMDIO_BPOD_STATE_OPCODE, int(state_id)],
+            )
+            for state_name, state_id in STREAMDIO_STATE_MARKERS
+        )
         for msg_id, payload in pairs:
             m.load_serial_message(msg_id, bytes(payload))
 
@@ -104,6 +115,13 @@ class SerialRelay:
 
     def act(self, message_id: int) -> dict[str, int]:
         return {self.module_name: message_id}
+
+    def bpod_state_marker_act(self, state_name: str) -> dict[str, int]:
+        return self.act(STREAMDIO_STATE_MARKER_MESSAGE_IDS[str(state_name)])
+
+    @staticmethod
+    def bpod_state_id_for_message(message_id: int) -> int | None:
+        return STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID.get(int(message_id))
 
     def send_bytes(self, byte_values: list[int], inter_byte_s: float = 0.002) -> None:
         """Send raw bytes through the selected Bpod serial relay immediately."""

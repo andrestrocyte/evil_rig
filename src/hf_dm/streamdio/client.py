@@ -24,6 +24,7 @@ from hf_dm.hardware.bringup_constants import (
     LICK_INPUT_CHANNEL,
     PULSE_INPUT_CHANNEL,
     STREAMDIO_ANALOG_INPUT_EVENT_BASE,
+    STREAMDIO_BPOD_STATE_EVENT_BASE,
     STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION,
     STREAMDIO_CAP_TOUCH_DIGITIZER_FIRMWARE_VERSION,
     STREAMDIO_DIO_INPUT_EVENT_BASE,
@@ -56,6 +57,7 @@ class StreamDIOClient:
         StreamDIOProtocol.DIO_INPUT_EVENT_BASE = STREAMDIO_DIO_INPUT_EVENT_BASE
         StreamDIOProtocol.DIO_OUTPUT_EVENT_BASE = STREAMDIO_DIO_OUTPUT_EVENT_BASE
         StreamDIOProtocol.ANALOG_INPUT_EVENT_BASE = STREAMDIO_ANALOG_INPUT_EVENT_BASE
+        StreamDIOProtocol.BPOD_STATE_EVENT_BASE = STREAMDIO_BPOD_STATE_EVENT_BASE
 
         self._protocol_cls = StreamDIOProtocol
         self.config_port = config_port
@@ -99,7 +101,11 @@ class StreamDIOClient:
                 "StreamDIO USB device."
             ) from exc
 
-    def configure_rotary_and_force(self, lick_channels: tuple[int, ...] = (LICK_INPUT_CHANNEL,)) -> None:
+    def configure_rotary_and_force(
+        self,
+        lick_channels: tuple[int, ...] = (LICK_INPUT_CHANNEL,),
+        extra_input_channels: tuple[int, ...] = (),
+    ) -> None:
         if self._dio is None:
             raise RuntimeError("StreamDIO not connected")
         with self._config_lock:
@@ -116,7 +122,7 @@ class StreamDIOClient:
             enable_vector = [False] * int(self._dio.module_info["n_input_channels"])
             enable_vector[PULSE_INPUT_CHANNEL - 1] = True
             enable_vector[DIRECTION_INPUT_CHANNEL - 1] = True
-            for channel in lick_channels:
+            for channel in tuple(lick_channels) + tuple(extra_input_channels):
                 if 1 <= int(channel) <= len(enable_vector):
                     enable_vector[int(channel) - 1] = True
             ok = self._dio.configure_module(

@@ -62,6 +62,21 @@ display:
   pre_trial_black_s: 0.0
   feedback_hold_s: 0.6
 
+frame2ttl:
+  enabled: true
+  input_channel: 5
+  input_pin: 6
+  patch_size_px: 64
+  patch_margin_px: 16
+  patch_corner: bottom_right
+  barcode_enabled: true
+  barcode_preamble_high_frames: 12
+  barcode_preamble_low_frames: 12
+  barcode_one_high_frames: 6
+  barcode_zero_high_frames: 6
+  barcode_inter_bit_low_frames: 6
+  choice_flash_enabled: true
+
 engagement:
   idle_timeout_s: 60.0
   max_consecutive_failures: 10

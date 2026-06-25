@@ -70,6 +70,16 @@ class TrialRecord:
     choice_loop_mean_frame_s: float = 0.0
     choice_loop_max_frame_s: float = 0.0
     choice_loop_stall_count: int = 0
+    frame2ttl_code_word: int | None = None
+    frame2ttl_trial_type_code: int | None = None
+    frame2ttl_barcode_complete: bool = False
+    frame2ttl_barcode_decoded: bool = False
+    frame2ttl_barcode_match: bool = False
+    frame2ttl_edge_count: int = 0
+    frame2ttl_choice_edge_count: int = 0
+    frame2ttl_first_ttl_timestamp_us: int | None = None
+    frame2ttl_first_ttl_relative_time_s: float | None = None
+    frame2ttl_first_ttl_latency_from_bpod_s: float | None = None
 
 
 @dataclass
@@ -205,36 +215,45 @@ class SessionRecorder:
         events_arr = self._events_to_structured()
         streamdio_arr = self._streamdio_to_structured()
 
-        np.savez_compressed(
-            npz_path,
-            trials=trials_arr,
-            events=events_arr,
-            streamdio_events=streamdio_arr,
-            bpod_trials_json=np.array(
-                [json.dumps(trial) for trial in self.bpod_trials],
-                dtype=object,
-            ),
-            trials_json=np.array(
-                [json.dumps(asdict(trial), default=str) for trial in self.trials],
-                dtype=object,
-            ),
-            events_json=np.array(
-                [json.dumps(asdict(event), default=str) for event in self.events],
-                dtype=object,
-            ),
-            fsm_definitions_json=np.array(
-                [
-                    json.dumps({"fsm_name": name, "fsm_json": fsm_json}, default=str)
-                    for name, fsm_json in self.fsm_definitions.items()
-                ],
-                dtype=object,
-            ),
-            summary_json=np.array([json.dumps(asdict(summary))], dtype=object),
-            session_metadata_json=np.array(
-                [json.dumps(self.metadata, default=str)],
-                dtype=object,
-            ),
-        )
+        npz_error: str | None = None
+        try:
+            np.savez_compressed(
+                npz_path,
+                trials=trials_arr,
+                events=events_arr,
+                streamdio_events=streamdio_arr,
+                bpod_trials_json=np.array(
+                    [json.dumps(trial) for trial in self.bpod_trials],
+                    dtype=object,
+                ),
+                trials_json=np.array(
+                    [json.dumps(asdict(trial), default=str) for trial in self.trials],
+                    dtype=object,
+                ),
+                events_json=np.array(
+                    [json.dumps(asdict(event), default=str) for event in self.events],
+                    dtype=object,
+                ),
+                fsm_definitions_json=np.array(
+                    [
+                        json.dumps({"fsm_name": name, "fsm_json": fsm_json}, default=str)
+                        for name, fsm_json in self.fsm_definitions.items()
+                    ],
+                    dtype=object,
+                ),
+                summary_json=np.array([json.dumps(asdict(summary))], dtype=object),
+                session_metadata_json=np.array(
+                    [json.dumps(self.metadata, default=str)],
+                    dtype=object,
+                ),
+            )
+        except OSError as exc:
+            npz_error = f"{type(exc).__name__}: {exc}"
+            try:
+                if npz_path.exists():
+                    npz_path.unlink()
+            except OSError:
+                pass
 
         streamdio_counts = Counter(event[0] for event in self.streamdio_events)
         meta = {
@@ -252,10 +271,12 @@ class SessionRecorder:
                 for name, fsm_json in self.fsm_definitions.items()
             ],
             "bpod_trials": self.bpod_trials,
-            "npz_file": str(npz_path.name),
+            "npz_file": None if npz_error is not None else str(npz_path.name),
         }
+        if npz_error is not None:
+            meta["npz_error"] = npz_error
         json_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        return npz_path
+        return json_path if npz_error is not None else npz_path
 
     def _trials_to_structured(self) -> np.ndarray:
         if not self.trials:
@@ -301,6 +322,16 @@ class SessionRecorder:
             ("choice_loop_mean_frame_s", "f8"),
             ("choice_loop_max_frame_s", "f8"),
             ("choice_loop_stall_count", "i4"),
+            ("frame2ttl_code_word", "i8"),
+            ("frame2ttl_trial_type_code", "i4"),
+            ("frame2ttl_barcode_complete", "?"),
+            ("frame2ttl_barcode_decoded", "?"),
+            ("frame2ttl_barcode_match", "?"),
+            ("frame2ttl_edge_count", "i4"),
+            ("frame2ttl_choice_edge_count", "i4"),
+            ("frame2ttl_first_ttl_timestamp_us", "i8"),
+            ("frame2ttl_first_ttl_relative_time_s", "f8"),
+            ("frame2ttl_first_ttl_latency_from_bpod_s", "f8"),
         ]
         rows = []
         for t in self.trials:
@@ -350,6 +381,32 @@ class SessionRecorder:
                     t.choice_loop_mean_frame_s,
                     t.choice_loop_max_frame_s,
                     t.choice_loop_stall_count,
+                    -1 if t.frame2ttl_code_word is None else int(t.frame2ttl_code_word),
+                    (
+                        -1
+                        if t.frame2ttl_trial_type_code is None
+                        else int(t.frame2ttl_trial_type_code)
+                    ),
+                    t.frame2ttl_barcode_complete,
+                    t.frame2ttl_barcode_decoded,
+                    t.frame2ttl_barcode_match,
+                    t.frame2ttl_edge_count,
+                    t.frame2ttl_choice_edge_count,
+                    (
+                        -1
+                        if t.frame2ttl_first_ttl_timestamp_us is None
+                        else int(t.frame2ttl_first_ttl_timestamp_us)
+                    ),
+                    (
+                        np.nan
+                        if t.frame2ttl_first_ttl_relative_time_s is None
+                        else float(t.frame2ttl_first_ttl_relative_time_s)
+                    ),
+                    (
+                        np.nan
+                        if t.frame2ttl_first_ttl_latency_from_bpod_s is None
+                        else float(t.frame2ttl_first_ttl_latency_from_bpod_s)
+                    ),
                 )
             )
         return np.array(rows, dtype=dtype)

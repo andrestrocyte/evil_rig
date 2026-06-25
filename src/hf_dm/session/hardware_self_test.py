@@ -194,25 +194,39 @@ class HardwareSelfTestSession(HFDecisionSession):
             trial_events = event_by_trial.get(trial.trial_index, {})
             if trial.chosen_shape == "star":
                 expected_states = [
+                    "Quiescence_Pre",
                     "Quiescence",
+                    "ChoiceWindow_Pre",
                     "ChoiceWindow",
+                    "ChoiceBlankHigh_Pre",
                     "ChoiceBlankHigh",
+                    "RewardHigh_Pre",
                     "RewardHigh",
+                    "PostRewardHigh_Pre",
                     "PostRewardHigh",
                 ]
             elif trial.chosen_shape == "circle":
                 expected_states = [
+                    "Quiescence_Pre",
                     "Quiescence",
+                    "ChoiceWindow_Pre",
                     "ChoiceWindow",
+                    "ChoiceBlankLow_Pre",
                     "ChoiceBlankLow",
+                    "RewardLow_Pre",
                     "RewardLow",
+                    "PostRewardLow_Pre",
                     "PostRewardLow",
                 ]
             else:
                 expected_states = [
+                    "Quiescence_Pre",
                     "Quiescence",
+                    "ChoiceWindow_Pre",
                     "ChoiceWindow",
+                    "TimeoutNoise_Pre",
                     "TimeoutNoise",
+                    "PostTimeout_Pre",
                     "PostTimeout",
                 ]
             actual_states = bpod_states_by_trial.get(trial.trial_index, [])

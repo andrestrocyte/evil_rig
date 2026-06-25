@@ -18,7 +18,10 @@ from hf_dm.fsm.runtime import TrialRuntime
 from hf_dm.hardware.bringup_constants import (
     CAP_TOUCH_POWER_OUTPUT_CHANNEL,
     CAP_TOUCH_POWER_PIN,
+    FRAME2TTL_INPUT_CHANNEL,
     LICK_INPUT_CHANNEL,
+    STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID,
+    STREAMDIO_STATE_MARKER_MESSAGE_IDS,
 )
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.simulated_bpod import SimulatedBpod
@@ -202,6 +205,9 @@ class SimulatedSpeakerRelay:
     def act(self, message_id: int) -> dict[str, int]:
         return {self.module_name: int(message_id)}
 
+    def bpod_state_marker_act(self, state_name: str) -> dict[str, int]:
+        return self.act(STREAMDIO_STATE_MARKER_MESSAGE_IDS[str(state_name)])
+
     def speaker_gate(self, enabled: bool) -> None:
         self.ops.append(("speaker_gate", bool(enabled), time.perf_counter()))
 
@@ -216,9 +222,12 @@ class SimulatedDIO:
         self._camera_start_mono = time.perf_counter()
         self._camera_events: list[tuple[int, float]] = []
         self._callback = None
+        self._stream_start_mono = time.perf_counter()
+        self._frame2ttl_state: int | None = None
 
     def start_streaming(self, callback=None) -> None:
         self._callback = callback
+        self._stream_start_mono = time.perf_counter()
 
     def start_camera_session(self, frequency_hz: int, exposure_us: int) -> None:
         del exposure_us
@@ -247,6 +256,48 @@ class SimulatedDIO:
     def stop_camera(self) -> None:
         self._update_camera_events()
         self._camera_active = False
+
+    def emit_frame2ttl_transition(
+        self,
+        state: bool,
+        *,
+        channel: int = FRAME2TTL_INPUT_CHANNEL,
+        relative_s: float | None = None,
+    ) -> None:
+        state_i = 1 if bool(state) else 0
+        if self._frame2ttl_state == state_i:
+            return
+        self._frame2ttl_state = state_i
+        if self._callback is None:
+            return
+        event_relative_s = (
+            max(0.0, time.perf_counter() - self._stream_start_mono)
+            if relative_s is None
+            else max(0.0, float(relative_s))
+        )
+        self._callback(
+            "dio_input",
+            int(channel),
+            state_i,
+            int(event_relative_s * 1_000_000),
+            event_relative_s,
+        )
+
+    def emit_bpod_state(self, state_id: int, *, relative_s: float | None = None) -> None:
+        if self._callback is None:
+            return
+        event_relative_s = (
+            max(0.0, time.perf_counter() - self._stream_start_mono)
+            if relative_s is None
+            else max(0.0, float(relative_s))
+        )
+        self._callback(
+            "bpod_state",
+            int(state_id),
+            None,
+            int(event_relative_s * 1_000_000),
+            event_relative_s,
+        )
 
     def close(self) -> None:
         self.stop_camera()
@@ -337,6 +388,7 @@ class SimulatedHFDecisionSession(HFDecisionSession):
     def __init__(self, config: SessionConfig, options: SimulationOptions):
         super().__init__(config)
         self.options = options
+        self._frame2ttl_sim_relative_bases: dict[tuple[int, str], float] = {}
         self.wheel = SimulatedWheel(
             config.wheel,
             frames_to_choice=options.frames_to_choice,
@@ -347,10 +399,11 @@ class SimulatedHFDecisionSession(HFDecisionSession):
         self._closed = False
         self.bpod = SimulatedBpod()
         self.bpod.set_softcode_handler(self._handle_bpod_softcode)
+        self.bpod.set_serial_handler(self._handle_simulated_bpod_serial_action)
         self.relay = SimulatedRelay()
         self.speaker_relay = SimulatedSpeakerRelay()
         self.dio = SimulatedDIO()
-        self.display = TaskDisplay(self.config.display)
+        self.display = TaskDisplay(self.config.display, self.config.frame2ttl)
         self.recorder = SessionRecorder(
             Path(self.config.results_dir),
             self.config.subject_id,
@@ -434,9 +487,19 @@ class SimulatedHFDecisionSession(HFDecisionSession):
                 "camera_hz": self.config.camera.frequency_hz,
                 "camera_backend": "spinnaker_sim",
                 "lick_channels": list(self.config.licks.channels),
+                "frame2ttl": self._frame2ttl_descriptor(),
                 "simulated": True,
             },
         )
+
+    def _handle_simulated_bpod_serial_action(self, output_name: str, message_id: int) -> None:
+        del output_name
+        state_id = STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID.get(int(message_id))
+        if state_id is None or self.dio is None:
+            return
+        emitter = getattr(self.dio, "emit_bpod_state", None)
+        if callable(emitter):
+            emitter(int(state_id))
 
     def _choice_for_trial(
         self,
@@ -478,6 +541,36 @@ class SimulatedHFDecisionSession(HFDecisionSession):
     def _prepare_centering_trial(self, start_position_deg: float) -> None:
         movement = "cw" if start_position_deg < 0.0 else "ccw"
         self.wheel.plan_choice(movement, abs(start_position_deg))
+
+    def _notify_frame2ttl_display_state(
+        self,
+        state: bool,
+        flip_mono_s: float,
+        *,
+        trial_index: int,
+        source: str,
+        frame_index: int,
+    ) -> None:
+        del flip_mono_s
+        if not self.config.frame2ttl.enabled or self.dio is None:
+            return
+        emitter = getattr(self.dio, "emit_frame2ttl_transition", None)
+        if callable(emitter):
+            relative_s = None
+            if source in {"barcode", "choice"}:
+                key = (int(trial_index), str(source))
+                base = self._frame2ttl_sim_relative_bases.setdefault(
+                    key,
+                    max(0.0, time.perf_counter() - self.dio._stream_start_mono),
+                )
+                relative_s = base + (
+                    int(frame_index) / float(max(1, int(self.config.display.fps)))
+                )
+            emitter(
+                bool(state),
+                channel=int(self.config.frame2ttl.input_channel),
+                relative_s=relative_s,
+            )
 
 
 def shorten_for_simulation(config: SessionConfig, *, n_trials: int | None = None) -> None:

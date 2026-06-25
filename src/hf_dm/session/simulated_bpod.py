@@ -13,6 +13,7 @@ class SimulatedBpod:
 
     def __init__(self) -> None:
         self._handler: Callable[[int], None] | None = None
+        self._serial_handler: Callable[[str, int], None] | None = None
         self._input: queue.Queue[int] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._completed: queue.Queue[list[dict[str, Any]]] = queue.Queue()
@@ -22,6 +23,9 @@ class SimulatedBpod:
 
     def set_softcode_handler(self, handler: Callable[[int], None] | None) -> None:
         self._handler = handler
+
+    def set_serial_handler(self, handler: Callable[[str, int], None] | None) -> None:
+        self._serial_handler = handler
 
     @property
     def is_running(self) -> bool:
@@ -63,6 +67,11 @@ class SimulatedBpod:
             outgoing = state.actions.get("SoftCode")
             if outgoing is not None and self._handler is not None:
                 self._handler(int(outgoing))
+            if self._serial_handler is not None:
+                for output_name, message_id in state.actions.items():
+                    if output_name == "SoftCode":
+                        continue
+                    self._serial_handler(str(output_name), int(message_id))
 
             deadline = entered + float(state.timer)
             target: str | None = None

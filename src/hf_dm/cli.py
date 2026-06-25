@@ -246,6 +246,60 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--frame2ttl-diagnostic",
+        action="store_true",
+        help=(
+            "Run a no-trial Frame2TTL check: flashes the configured sync square "
+            "and records DI05/pin6 TTL edges."
+        ),
+    )
+    parser.add_argument(
+        "--frame2ttl-barcode-diagnostic",
+        action="store_true",
+        help=(
+            "Run a no-trial Frame2TTL barcode check: displays representative "
+            "trial-start count barcodes and reports DI decode/match accuracy."
+        ),
+    )
+    parser.add_argument(
+        "--frame2ttl-barcode-repetitions",
+        type=int,
+        default=1,
+        help="Number of times to repeat all barcode cases for --frame2ttl-barcode-diagnostic.",
+    )
+    parser.add_argument(
+        "--bpod-opcode-diagnostic",
+        action="store_true",
+        help=(
+            "Run a no-output Bpod serial opcode check: sends StreamDIO state "
+            "marker opcodes and reports bpod_state timestamps."
+        ),
+    )
+    parser.add_argument(
+        "--bpod-opcode-hold-s",
+        type=float,
+        default=0.01,
+        help="Seconds to hold each marker state for --bpod-opcode-diagnostic.",
+    )
+    parser.add_argument(
+        "--frame2ttl-flips",
+        type=int,
+        default=20,
+        help="Number of square flips for --frame2ttl-diagnostic.",
+    )
+    parser.add_argument(
+        "--frame2ttl-hold-s",
+        type=float,
+        default=0.25,
+        help="Seconds to hold each square state for --frame2ttl-diagnostic.",
+    )
+    parser.add_argument(
+        "--frame2ttl-settle-s",
+        type=float,
+        default=0.5,
+        help="Seconds to hold black before/after --frame2ttl-diagnostic flashes.",
+    )
+    parser.add_argument(
         "--cap-touch-duration",
         type=float,
         default=15.0,
@@ -362,12 +416,30 @@ def main() -> None:
         parser.error("--hardware-self-test cannot be combined with --simulate")
     if args.hardware_self_test and args.preflight:
         parser.error("--hardware-self-test cannot be combined with --preflight")
+    frame2ttl_modes = [
+        args.frame2ttl_diagnostic,
+        args.frame2ttl_barcode_diagnostic,
+        args.bpod_opcode_diagnostic,
+    ]
+    if sum(1 for enabled in frame2ttl_modes if enabled) > 1:
+        parser.error(
+            "--frame2ttl-diagnostic, --frame2ttl-barcode-diagnostic, and "
+            "--bpod-opcode-diagnostic are mutually exclusive"
+        )
     if args.cap_touch_diagnostic and (
-        args.simulate or args.preflight or args.hardware_self_test
+        args.simulate
+        or args.preflight
+        or args.hardware_self_test
+        or any(frame2ttl_modes)
     ):
         parser.error(
             "--cap-touch-diagnostic cannot be combined with --simulate, "
-            "--preflight, or --hardware-self-test"
+            "--preflight, --hardware-self-test, or sync diagnostics"
+        )
+    if any(frame2ttl_modes) and (args.preflight or args.hardware_self_test):
+        parser.error(
+            "sync diagnostics cannot be combined with --preflight or "
+            "--hardware-self-test"
         )
 
     logging.basicConfig(
@@ -382,6 +454,10 @@ def main() -> None:
         config.monitor.enabled = True
     if args.no_monitor:
         config.monitor.enabled = False
+    if any(frame2ttl_modes):
+        config.camera.record_video = False
+        config.camera.required = False
+        config.speaker.required = False
     setup_requested = (
         args.session_mouse_dir is not None
         or args.session_modality is not None
@@ -396,6 +472,7 @@ def main() -> None:
         and not args.preflight
         and not args.hardware_self_test
         and not args.cap_touch_diagnostic
+        and not any(frame2ttl_modes)
     )
     if should_show_setup:
         _apply_session_setup(config, _run_session_setup_dialog())
@@ -460,7 +537,20 @@ def main() -> None:
         session = HFDecisionSession(config)
     try:
         session.connect()
-        if args.preflight:
+        if args.frame2ttl_diagnostic:
+            summary = session.frame2ttl_diagnostic(
+                n_flips=args.frame2ttl_flips,
+                hold_s=args.frame2ttl_hold_s,
+                settle_s=args.frame2ttl_settle_s,
+            )
+        elif args.frame2ttl_barcode_diagnostic:
+            summary = session.frame2ttl_barcode_diagnostic(
+                repetitions=args.frame2ttl_barcode_repetitions,
+                settle_s=args.frame2ttl_settle_s,
+            )
+        elif args.bpod_opcode_diagnostic:
+            summary = session.bpod_opcode_diagnostic(hold_s=args.bpod_opcode_hold_s)
+        elif args.preflight:
             summary = session.preflight(duration_s=args.preflight_duration)
         else:
             summary = session.run()

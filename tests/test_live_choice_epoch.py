@@ -1,6 +1,6 @@
 import os
 
-from hf_dm.config import DisplayConfig, SessionConfig
+from hf_dm.config import DisplayConfig, Frame2TTLConfig, SessionConfig
 from hf_dm.display.pygame_display import TaskDisplay
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.simulated import (
@@ -38,6 +38,33 @@ def test_star_and_circle_have_exactly_equal_bright_pixels():
         display.close()
 
 
+def test_frame2ttl_sync_square_draws_in_lower_right_corner():
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    display = TaskDisplay(
+        DisplayConfig(
+            width=240,
+            height=180,
+            auto_size_to_display=False,
+            display_index=None,
+            noframe=False,
+        ),
+        Frame2TTLConfig(
+            enabled=True,
+            patch_size_px=20,
+            patch_margin_px=10,
+            patch_corner="bottom_right",
+        ),
+    )
+    try:
+        display.draw_sync_square_frame(True)
+        assert display.screen.get_at((219, 159))[:3] == (255, 255, 255)
+        assert display.screen.get_at((5, 5))[:3] == (0, 0, 0)
+        display.draw_sync_square_frame(False)
+        assert display.screen.get_at((219, 159))[:3] == (0, 0, 0)
+    finally:
+        display.close()
+
+
 def test_bpod_fsm_choice_blanks_then_rewards_and_exits(tmp_path):
     os.environ["SDL_VIDEODRIVER"] = "dummy"
     config = SessionConfig(n_trials=1, results_dir=str(tmp_path))
@@ -62,13 +89,19 @@ def test_bpod_fsm_choice_blanks_then_rewards_and_exits(tmp_path):
         if row["type"] == "StateStart"
     ]
     assert state_order == [
+        "Quiescence_Pre",
         "Quiescence",
+        "ChoiceWindow_Pre",
         "ChoiceWindow",
+        "ChoiceBlankHigh_Pre",
         "ChoiceBlankHigh",
+        "RewardHigh_Pre",
         "RewardHigh",
+        "PostRewardHigh_Pre",
         "PostRewardHigh",
     ]
     event_types = [event.event_type for event in session.recorder.events]
+    assert "bpod_state_marker" in event_types
     assert event_types.index("choice_detected") < event_types.index("stimulus_off")
     assert event_types.index("stimulus_off") < event_types.index("pump_start")
     assert event_types.index("pump_start") < event_types.index("pump_end")

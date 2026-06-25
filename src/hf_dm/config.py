@@ -13,6 +13,8 @@ from hf_dm.hardware.bringup_constants import (
     BringupPorts,
     CAP_TOUCH_POWER_OUTPUT_CHANNEL,
     DEFAULT_BAUDRATE,
+    FRAME2TTL_INPUT_CHANNEL,
+    FRAME2TTL_INPUT_PIN,
     LICK_INPUT_CHANNEL,
     SPEAKER_NOISE_SAMPLE_INTERVAL_US,
 )
@@ -55,6 +57,23 @@ class DisplayConfig:
     @property
     def axis(self) -> str:
         return "vertical" if self.rotated_choice_axis else "horizontal"
+
+
+@dataclass
+class Frame2TTLConfig:
+    enabled: bool = True
+    input_channel: int = FRAME2TTL_INPUT_CHANNEL
+    input_pin: int = FRAME2TTL_INPUT_PIN
+    patch_size_px: int = 64
+    patch_margin_px: int = 16
+    patch_corner: str = "bottom_right"
+    barcode_enabled: bool = True
+    barcode_preamble_high_frames: int = 12
+    barcode_preamble_low_frames: int = 12
+    barcode_one_high_frames: int = 6
+    barcode_zero_high_frames: int = 6
+    barcode_inter_bit_low_frames: int = 6
+    choice_flash_enabled: bool = True
 
 
 @dataclass
@@ -164,6 +183,7 @@ class SessionConfig:
     ports: BringupPorts = field(default_factory=BringupPorts)
     wheel: WheelKinematics = field(default_factory=WheelKinematics)
     display: DisplayConfig = field(default_factory=DisplayConfig)
+    frame2ttl: Frame2TTLConfig = field(default_factory=Frame2TTLConfig)
     timing: TimingConfig = field(default_factory=TimingConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     task: TaskDesignConfig = field(default_factory=TaskDesignConfig)
@@ -197,6 +217,7 @@ class SessionConfig:
         camera_raw = raw.get("camera", {})
         monitor_raw = raw.get("monitor", {})
         wheel_raw = raw.get("wheel", {})
+        frame2ttl_raw = raw.get("frame2ttl", {})
 
         def channels(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
             value = lick_raw.get(name, default)
@@ -282,6 +303,35 @@ class SessionConfig:
                 shape_radius_px=int(display_raw.get("shape_radius_px", 90)),
                 target_radius_px=int(display_raw.get("target_radius_px", 120)),
                 show_debug_overlay=bool(display_raw.get("show_debug_overlay", False)),
+            ),
+            frame2ttl=Frame2TTLConfig(
+                enabled=bool(frame2ttl_raw.get("enabled", True)),
+                input_channel=int(
+                    frame2ttl_raw.get("input_channel", FRAME2TTL_INPUT_CHANNEL)
+                ),
+                input_pin=int(frame2ttl_raw.get("input_pin", FRAME2TTL_INPUT_PIN)),
+                patch_size_px=int(frame2ttl_raw.get("patch_size_px", 64)),
+                patch_margin_px=int(frame2ttl_raw.get("patch_margin_px", 16)),
+                patch_corner=str(frame2ttl_raw.get("patch_corner", "bottom_right")),
+                barcode_enabled=bool(frame2ttl_raw.get("barcode_enabled", True)),
+                barcode_preamble_high_frames=int(
+                    frame2ttl_raw.get("barcode_preamble_high_frames", 12)
+                ),
+                barcode_preamble_low_frames=int(
+                    frame2ttl_raw.get("barcode_preamble_low_frames", 12)
+                ),
+                barcode_one_high_frames=int(
+                    frame2ttl_raw.get("barcode_one_high_frames", 6)
+                ),
+                barcode_zero_high_frames=int(
+                    frame2ttl_raw.get("barcode_zero_high_frames", 6)
+                ),
+                barcode_inter_bit_low_frames=int(
+                    frame2ttl_raw.get("barcode_inter_bit_low_frames", 6)
+                ),
+                choice_flash_enabled=bool(
+                    frame2ttl_raw.get("choice_flash_enabled", True)
+                ),
             ),
             timing=TimingConfig(
                 quiescence_s=float(timing_raw.get("quiescence_s", 3.0)),
