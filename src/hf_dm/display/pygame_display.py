@@ -12,7 +12,7 @@ from typing import Literal
 import pygame
 
 from hf_dm.config import DisplayConfig, Frame2TTLConfig
-from hf_dm.fsm.runtime import Side
+from hf_dm.fsm.runtime import Shape, Side
 
 Direction = Literal["cw", "ccw"]
 

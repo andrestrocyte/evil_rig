@@ -6,7 +6,7 @@ from pathlib import Path
 from hf_dm.config import SessionConfig, config_to_dict
 from hf_dm.data.recorder import SessionRecorder, SessionSummary, TrialRecord
 from hf_dm.data.session_export import sha256_file, validate_session
-from hf_dm.ops_cli import main
+from hf_dm.ops_cli import _streamdio_module_status, main
 
 
 def _make_session(tmp_path):
@@ -65,6 +65,73 @@ def test_ops_cli_export_and_validate_session(tmp_path, monkeypatch, capsys):
     main()
     validate_result = json.loads(capsys.readouterr().out)
     assert validate_result["valid"]
+
+
+def test_ops_cli_validate_config_rejects_semantic_errors(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "invalid.yaml"
+    config_path.write_text(
+        "n_trials: 0\ncamera:\n  frequency_hz: 30\n  exposure_us: 40000\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", ["hf-dm", "validate-config", str(config_path)])
+
+    try:
+        main()
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:
+        raise AssertionError("validate-config accepted invalid settings")
+
+    result = json.loads(capsys.readouterr().out)
+    assert not result["valid"]
+    assert {error["field"] for error in result["errors"]} >= {
+        "n_trials",
+        "camera.exposure_us",
+    }
+
+
+def test_preflight_report_uses_cached_streamdio_status_after_disconnect():
+    session = types.SimpleNamespace(
+        dio=types.SimpleNamespace(
+            get_module_status=lambda: (_ for _ in ()).throw(RuntimeError("disconnected")),
+            raw=types.SimpleNamespace(module_info={"firmware_version": 4}),
+        ),
+        _latest_streamdio_module_status={
+            "module_info": {"firmware_version": 4},
+            "buffer_overruns": 0,
+        },
+    )
+
+    status = _streamdio_module_status(session)
+
+    assert status["source"] == "cached_status_poll"
+    assert status["module_info"]["firmware_version"] == 4
+    assert status["buffer_overruns"] == 0
+
+
+def test_preflight_report_falls_back_to_registered_stream_summary():
+    session = types.SimpleNamespace(
+        dio=types.SimpleNamespace(
+            get_module_status=lambda: (_ for _ in ()).throw(RuntimeError("disconnected")),
+            raw=types.SimpleNamespace(module_info=None),
+        ),
+        _latest_streamdio_module_status=None,
+        recorder=types.SimpleNamespace(
+            stream_summaries={
+                "streamdio": {
+                    "config_port": "COM6",
+                    "stream_port": "COM7",
+                    "module_info": {"firmware_version": 4},
+                }
+            }
+        ),
+    )
+
+    status = _streamdio_module_status(session)
+
+    assert status["source"] == "session_stream_summary"
+    assert status["module_info"]["firmware_version"] == 4
+    assert status["config_port"] == "COM6"
 
 
 def test_ops_cli_camera_roi_setup_writes_yaml(tmp_path, monkeypatch, capsys):

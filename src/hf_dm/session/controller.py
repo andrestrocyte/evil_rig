@@ -13,7 +13,13 @@ from bpod_core.bpod import Bpod
 from bpod_core.fsm import StateMachine
 
 from hf_dm.audio.white_noise import WhiteNoisePlayer
-from hf_dm.config import SessionConfig, TrainingPhase, config_to_dict, task_design_summary
+from hf_dm.config import (
+    SessionConfig,
+    TrainingPhase,
+    config_to_dict,
+    task_design_summary,
+    validate_session_config,
+)
 from hf_dm.camera.spinnaker import HeadlessSpinnakerRecorder
 from hf_dm.data.session_export import resolve_session_output, session_bundle_dir
 from hf_dm.hardware.discovery import connect_bpod_core
@@ -52,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 class HFDecisionSession:
     def __init__(self, config: SessionConfig):
-        self.config = config
+        self.config = validate_session_config(config)
         self.rng = random.Random(config.random_seed)
         self.bpod: Bpod | None = None
         self.relay: StreamDIOOutputs | None = None
@@ -3347,7 +3353,7 @@ class HFDecisionSession:
                 lick_count=len(lick_events),
                 lick_rate_hz=self._lick_rate_hz(
                     len(lick_events),
-                    float(loop_stats.get("duration_s", response_time_s)),
+                    float(loop_stats.get("duration_s", rt)),
                 ),
                 lick_timestamps_us=[int(event["timestamp_us"]) for event in lick_events],
                 lick_relative_times_s=[float(event["relative_time_s"]) for event in lick_events],

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -291,7 +292,7 @@ class SessionConfig:
                 return None
             return int(value)
 
-        return SessionConfig(
+        config = SessionConfig(
             subject_id=str(raw.get("subject_id", "mouse01")),
             phase=phase,
             n_trials=int(raw.get("n_trials", 50)),
@@ -636,6 +637,265 @@ class SessionConfig:
             ),
             results_dir=str(raw.get("results_dir", "data/sessions")),
         )
+        return validate_session_config(config)
+
+
+@dataclass(frozen=True)
+class ConfigValidationIssue:
+    field: str
+    message: str
+    value: Any = None
+
+
+class ConfigValidationError(ValueError):
+    def __init__(self, issues: list[ConfigValidationIssue]):
+        self.issues = tuple(issues)
+        details = "; ".join(f"{issue.field}: {issue.message}" for issue in issues)
+        super().__init__(f"Invalid session configuration: {details}")
+
+
+def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssue]:
+    """Return semantic configuration failures before any hardware is opened."""
+    issues: list[ConfigValidationIssue] = []
+
+    def require(condition: bool, field_name: str, message: str, value: Any) -> None:
+        if not condition:
+            issues.append(ConfigValidationIssue(field_name, message, value))
+
+    def finite(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+    require(bool(str(config.subject_id).strip()), "subject_id", "must not be empty", config.subject_id)
+    require(config.n_trials > 0, "n_trials", "must be greater than zero", config.n_trials)
+    require(bool(str(config.results_dir).strip()), "results_dir", "must not be empty", config.results_dir)
+
+    require(config.ports.baudrate > 0, "ports.baudrate", "must be greater than zero", config.ports.baudrate)
+    require(
+        config.ports.bpod_serial_channel > 0,
+        "ports.bpod_serial_channel",
+        "must be one-based and greater than zero",
+        config.ports.bpod_serial_channel,
+    )
+    for field_name in ("bpod_port", "dio_config_port", "dio_stream_port"):
+        value = getattr(config.ports, field_name)
+        require(bool(str(value).strip()), f"ports.{field_name}", "must not be empty", value)
+
+    wheel = config.wheel
+    require(
+        finite(wheel.wheel_radius_mm) and wheel.wheel_radius_mm > 0,
+        "wheel.wheel_radius_mm",
+        "must be finite and greater than zero",
+        wheel.wheel_radius_mm,
+    )
+    require(
+        wheel.encoder_ticks_per_rev > 0,
+        "wheel.encoder_ticks_per_rev",
+        "must be greater than zero",
+        wheel.encoder_ticks_per_rev,
+    )
+    require(
+        finite(wheel.gain_deg_per_mm) and wheel.gain_deg_per_mm > 0,
+        "wheel.gain_deg_per_mm",
+        "must be finite and greater than zero",
+        wheel.gain_deg_per_mm,
+    )
+    require(
+        wheel.pulse_channel != wheel.direction_channel,
+        "wheel.direction_channel",
+        "must differ from wheel.pulse_channel",
+        wheel.direction_channel,
+    )
+    for field_name in ("pulse_channel", "direction_channel", "force_channel"):
+        value = getattr(wheel, field_name)
+        require(value > 0, f"wheel.{field_name}", "must be greater than zero", value)
+
+    display = config.display
+    for field_name in ("distance_mm", "pixel_size_mm", "choice_distance_deg"):
+        value = getattr(display, field_name)
+        require(
+            finite(value) and value > 0,
+            f"display.{field_name}",
+            "must be finite and greater than zero",
+            value,
+        )
+    require(display.fps > 0, "display.fps", "must be greater than zero", display.fps)
+    require(
+        finite(display.choice_center_threshold_deg)
+        and 0 <= display.choice_center_threshold_deg < display.choice_distance_deg,
+        "display.choice_center_threshold_deg",
+        "must be finite, non-negative, and below choice_distance_deg",
+        display.choice_center_threshold_deg,
+    )
+    require(
+        (display.width is None) == (display.height is None),
+        "display.width/height",
+        "must both be set or both be null",
+        [display.width, display.height],
+    )
+    for field_name in ("width", "height"):
+        value = getattr(display, field_name)
+        if value is not None:
+            require(value > 0, f"display.{field_name}", "must be greater than zero", value)
+
+    frame2ttl = config.frame2ttl
+    require(frame2ttl.input_channel > 0, "frame2ttl.input_channel", "must be greater than zero", frame2ttl.input_channel)
+    require(frame2ttl.input_pin > 0, "frame2ttl.input_pin", "must be greater than zero", frame2ttl.input_pin)
+    require(frame2ttl.patch_size_px > 0, "frame2ttl.patch_size_px", "must be greater than zero", frame2ttl.patch_size_px)
+    require(frame2ttl.patch_margin_px >= 0, "frame2ttl.patch_margin_px", "must be non-negative", frame2ttl.patch_margin_px)
+    require(
+        frame2ttl.patch_corner in {"top_left", "top_right", "bottom_left", "bottom_right"},
+        "frame2ttl.patch_corner",
+        "must be a supported screen corner",
+        frame2ttl.patch_corner,
+    )
+    if frame2ttl.barcode_enabled:
+        for field_name in (
+            "barcode_preamble_high_frames",
+            "barcode_preamble_low_frames",
+            "barcode_one_high_frames",
+            "barcode_zero_high_frames",
+            "barcode_inter_bit_low_frames",
+        ):
+            value = getattr(frame2ttl, field_name)
+            require(value > 0, f"frame2ttl.{field_name}", "must be greater than zero", value)
+
+    timing = config.timing
+    for field_name in (
+        "quiescence_s",
+        "inter_trial_min_s",
+        "choice_blank_s",
+        "post_reward_s",
+        "timeout_noise_s",
+        "post_timeout_s",
+    ):
+        value = getattr(timing, field_name)
+        require(finite(value) and value >= 0, f"timing.{field_name}", "must be finite and non-negative", value)
+    for field_name in ("choice_timeout_s", "choice_loop_stall_s"):
+        value = getattr(timing, field_name)
+        require(finite(value) and value > 0, f"timing.{field_name}", "must be finite and greater than zero", value)
+
+    for field_name in ("matched_pump_s", "opposite_pump_s"):
+        value = getattr(config.reward, field_name)
+        require(finite(value) and value >= 0, f"reward.{field_name}", "must be finite and non-negative", value)
+
+    task = config.task
+    require(task.modality in {"force", "risk", "delay"}, "task.modality", "must be force, risk, or delay", task.modality)
+    require(task.n_forced_trials >= 0, "task.n_forced_trials", "must be non-negative", task.n_forced_trials)
+    if task.n_free_trials is not None:
+        require(task.n_free_trials >= 0, "task.n_free_trials", "must be non-negative", task.n_free_trials)
+        require(
+            task.n_free_trials + task.n_forced_trials == config.n_trials,
+            "task.n_free_trials/task.n_forced_trials",
+            "must sum to n_trials when n_free_trials is explicit",
+            [task.n_free_trials, task.n_forced_trials, config.n_trials],
+        )
+    require(
+        finite(task.risk_star_probability) and 0 <= task.risk_star_probability <= 1,
+        "task.risk_star_probability",
+        "must be between zero and one",
+        task.risk_star_probability,
+    )
+    require(
+        finite(task.delay_star_extra_s) and task.delay_star_extra_s >= 0,
+        "task.delay_star_extra_s",
+        "must be finite and non-negative",
+        task.delay_star_extra_s,
+    )
+
+    lick_channels = tuple(config.licks.channels)
+    require(bool(lick_channels), "licks.channels", "must contain at least one input", lick_channels)
+    require(len(set(lick_channels)) == len(lick_channels), "licks.channels", "must not contain duplicates", lick_channels)
+    for channel in lick_channels:
+        require(channel > 0, "licks.channels", "all channels must be greater than zero", channel)
+    if frame2ttl.enabled:
+        require(
+            frame2ttl.input_channel not in lick_channels,
+            "frame2ttl.input_channel",
+            "must not overlap a lick input channel",
+            frame2ttl.input_channel,
+        )
+
+    speaker = config.speaker
+    require(speaker.sample_interval_us > 0, "speaker.sample_interval_us", "must be greater than zero", speaker.sample_interval_us)
+    require(finite(speaker.frequency_hz) and speaker.frequency_hz > 0, "speaker.frequency_hz", "must be finite and greater than zero", speaker.frequency_hz)
+    require(finite(speaker.volume) and 0 <= speaker.volume <= 1, "speaker.volume", "must be between zero and one", speaker.volume)
+
+    require(config.engagement.idle_timeout_s > 0, "engagement.idle_timeout_s", "must be greater than zero", config.engagement.idle_timeout_s)
+    require(
+        config.engagement.max_consecutive_failures > 0,
+        "engagement.max_consecutive_failures",
+        "must be greater than zero",
+        config.engagement.max_consecutive_failures,
+    )
+
+    camera = config.camera
+    require(camera.frequency_hz > 0, "camera.frequency_hz", "must be greater than zero", camera.frequency_hz)
+    require(camera.exposure_us > 0, "camera.exposure_us", "must be greater than zero", camera.exposure_us)
+    if camera.frequency_hz > 0:
+        require(
+            camera.exposure_us < 1_000_000 / camera.frequency_hz,
+            "camera.exposure_us",
+            "must be shorter than the camera trigger period",
+            camera.exposure_us,
+        )
+    require(camera.acquisition_timeout_ms > 0, "camera.acquisition_timeout_ms", "must be greater than zero", camera.acquisition_timeout_ms)
+    require(bool(str(camera.backend).strip()), "camera.backend", "must not be empty", camera.backend)
+    require(bool(str(camera.save_dir).strip()), "camera.save_dir", "must not be empty", camera.save_dir)
+    require(
+        (camera.roi_width is None) == (camera.roi_height is None),
+        "camera.roi_width/roi_height",
+        "must both be set or both be null",
+        [camera.roi_width, camera.roi_height],
+    )
+    require(
+        (camera.roi_offset_x is None) == (camera.roi_offset_y is None),
+        "camera.roi_offset_x/roi_offset_y",
+        "must both be set or both be null",
+        [camera.roi_offset_x, camera.roi_offset_y],
+    )
+    for field_name in ("roi_width", "roi_height"):
+        value = getattr(camera, field_name)
+        if value is not None:
+            require(value > 0, f"camera.{field_name}", "must be greater than zero", value)
+    for field_name in ("roi_offset_x", "roi_offset_y"):
+        value = getattr(camera, field_name)
+        if value is not None:
+            require(value >= 0, f"camera.{field_name}", "must be non-negative", value)
+
+    monitor = config.monitor
+    require(monitor.fps > 0, "monitor.fps", "must be greater than zero", monitor.fps)
+    require(1 <= monitor.trial_history <= 10, "monitor.trial_history", "must be between 1 and 10", monitor.trial_history)
+    require(monitor.queue_size >= 16, "monitor.queue_size", "must be at least 16", monitor.queue_size)
+    for field_name in ("force_sample_hz", "wheel_sample_hz", "screen_fps", "camera_fps"):
+        value = getattr(monitor, field_name)
+        require(finite(value) and value > 0, f"monitor.{field_name}", "must be finite and greater than zero", value)
+
+    export = config.session_export
+    require(export.layout in {"flat", "mm_hierarchy"}, "session_export.layout", "must be flat or mm_hierarchy", export.layout)
+    require(export.streamdio_chunk_s >= 0, "session_export.streamdio_chunk_s", "must be non-negative", export.streamdio_chunk_s)
+    require(
+        export.streamdio_memory_mode in {"full", "bounded", "rolling", "chunked"},
+        "session_export.streamdio_memory_mode",
+        "must be full, bounded, rolling, or chunked",
+        export.streamdio_memory_mode,
+    )
+    if export.streamdio_memory_mode in {"bounded", "rolling", "chunked"}:
+        require(
+            export.streamdio_chunk_s > 0,
+            "session_export.streamdio_chunk_s",
+            "must be greater than zero for bounded or chunked memory modes",
+            export.streamdio_chunk_s,
+        )
+    require(export.streamdio_recent_events > 0, "session_export.streamdio_recent_events", "must be greater than zero", export.streamdio_recent_events)
+    require(config.integrations.alyx_timeout_s > 0, "integrations.alyx_timeout_s", "must be greater than zero", config.integrations.alyx_timeout_s)
+    return issues
+
+
+def validate_session_config(config: SessionConfig) -> SessionConfig:
+    issues = config_validation_issues(config)
+    if issues:
+        raise ConfigValidationError(issues)
+    return config
 
 
 def _normalize_cli_overrides(value: Any) -> list[dict[str, Any]]:

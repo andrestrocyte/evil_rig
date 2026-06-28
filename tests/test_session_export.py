@@ -639,7 +639,7 @@ def test_validate_session_checks_monitor_telemetry_jsonl(tmp_path):
         "counts_by_message_type": {"trial_phase": 1},
     }
     assert result["valid"]
-    assert result["jsonl_files_checked"] == 1
+    assert result["jsonl_files_checked"] == 2
 
     telemetry_path.write_text("", encoding="utf-8")
     _refresh_manifest_artifact_sha(manifest_path, telemetry_path)
@@ -655,7 +655,7 @@ def test_validate_session_checks_monitor_telemetry_jsonl(tmp_path):
     result = validate_session(bundle)
 
     assert not result["valid"]
-    assert result["jsonl_files_checked"] == 1
+    assert result["jsonl_files_checked"] == 2
     assert any("jsonl invalid json" in error for error in result["errors"])
 
 

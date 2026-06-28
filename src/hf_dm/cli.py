@@ -10,7 +10,12 @@ import logging
 import os
 from pathlib import Path
 
-from hf_dm.config import SessionConfig, config_to_dict, task_design_summary
+from hf_dm.config import (
+    SessionConfig,
+    config_to_dict,
+    task_design_summary,
+    validate_session_config,
+)
 from hf_dm.session.cap_touch_diagnostic import run_cap_touch_diagnostic
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.hardware_self_test import HardwareSelfTestSession, shorten_for_hardware_self_test
@@ -577,6 +582,7 @@ def main() -> None:
                 source="hf-dm-run session arguments",
                 values=session_arg_overrides,
             )
+    validate_session_config(config)
     if args.cap_touch_diagnostic:
         run_cap_touch_diagnostic(
             config,

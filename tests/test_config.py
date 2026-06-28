@@ -1,7 +1,12 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from hf_dm.config import SessionConfig
+from hf_dm.config import (
+    ConfigValidationError,
+    SessionConfig,
+    config_validation_issues,
+    validate_session_config,
+)
 from hf_dm.hardware.bringup_constants import FRAME2TTL_INPUT_CHANNEL, FRAME2TTL_INPUT_PIN
 
 
@@ -112,6 +117,29 @@ def test_official_profiles_use_mm_layout_visual_roi_and_ten_choices():
         assert config.session_export.layout == "mm_hierarchy", filename
         assert config.monitor.trial_history == 10, filename
         assert config.integrations.mm_flir_roi_gui, filename
+
+
+def test_semantic_config_validation_reports_all_dangerous_values():
+    config = SessionConfig(n_trials=0)
+    config.camera.frequency_hz = 30
+    config.camera.exposure_us = 40_000
+    config.session_export.streamdio_memory_mode = "bounded"
+    config.session_export.streamdio_chunk_s = 0
+    config.task.modality = "mystery"
+
+    issues = config_validation_issues(config)
+    fields = {issue.field for issue in issues}
+
+    assert "n_trials" in fields
+    assert "camera.exposure_us" in fields
+    assert "session_export.streamdio_chunk_s" in fields
+    assert "task.modality" in fields
+    try:
+        validate_session_config(config)
+    except ConfigValidationError as exc:
+        assert len(exc.issues) == len(issues)
+    else:
+        raise AssertionError("invalid hardware configuration was accepted")
 
 
 def test_monitor_record_path_loads_from_yaml():

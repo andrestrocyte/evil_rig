@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -16,6 +17,37 @@ import numpy as np
 
 Direction = Literal["cw", "ccw"]
 Choice = Literal["cw", "ccw", "timeout", "centering"]
+JournalMode = Literal["new", "resume", "disabled"]
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _atomic_write_npz(path: Path, **arrays: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            np.savez_compressed(handle, **arrays)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 @dataclass
@@ -135,6 +167,7 @@ class SessionRecorder:
         phase: str,
         *,
         base_name: str | None = None,
+        journal_mode: JournalMode = "new",
     ):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -174,21 +207,120 @@ class SessionRecorder:
         self.summary: SessionSummary | None = None
         self._session_start_wall = time.time()
         self._session_start_mono = time.perf_counter()
-        self.log_event("session_start", {"subject_id": subject_id, "phase": phase})
+        self._journal_path = self.base_path.with_suffix(".journal.jsonl")
+        self._incomplete_marker_path = self.base_path.with_suffix(".incomplete.json")
+        self._journal_handle: Any = None
+        self._journal_lock = threading.RLock()
+        self._journal_sequence = 0
+        self._journal_mode: JournalMode = journal_mode
+        self._finalized = False
+        self._open_journal(subject_id=subject_id, phase=phase)
+        if journal_mode != "resume":
+            self.log_event("session_start", {"subject_id": subject_id, "phase": phase})
+
+    @property
+    def journal_path(self) -> Path:
+        return self._journal_path
+
+    @property
+    def incomplete_marker_path(self) -> Path:
+        return self._incomplete_marker_path
+
+    def _open_journal(self, *, subject_id: str, phase: str) -> None:
+        if self._journal_mode == "disabled":
+            return
+        if self._journal_mode == "resume":
+            if not self._journal_path.exists():
+                raise FileNotFoundError(self._journal_path)
+            self._journal_sequence = sum(
+                1
+                for line in self._journal_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+            self._journal_handle = self._journal_path.open(
+                "a",
+                encoding="utf-8",
+                newline="\n",
+                buffering=1,
+            )
+            return
+        self._journal_handle = self._journal_path.open(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            buffering=1,
+        )
+        header = {
+            "subject_id": str(subject_id),
+            "phase": str(phase),
+            "base_path": str(self.base_path),
+            "session_start_wall_s": self._session_start_wall,
+            "session_start_mono_s": self._session_start_mono,
+        }
+        self._journal_append("session_header", header, durable=True)
+        _atomic_write_text(
+            self._incomplete_marker_path,
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "incomplete",
+                    "journal": self._journal_path.name,
+                    **header,
+                },
+                indent=2,
+            ),
+        )
+
+    def _journal_append(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        durable: bool = False,
+    ) -> None:
+        with self._journal_lock:
+            if self._journal_handle is None:
+                return
+            row = {
+                "schema_version": 1,
+                "sequence": self._journal_sequence,
+                "kind": str(kind),
+                "recorded_wall_s": time.time(),
+                "payload": json.loads(json.dumps(payload, default=str)),
+            }
+            self._journal_handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+            self._journal_handle.flush()
+            if durable:
+                os.fsync(self._journal_handle.fileno())
+            self._journal_sequence += 1
+
+    def close_journal(self) -> None:
+        with self._journal_lock:
+            if self._journal_handle is None:
+                return
+            self._journal_handle.flush()
+            self._journal_handle.close()
+            self._journal_handle = None
 
     def set_metadata(self, metadata: dict[str, Any]) -> None:
         self.metadata.update(json.loads(json.dumps(metadata, default=str)))
         if self.stream_summaries:
             self.metadata["stream_summaries"] = dict(self.stream_summaries)
+        self._journal_append("metadata", self.metadata)
         self.log_event("session_metadata", self.metadata)
 
     def set_export_options(self, options: dict[str, Any]) -> None:
         self.export_options = json.loads(json.dumps(options, default=str))
+        self._journal_append("export_options", self.export_options)
         self._configure_streamdio_chunking()
 
     def register_stream(self, name: str, summary: dict[str, Any]) -> None:
         self.stream_summaries[str(name)] = json.loads(json.dumps(summary, default=str))
         self.metadata["stream_summaries"] = dict(self.stream_summaries)
+        self._journal_append(
+            "stream_summary",
+            {"name": str(name), "summary": self.stream_summaries[str(name)]},
+        )
 
     def get_stream_summaries(self) -> dict[str, dict[str, Any]]:
         return json.loads(json.dumps(self.stream_summaries, default=str))
@@ -208,17 +340,21 @@ class SessionRecorder:
             fsm_json = json.dumps(fsm, default=str)
 
         self.fsm_definitions[fsm_name] = fsm_json
+        self._journal_append(
+            "fsm_definition",
+            {"fsm_name": fsm_name, "fsm_json": fsm_json},
+        )
         self.log_event("fsm_definition_added", {"fsm_name": fsm_name})
 
     def log_event(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
-        self.events.append(
-            SessionEvent(
-                wall_time_s=time.time(),
-                monotonic_s=time.perf_counter(),
-                event_type=event_type,
-                payload=payload or {},
-            )
+        event = SessionEvent(
+            wall_time_s=time.time(),
+            monotonic_s=time.perf_counter(),
+            event_type=event_type,
+            payload=payload or {},
         )
+        self.events.append(event)
+        self._journal_append("event", asdict(event))
         self._max_event_count = max(self._max_event_count, len(self.events))
 
     def log_debug_event(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
@@ -236,6 +372,7 @@ class SessionRecorder:
 
     def add_trial(self, trial: TrialRecord) -> None:
         self.trials.append(trial)
+        self._journal_append("trial", asdict(trial), durable=True)
         self._max_trial_count = max(self._max_trial_count, len(self.trials))
         self.log_event(
             "trial_end",
@@ -262,6 +399,7 @@ class SessionRecorder:
                 "events": serializable_rows,
             }
         )
+        self._journal_append("bpod_trial", self.bpod_trials[-1])
         self._max_bpod_trial_count = max(self._max_bpod_trial_count, len(self.bpod_trials))
         states = [
             row.get("state")
@@ -305,9 +443,13 @@ class SessionRecorder:
         self._buffer_streamdio_chunk(row)
 
     def finalize(self, summary: SessionSummary) -> Path:
+        if self._finalized:
+            raise RuntimeError(f"SessionRecorder already finalized: {self.base_path}")
         finalize_start = time.perf_counter()
         self.summary = summary
         self.log_event("session_end", {"end_reason": summary.end_reason})
+        self._journal_append("session_summary", asdict(summary), durable=True)
+        self.close_journal()
         self._finalize_streamdio_chunks()
 
         npz_path = self.base_path.with_suffix(".npz")
@@ -320,7 +462,7 @@ class SessionRecorder:
 
         npz_error: str | None = None
         try:
-            np.savez_compressed(
+            _atomic_write_npz(
                 npz_path,
                 trials=trials_arr,
                 events=events_arr,
@@ -396,7 +538,7 @@ class SessionRecorder:
         }
         if npz_error is not None:
             meta["npz_error"] = npz_error
-        json_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        _atomic_write_text(json_path, json.dumps(meta, indent=2))
         artifact_bytes = 0
         for path in (npz_path, json_path):
             if path.exists():
@@ -406,6 +548,7 @@ class SessionRecorder:
             if isinstance(self.metadata.get("config"), dict)
             else {}
         )
+        export_error: str | None = None
         if any(
             bool(options.get(name, True))
             for name in ("manifest", "config_snapshot", "export_csv_on_finalize", "export_timeline")
@@ -450,14 +593,29 @@ class SessionRecorder:
                 )
             except Exception as exc:
                 # Export duplication must never invalidate the primary NPZ/JSON data.
+                export_error = f"{type(exc).__name__}: {exc}"
                 export_error_path = self.base_path.with_name(
                     f"{self.base_path.name}_export_error.json"
                 )
-                export_error_path.write_text(
-                    json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2),
-                    encoding="utf-8",
+                _atomic_write_text(
+                    export_error_path,
+                    json.dumps({"error": export_error}, indent=2),
                 )
+        if json_path.exists() and npz_error is None and export_error is None:
+            try:
+                self._incomplete_marker_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._finalized = True
         return json_path if npz_error is not None else npz_path
+
+    @staticmethod
+    def recover(
+        path: Path | str,
+        *,
+        end_reason: str = "recovered_after_crash",
+    ) -> dict[str, Any]:
+        return recover_session_journal(path, end_reason=end_reason)
 
     def _configure_streamdio_chunking(self) -> None:
         if self._streamdio_chunk_thread is not None:
@@ -550,7 +708,7 @@ class SessionRecorder:
                 return
             try:
                 path = self._streamdio_chunk_dir / f"streamdio_chunk_{int(index):03d}.npz"
-                np.savez_compressed(
+                _atomic_write_npz(
                     path,
                     streamdio_events=self._streamdio_rows_to_structured(rows or []),
                 )
@@ -757,3 +915,247 @@ class SessionRecorder:
             ("host_perf_counter_s", "f8"),
         ]
         return np.array(rows, dtype=dtype)
+
+
+_JOURNAL_SUFFIX = ".journal.jsonl"
+
+
+def resolve_session_journal(path: Path | str) -> Path:
+    candidate = Path(path)
+    if candidate.is_dir():
+        incomplete = sorted(candidate.glob("*.incomplete.json"))
+        if len(incomplete) == 1:
+            candidate = incomplete[0]
+        else:
+            journals = sorted(candidate.glob(f"*{_JOURNAL_SUFFIX}"))
+            if len(journals) != 1:
+                raise FileNotFoundError(
+                    f"Expected one session journal in {candidate}, found {len(journals)}"
+                )
+            return journals[0]
+    if candidate.name.endswith(".incomplete.json"):
+        marker = json.loads(candidate.read_text(encoding="utf-8"))
+        journal_name = marker.get("journal")
+        if not journal_name:
+            raise ValueError(f"Incomplete marker has no journal field: {candidate}")
+        candidate = candidate.parent / str(journal_name)
+    elif not candidate.name.endswith(_JOURNAL_SUFFIX):
+        candidate = candidate.with_suffix(_JOURNAL_SUFFIX)
+    if not candidate.exists():
+        raise FileNotFoundError(candidate)
+    return candidate
+
+
+def load_session_journal(
+    path: Path | str,
+    *,
+    repair_trailing: bool = False,
+) -> tuple[list[dict[str, Any]], bool]:
+    journal_path = resolve_session_journal(path)
+    original = journal_path.read_text(encoding="utf-8")
+    lines = original.splitlines()
+    nonempty = [index for index, line in enumerate(lines) if line.strip()]
+    last_nonempty = nonempty[-1] if nonempty else -1
+    rows: list[dict[str, Any]] = []
+    repaired = False
+    valid_lines: list[str] = []
+    for index, line in enumerate(lines):
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            row = json.loads(text)
+        except json.JSONDecodeError as exc:
+            if repair_trailing and index == last_nonempty:
+                repaired = True
+                break
+            raise ValueError(
+                f"Invalid session journal JSON at {journal_path}:{index + 1}: {exc.msg}"
+            ) from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"Session journal row is not an object: {journal_path}:{index + 1}")
+        if row.get("schema_version") != 1:
+            raise ValueError(f"Unsupported session journal schema: {journal_path}:{index + 1}")
+        if row.get("sequence") != len(rows):
+            raise ValueError(
+                f"Session journal sequence mismatch: {journal_path}:{index + 1}: "
+                f"{row.get('sequence')} != {len(rows)}"
+            )
+        if not isinstance(row.get("payload"), dict):
+            raise ValueError(f"Session journal payload is not an object: {journal_path}:{index + 1}")
+        rows.append(row)
+        valid_lines.append(json.dumps(row, separators=(",", ":")))
+    if not rows or rows[0].get("kind") != "session_header":
+        raise ValueError(f"Session journal is missing its header: {journal_path}")
+    if repaired:
+        _backup_recovery_journal(journal_path, original)
+        _atomic_write_text(journal_path, "\n".join(valid_lines) + "\n")
+    return rows, repaired
+
+
+def _backup_recovery_journal(path: Path, original: str) -> Path:
+    backup = path.with_name(f"{path.name}.recovery-backup")
+    if not backup.exists():
+        _atomic_write_text(backup, original)
+    return backup
+
+
+def _remove_prior_journal_summaries(
+    path: Path,
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    filtered = [row for row in rows if row.get("kind") != "session_summary"]
+    if len(filtered) == len(rows):
+        return rows, False
+    original = path.read_text(encoding="utf-8")
+    _backup_recovery_journal(path, original)
+    for sequence, row in enumerate(filtered):
+        row["sequence"] = sequence
+    _atomic_write_text(
+        path,
+        "\n".join(json.dumps(row, separators=(",", ":")) for row in filtered) + "\n",
+    )
+    return filtered, True
+
+
+def recover_session_journal(
+    path: Path | str,
+    *,
+    end_reason: str = "recovered_after_crash",
+) -> dict[str, Any]:
+    journal_path = resolve_session_journal(path)
+    base_name = journal_path.name[: -len(_JOURNAL_SUFFIX)]
+    incomplete_marker = journal_path.with_name(f"{base_name}.incomplete.json")
+    manifest_candidates = (
+        journal_path.parent / "manifest.json",
+        journal_path.parent / f"{base_name}_bundle" / "manifest.json",
+    )
+    if not incomplete_marker.exists() and any(item.exists() for item in manifest_candidates):
+        raise RuntimeError(
+            f"Session is already finalized; refusing recovery without an incomplete marker: "
+            f"{journal_path.parent}"
+        )
+    rows, repaired_tail = load_session_journal(journal_path, repair_trailing=True)
+    if not incomplete_marker.exists() and any(
+        row.get("kind") == "session_summary" for row in rows
+    ):
+        raise RuntimeError(
+            f"Session journal already contains a final summary; refusing recovery without an "
+            f"incomplete marker: {journal_path.parent}"
+        )
+    rows, removed_summary = _remove_prior_journal_summaries(journal_path, rows)
+    header = dict(rows[0]["payload"])
+    subject_id = str(header.get("subject_id") or "unknown")
+    phase = str(header.get("phase") or "unknown")
+
+    recorder = SessionRecorder(
+        journal_path.parent,
+        subject_id,
+        phase,
+        base_name=base_name,
+        journal_mode="resume",
+    )
+    recorder.events.clear()
+    recorder.trials.clear()
+    recorder.bpod_trials.clear()
+    recorder.fsm_definitions.clear()
+    recorder.metadata.clear()
+    recorder.stream_summaries.clear()
+    recorder.export_options.clear()
+    recorder._session_start_wall = float(
+        header.get("session_start_wall_s", recorder._session_start_wall)
+    )
+    recorder._session_start_mono = float(
+        header.get("session_start_mono_s", recorder._session_start_mono)
+    )
+
+    for row in rows[1:]:
+        kind = row.get("kind")
+        payload = dict(row["payload"])
+        if kind == "event":
+            recorder.events.append(SessionEvent(**payload))
+        elif kind == "trial":
+            recorder.trials.append(TrialRecord(**payload))
+        elif kind == "bpod_trial":
+            recorder.bpod_trials.append(payload)
+        elif kind == "metadata":
+            recorder.metadata.update(payload)
+        elif kind == "export_options":
+            recorder.export_options.update(payload)
+        elif kind == "stream_summary":
+            name = str(payload.get("name") or "unknown")
+            summary = payload.get("summary")
+            if isinstance(summary, dict):
+                recorder.stream_summaries[name] = dict(summary)
+        elif kind == "fsm_definition":
+            name = payload.get("fsm_name")
+            fsm_json = payload.get("fsm_json")
+            if name is not None and fsm_json is not None:
+                recorder.fsm_definitions[str(name)] = str(fsm_json)
+
+    if recorder.stream_summaries:
+        recorder.metadata["stream_summaries"] = dict(recorder.stream_summaries)
+    recorder._max_event_count = len(recorder.events)
+    recorder._max_trial_count = len(recorder.trials)
+    recorder._max_bpod_trial_count = len(recorder.bpod_trials)
+
+    from hf_dm.data.session_export import session_bundle_dir, validate_session
+
+    layout = str(recorder.export_options.get("layout", "mm_hierarchy"))
+    chunk_dir = session_bundle_dir(recorder.base_path, layout=layout) / "continuous_streams"
+    recorder._streamdio_chunk_files = [str(item) for item in sorted(chunk_dir.glob("streamdio_chunk_*.npz"))]
+    recovered_streamdio = recorder._load_streamdio_chunk_rows()
+    recorder.streamdio_events = recovered_streamdio
+    recorder._streamdio_total_count = len(recovered_streamdio)
+    recorder._streamdio_counts = Counter(row[0] for row in recovered_streamdio)
+    recorder._max_streamdio_event_count = len(recovered_streamdio)
+    recorder._streamdio_chunk_s = float(recorder.export_options.get("streamdio_chunk_s", 0.0) or 0.0)
+    recorder._streamdio_memory_mode = str(
+        recorder.export_options.get("streamdio_memory_mode", "full")
+    )
+    recorder._streamdio_memory_bounded = bool(recorder._streamdio_chunk_files)
+
+    recorder.log_event(
+        "session_recovered",
+        {
+            "journal": str(journal_path),
+            "repaired_trailing_record": repaired_tail,
+            "replaced_prior_summary": removed_summary,
+            "recovered_trials": len(recorder.trials),
+            "recovered_bpod_trials": len(recorder.bpod_trials),
+            "recovered_streamdio_events": len(recovered_streamdio),
+        },
+    )
+    config_metadata = recorder.metadata.get("config")
+    planned = len(recorder.trials)
+    if isinstance(config_metadata, dict):
+        try:
+            planned = int(config_metadata.get("n_trials", planned))
+        except (TypeError, ValueError):
+            pass
+    summary = SessionSummary(
+        subject_id=subject_id,
+        phase=phase,
+        n_trials_planned=max(planned, len(recorder.trials)),
+        n_trials_completed=len(recorder.trials),
+        end_reason=str(end_reason),
+        consecutive_failures=0,
+        session_start_wall_s=recorder._session_start_wall,
+        session_end_wall_s=time.time(),
+        engagement_idle_triggered=False,
+    )
+    artifact = recorder.finalize(summary)
+    bundle_dir = session_bundle_dir(recorder.base_path, layout=layout)
+    validation = validate_session(bundle_dir)
+    return {
+        "journal": str(journal_path),
+        "artifact": str(artifact),
+        "bundle_dir": str(bundle_dir),
+        "manifest": validation.get("manifest"),
+        "validation": validation,
+        "repaired_trailing_record": repaired_tail,
+        "replaced_prior_summary": removed_summary,
+        "recovered_trials": len(recorder.trials),
+        "recovered_bpod_trials": len(recorder.bpod_trials),
+        "recovered_streamdio_events": len(recovered_streamdio),
+    }

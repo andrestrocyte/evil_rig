@@ -349,8 +349,10 @@ def make_session_bundle(
 
     manifest_path = bundle_dir / "manifest.json"
     chunk_paths = sorted(continuous_dir.glob("streamdio_chunk_*.npz"))
+    journal_path = Path(base_path).with_suffix(".journal.jsonl")
     artifact_paths = [
         json_path,
+        *([journal_path] if journal_path.exists() else []),
         *written,
         *_video_artifact_paths(bundle_dir, event_dicts),
         *chunk_paths,
@@ -1997,6 +1999,10 @@ def _validate_jsonl_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> 
     counts_by_kind: dict[str, int] = {}
     counts_by_message_type: dict[str, int] = {}
     is_monitor_telemetry = _relative_matches(rel, "exports/monitor_telemetry.jsonl")
+    is_session_journal = path.name.endswith(".journal.jsonl")
+    journal_counts: dict[str, int] = {}
+    journal_summary: dict[str, Any] | None = None
+    expected_sequence = 0
     try:
         with path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -2026,6 +2032,21 @@ def _validate_jsonl_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> 
                             counts_by_message_type[message_type] = (
                                 counts_by_message_type.get(message_type, 0) + 1
                             )
+                if is_session_journal:
+                    errors.extend(
+                        _validate_session_journal_row(
+                            row,
+                            rel,
+                            line_number,
+                            expected_sequence=expected_sequence,
+                        )
+                    )
+                    kind = row.get("kind")
+                    if isinstance(kind, str):
+                        journal_counts[kind] = journal_counts.get(kind, 0) + 1
+                        if kind == "session_summary" and isinstance(row.get("payload"), dict):
+                            journal_summary = dict(row["payload"])
+                    expected_sequence += 1
     except Exception as exc:
         return [f"jsonl unreadable: {rel}: {type(exc).__name__}: {exc}"]
     if is_monitor_telemetry:
@@ -2049,6 +2070,66 @@ def _validate_jsonl_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> 
             counts_by_message_type,
             rel,
         )
+    if is_session_journal:
+        if journal_counts.get("session_header") != 1:
+            errors.append(f"session journal must contain one header: {rel}")
+        if journal_counts.get("session_summary") != 1:
+            errors.append(f"session journal must contain one summary: {rel}")
+        manifest_counts = manifest.get("counts") or {}
+        for kind, manifest_key in (
+            ("trial", "trials"),
+            ("event", "events"),
+            ("bpod_trial", "bpod_trials"),
+        ):
+            expected = _optional_int(manifest_counts.get(manifest_key))
+            actual = journal_counts.get(kind, 0)
+            if expected is not None and actual != expected:
+                errors.append(
+                    f"session journal {kind} count mismatch: {rel}: {actual} != {expected}"
+                )
+        manifest_summary = manifest.get("summary") or {}
+        if journal_summary is not None:
+            for field in ("subject_id", "phase", "n_trials_completed", "end_reason"):
+                if field in manifest_summary and journal_summary.get(field) != manifest_summary.get(field):
+                    errors.append(f"session journal summary mismatch for {field}: {rel}")
+    return errors
+
+
+def _validate_session_journal_row(
+    row: dict[str, Any],
+    rel: str,
+    line_number: int,
+    *,
+    expected_sequence: int,
+) -> list[str]:
+    errors: list[str] = []
+    if row.get("schema_version") != 1:
+        errors.append(f"session journal schema mismatch: {rel}:{line_number}")
+    if row.get("sequence") != expected_sequence:
+        errors.append(
+            f"session journal sequence mismatch: {rel}:{line_number}: "
+            f"{row.get('sequence')} != {expected_sequence}"
+        )
+    kind = row.get("kind")
+    allowed = {
+        "session_header",
+        "metadata",
+        "export_options",
+        "stream_summary",
+        "fsm_definition",
+        "event",
+        "trial",
+        "bpod_trial",
+        "session_summary",
+    }
+    if kind not in allowed:
+        errors.append(f"session journal invalid kind: {rel}:{line_number}: {kind}")
+    if not isinstance(row.get("recorded_wall_s"), (int, float)):
+        errors.append(f"session journal invalid recorded_wall_s: {rel}:{line_number}")
+    if not isinstance(row.get("payload"), dict):
+        errors.append(f"session journal missing payload object: {rel}:{line_number}")
+    if expected_sequence == 0 and kind != "session_header":
+        errors.append(f"session journal first row is not a header: {rel}:{line_number}")
     return errors
 
 

@@ -175,6 +175,9 @@ latest module and cap-touch status plus snapshot counts are retained in the Stre
 ## Run
 
 ```bash
+# Validate all semantic settings without opening Bpod, StreamDIO, camera, or displays.
+hf-dm validate-config configs/dm_50.yaml
+
 # No-trial hardware preflight: Bpod/StreamDIO/Spinnaker streams and cleanup only.
 python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration 2
 
@@ -317,6 +320,8 @@ the saved `preflight_end` event reports wheel pulse/direction edges and cap-touc
 - Events: `session_start`, `trial_start`, `stimulus_on`, `force_on`, `choice_detected`, `feedback_on`, `frame2ttl_*`, `pump_start`, `pump_end`, `output_actual`, `lick`, `white_noise_*`, cleanup, `trial_end`, `session_end`
 - Video: every camera frame with camera and host timestamps in `frame_timestamps.csv`
 - Session summary: end reason (`completed`, `idle_timeout`, `max_consecutive_failures`)
+- Crash journal: append-only `session.journal.jsonl`; completed trials are flushed and fsynced before
+  the next trial. `session.incomplete.json` remains only when finalization did not complete.
 
 ### Session export bundle
 
@@ -346,6 +351,8 @@ The bundle includes:
   `recording_summary.json` / `frame_timestamps.csv` artifacts when present, a StreamDIO chunk
   index when chunking is enabled, and recorder stats including primary and derived artifact byte
   counts
+- `session.journal.jsonl`: ordered semantic events, completed trial records, exact Bpod rows,
+  metadata, and the final summary. The manifest validator checks its schema, sequence, and counts.
 - `config.snapshot.yaml`: source config path, source YAML text and SHA256 when available,
   recorded CLI/config overrides, plus the effective post-CLI config
 - `videos/spinnaker_video.json`: a bundle-local pointer to the Spinnaker recording directory,
@@ -380,6 +387,8 @@ Offline helpers:
 ```bash
 hf-dm export-session data/sessions/<session>.json
 hf-dm validate-session data/sessions/<session>_bundle
+hf-dm validate-config configs/dm_50.yaml
+hf-dm recover-session data/sessions/<phase>/<subject>/<date>/<run>
 hf-dm export-preview-video data/videos/<session>_spinnaker
 hf-dm export-session data/sessions/<session>.json --export-preview-video
 hf-dm rig-preflight --config configs/dm_50.yaml --duration 2 --no-monitor
@@ -395,6 +404,24 @@ Visual ROI setup temporarily opens the configured FLIR camera in full-frame, fre
 captures a frame, and lets OpenCV select a rectangle. Width, height, and offsets are snapped to the
 camera node increments before writing YAML. Cancelling leaves the file untouched. With
 `integrations.mm_flir_roi_gui: true`, omitting ROI numbers selects visual mode automatically.
+
+### Interrupted session recovery
+
+The recorder writes semantic records incrementally and performs an OS-level sync after every
+completed trial. A hard crash can therefore be recovered from the session directory, its
+`*.incomplete.json` marker, or its `*.journal.jsonl` file:
+
+```bash
+hf-dm recover-session data/sessions/decision_making/mouse01/2026-06-28/001
+```
+
+Recovery preserves the original journal before repairing a truncated final line, restores completed
+trials and Bpod rows, incorporates any completed StreamDIO chunks, atomically rewrites primary
+NPZ/JSON artifacts, and runs the normal manifest validator. The incomplete marker is removed only
+after primary writes and configured exports succeed.
+
+GitHub Actions runs critical Ruff checks and the hardware-free pytest suite on both Windows and
+Linux. Physical rig certification remains the job of `rig-preflight` and hardware diagnostics.
 
 `validate-session` checks manifest paths, byte sizes, and SHA256 hashes, verifies source-config
 provenance from `config.snapshot.yaml`, opens NPZ artifacts, verifies the primary session NPZ schema/counts,

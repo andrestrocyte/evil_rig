@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from hf_dm.config import SessionConfig, config_to_dict
+from hf_dm.config import SessionConfig, config_to_dict, validate_session_config
 from hf_dm.data.recorder import SessionRecorder, SessionSummary
 from hf_dm.data.session_export import resolve_session_output, session_bundle_dir
 
@@ -27,6 +27,7 @@ class SessionBundle:
         *,
         metadata: dict[str, Any] | None = None,
     ) -> "SessionBundle":
+        validate_session_config(config)
         out, base_name = resolve_session_output(
             Path(config.results_dir),
             subject_id=config.subject_id,

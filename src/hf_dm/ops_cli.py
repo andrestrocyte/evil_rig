@@ -11,7 +11,13 @@ from pathlib import Path
 
 import yaml
 
-from hf_dm.config import SessionConfig, config_to_dict
+from hf_dm.config import (
+    ConfigValidationError,
+    SessionConfig,
+    config_to_dict,
+    validate_session_config,
+)
+from hf_dm.data.recorder import recover_session_journal
 from hf_dm.data.session_export import (
     export_existing_session,
     session_bundle_dir,
@@ -39,6 +45,23 @@ def main() -> None:
 
     validate_parser = sub.add_parser("validate-session", help="Validate a session manifest")
     validate_parser.add_argument("session", type=Path, help="Session bundle, manifest, .json, or .npz")
+
+    config_parser = sub.add_parser(
+        "validate-config",
+        help="Validate task settings without opening hardware",
+    )
+    config_parser.add_argument("config", type=Path, help="Session YAML configuration")
+
+    recover_parser = sub.add_parser(
+        "recover-session",
+        help="Finalize an interrupted session from its durable journal",
+    )
+    recover_parser.add_argument(
+        "session",
+        type=Path,
+        help="Session directory, incomplete marker, or .journal.jsonl file",
+    )
+    recover_parser.add_argument("--end-reason", default="recovered_after_crash")
 
     preview_parser = sub.add_parser(
         "export-preview-video",
@@ -95,6 +118,46 @@ def main() -> None:
         if not result["valid"]:
             raise SystemExit(1)
         return
+    if args.command == "validate-config":
+        try:
+            config = validate_session_config(SessionConfig.from_yaml(args.config))
+            result = {
+                "valid": True,
+                "config": str(args.config),
+                "effective": config_to_dict(config),
+                "errors": [],
+            }
+        except ConfigValidationError as exc:
+            result = {
+                "valid": False,
+                "config": str(args.config),
+                "errors": [asdict(issue) for issue in exc.issues],
+            }
+        except Exception as exc:
+            result = {
+                "valid": False,
+                "config": str(args.config),
+                "errors": [
+                    {
+                        "field": "config",
+                        "message": f"{type(exc).__name__}: {exc}",
+                        "value": None,
+                    }
+                ],
+            }
+        print(json.dumps(result, indent=2))
+        if not result["valid"]:
+            raise SystemExit(1)
+        return
+    if args.command == "recover-session":
+        result = recover_session_journal(
+            args.session,
+            end_reason=args.end_reason,
+        )
+        print(json.dumps(result, indent=2))
+        if not result["validation"]["valid"]:
+            raise SystemExit(1)
+        return
     if args.command == "export-preview-video":
         result = export_preview_video(
             args.session,
@@ -113,6 +176,7 @@ def main() -> None:
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         )
         config = SessionConfig.from_yaml(args.config)
+        validate_session_config(config)
         config.session_export.source_config_path = str(args.config)
         if args.monitor:
             config.monitor.enabled = True
@@ -376,8 +440,21 @@ def _streamdio_module_status(session: HFDecisionSession) -> dict[str, object]:
     if callable(getter):
         try:
             return dict(getter())
-        except Exception as exc:
-            return {"error": f"{type(exc).__name__}: {exc}"}
+        except Exception:
+            pass
+    cached = getattr(session, "_latest_streamdio_module_status", None)
+    if isinstance(cached, dict) and cached:
+        return {"source": "cached_status_poll", **cached}
+    raw = getattr(dio, "raw", None)
+    module_info = getattr(raw, "module_info", None)
+    if isinstance(module_info, dict) and module_info:
+        return {"source": "connection_metadata", "module_info": dict(module_info)}
+    recorder = getattr(session, "recorder", None)
+    summaries = getattr(recorder, "stream_summaries", None)
+    if isinstance(summaries, dict):
+        streamdio = summaries.get("streamdio")
+        if isinstance(streamdio, dict) and streamdio:
+            return {"source": "session_stream_summary", **streamdio}
     return {}
 
 
