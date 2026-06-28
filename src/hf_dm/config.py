@@ -184,7 +184,7 @@ class MonitorConfig:
     height: int = 940
     fps: int = 30
     history_s: float = 20.0
-    trial_history: int = 12
+    trial_history: int = 10
     queue_size: int = 512
     force_sample_hz: float = 80.0
     wheel_sample_hz: float = 60.0
@@ -201,7 +201,7 @@ class MonitorConfig:
 
 @dataclass
 class SessionExportConfig:
-    layout: str = "flat"
+    layout: str = "mm_hierarchy"
     manifest: bool = True
     config_snapshot: bool = True
     export_csv_on_finalize: bool = True
@@ -582,7 +582,7 @@ class SessionConfig:
                 height=int(monitor_raw.get("height", 940)),
                 fps=int(monitor_raw.get("fps", 30)),
                 history_s=float(monitor_raw.get("history_s", 20.0)),
-                trial_history=int(monitor_raw.get("trial_history", 12)),
+                trial_history=int(monitor_raw.get("trial_history", 10)),
                 queue_size=int(monitor_raw.get("queue_size", 512)),
                 force_sample_hz=float(monitor_raw.get("force_sample_hz", 80.0)),
                 wheel_sample_hz=float(monitor_raw.get("wheel_sample_hz", 60.0)),
@@ -605,7 +605,7 @@ class SessionConfig:
                 ),
             ),
             session_export=SessionExportConfig(
-                layout=str(session_export_raw.get("layout", "flat")),
+                layout=str(session_export_raw.get("layout", "mm_hierarchy")),
                 manifest=bool(session_export_raw.get("manifest", True)),
                 config_snapshot=bool(
                     session_export_raw.get("config_snapshot", True)

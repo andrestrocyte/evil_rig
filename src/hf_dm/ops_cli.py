@@ -57,7 +57,7 @@ def main() -> None:
     preflight_parser.add_argument("--no-monitor", action="store_true")
     preflight_parser.add_argument("-v", "--verbose", action="store_true")
 
-    roi_parser = sub.add_parser("camera-roi-setup", help="Write optional Spinnaker ROI fields to YAML")
+    roi_parser = sub.add_parser("camera-roi-setup", help="Select or write Spinnaker ROI fields")
     roi_parser.add_argument("--config", type=Path, required=True)
     roi_parser.add_argument("--output", type=Path, default=None)
     roi_parser.add_argument("--width", type=int, default=None)
@@ -68,6 +68,11 @@ def main() -> None:
         "--interactive",
         action="store_true",
         help="Prompt for missing ROI fields using the current YAML values as defaults",
+    )
+    roi_parser.add_argument(
+        "--visual",
+        action="store_true",
+        help="Acquire a full FLIR frame and select the ROI visually",
     )
     roi_parser.add_argument("--clear", action="store_true", help="Remove ROI fields from the YAML")
 
@@ -161,6 +166,7 @@ def main() -> None:
             offset_x=args.offset_x,
             offset_y=args.offset_y,
             interactive=args.interactive,
+            visual=args.visual,
             clear=args.clear,
         )
         print(json.dumps(result, indent=2))
@@ -194,21 +200,77 @@ def _write_camera_roi(
     offset_x: int | None,
     offset_y: int | None,
     interactive: bool,
+    visual: bool,
     clear: bool,
 ) -> dict[str, object]:
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     camera = dict(raw.get("camera") or {})
+    integrations = dict(raw.get("integrations") or {})
     keys = {
         "roi_width": width,
         "roi_height": height,
         "roi_offset_x": offset_x,
         "roi_offset_y": offset_y,
     }
+    supplied_coordinates = any(value is not None for value in keys.values())
+    if clear and (visual or interactive or supplied_coordinates):
+        raise SystemExit(
+            "camera-roi-setup --clear cannot be combined with other ROI modes or numbers"
+        )
+    if visual and (interactive or supplied_coordinates):
+        raise SystemExit(
+            "camera-roi-setup --visual cannot be combined with --interactive or ROI numbers"
+        )
+    use_visual = bool(visual) or (
+        bool(integrations.get("mm_flir_roi_gui", False))
+        and not clear
+        and not interactive
+        and all(value is None for value in keys.values())
+    )
+    if clear:
+        mode = "clear"
+    elif use_visual:
+        mode = "visual"
+    elif interactive:
+        mode = "interactive"
+    else:
+        mode = "numeric"
     if clear:
         for key in keys:
             camera.pop(key, None)
     else:
-        if interactive:
+        if use_visual:
+            from hf_dm.camera.roi_gui import select_spinnaker_roi
+
+            selected = select_spinnaker_roi(
+                serial_number=(
+                    str(camera["serial_number"])
+                    if camera.get("serial_number") not in (None, "")
+                    else None
+                ),
+                exposure_us=int(camera.get("exposure_us", 10_000)),
+                gain_db=(
+                    float(camera["gain_db"])
+                    if camera.get("gain_db") not in (None, "")
+                    else None
+                ),
+                pixel_format=str(camera.get("pixel_format", "Mono8")),
+            )
+            if selected is None:
+                return {
+                    "config": str(config_path),
+                    "output": None,
+                    "mode": "visual",
+                    "cancelled": True,
+                    "roi": None,
+                }
+            keys = {
+                "roi_width": selected["width"],
+                "roi_height": selected["height"],
+                "roi_offset_x": selected["offset_x"],
+                "roi_offset_y": selected["offset_y"],
+            }
+        elif interactive:
             keys = {
                 "roi_width": _prompt_roi_int("ROI width", width, camera.get("roi_width")),
                 "roi_height": _prompt_roi_int("ROI height", height, camera.get("roi_height")),
@@ -238,6 +300,8 @@ def _write_camera_roi(
     return {
         "config": str(config_path),
         "output": str(target),
+        "mode": mode,
+        "cancelled": False,
         "roi": None
         if clear
         else {

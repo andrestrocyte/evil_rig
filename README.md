@@ -123,13 +123,13 @@ video:
   duplicate_preview_video: false  # opt-in offline FFV1 AVI from saved PGM frames
 ```
 
-Optional MM-inspired integrations remain cold-path and disabled unless configured:
+Optional MM-inspired integrations remain cold-path:
 
 ```yaml
 integrations:
   mm_soundcard_status: true
   mm_alyx_register: false         # uses ALYX_API_URL/ALYX_TOKEN or alyx_* fields
-  mm_flir_roi_gui: false          # ROI is managed by hf-dm camera-roi-setup
+  mm_flir_roi_gui: true           # no-argument camera-roi-setup opens visual selection
 ```
 
 The session writes a frame sequence, `frame_timestamps.csv`, and `recording_summary.json` under
@@ -149,7 +149,8 @@ The official configs enable a separate lightweight monitor on the computer/main 
 drop-safe telemetry, so closing or slowing the GUI does not stall the Bpod/StreamDIO task loop.
 
 It shows a low-rate camera preview, a compact left-rotated task screen copy, the active Bpod FSM
-state, latest star/circle/timeout outcome squares, lick-edge/pump/noise event rails, raw cap-touch
+state, a one-row rolling history of the latest 10 star/circle/timeout outcome icons,
+lick-edge/pump/noise event rails, raw cap-touch
 pin status, a live force-effort ADC trace with a session-held y-axis maximum, and the wheel trace
 reset every trial.
 Use `--no-monitor` for command-line checks, or `--monitor` to force it on when a YAML file has it
@@ -323,19 +324,20 @@ The `session_export:` YAML block controls derived data products:
 
 ```yaml
 session_export:
-  layout: flat                 # flat | mm_hierarchy
+  layout: mm_hierarchy         # production default; flat remains available
   manifest: true
   config_snapshot: true
   export_csv_on_finalize: true
   export_timeline: true
-  streamdio_chunk_s: 0         # >0 writes duplicate chunk NPZs in a background thread
-  streamdio_memory_mode: full   # full | bounded; bounded keeps only recent rows in RAM
+  streamdio_chunk_s: 0         # dm_200 uses 45 seconds
+  streamdio_memory_mode: full  # dm_200 uses bounded; full suits shorter tasks
   streamdio_recent_events: 50000
 ```
 
-`layout: flat` preserves the current primary artifact paths and creates a per-session
-`*_bundle/` directory. `layout: mm_hierarchy` is opt-in and writes into
+`layout: mm_hierarchy` is the production default and writes into
 `data/sessions/<phase>/<subject>/<YYYY-MM-DD>/<run_id>/session.npz`.
+`layout: flat` remains available for legacy primary artifact paths and creates a per-session
+`*_bundle/` directory.
 
 The bundle includes:
 
@@ -363,7 +365,8 @@ The bundle includes:
   such as individual choice-loop stalls stay out of the main semantic event list, while aggregate
   counts remain in `TrialRecord` and manifest `recorder_stats`
 
-For very long sessions, set `streamdio_chunk_s` and `streamdio_memory_mode: bounded`. The live task
+The official `dm_200` profile sets `streamdio_chunk_s: 45` and
+`streamdio_memory_mode: bounded`. For other very long sessions, enable the same pair. The live task
 then keeps only the most recent `streamdio_recent_events` rows in memory, writes completed chunks in
 a daemon thread, and reconstructs the full primary NPZ/CSV/timeline from those chunks at finalize.
 
@@ -382,10 +385,16 @@ hf-dm export-session data/sessions/<session>.json --export-preview-video
 hf-dm rig-preflight --config configs/dm_50.yaml --duration 2 --no-monitor
 hf-dm camera-roi-setup --config configs/dm_50.yaml --output configs/dm_50_roi.yaml --width 640 --height 480 --offset-x 0 --offset-y 0
 hf-dm camera-roi-setup --config configs/dm_50.yaml --output configs/dm_50_roi.yaml --interactive
+hf-dm camera-roi-setup --config configs/dm_50.yaml --output configs/dm_50_roi.yaml --visual
 
 hf-dm-export-session data/sessions/<session>.json
 hf-dm-validate-session data/sessions/<session>_bundle
 ```
+
+Visual ROI setup temporarily opens the configured FLIR camera in full-frame, free-running mode,
+captures a frame, and lets OpenCV select a rectangle. Width, height, and offsets are snapped to the
+camera node increments before writing YAML. Cancelling leaves the file untouched. With
+`integrations.mm_flir_roi_gui: true`, omitting ROI numbers selects visual mode automatically.
 
 `validate-session` checks manifest paths, byte sizes, and SHA256 hashes, verifies source-config
 provenance from `config.snapshot.yaml`, opens NPZ artifacts, verifies the primary session NPZ schema/counts,

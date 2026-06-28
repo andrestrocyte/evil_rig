@@ -14,6 +14,7 @@ from hf_dm.hardware.bringup_constants import (
 )
 from hf_dm.monitor import OperatorMonitor, OperatorMonitorState
 from hf_dm.monitor.gui import (
+    _MonitorWindow,
     _MonitorTelemetryRecorder,
     _frame_age_text,
     _frame_to_netpbm,
@@ -227,6 +228,84 @@ def test_operator_monitor_state_tracks_trials_events_and_recent_frames():
     assert state.camera_frame_count == 1
     assert state.last_camera_frame_mono_s is not None
     assert state.outcomes[-1]["chosen_shape"] == "star"
+
+
+def test_choice_history_is_a_rolling_ten_and_replaces_trial_updates():
+    state = OperatorMonitorState(history_s=10.0, trial_history=12)
+
+    for trial_index in range(1, 13):
+        state.apply(
+            {
+                "type": "trial_result",
+                "payload": {
+                    "trial_index": trial_index,
+                    "chosen_shape": "star" if trial_index % 2 else "circle",
+                    "responded": True,
+                    "matched": False,
+                },
+            }
+        )
+
+    assert state.trial_history == 10
+    assert [outcome["trial_index"] for outcome in state.outcomes] == list(range(3, 13))
+
+    state.apply(
+        {
+            "type": "trial_result",
+            "payload": {
+                "trial_index": 12,
+                "chosen_shape": "star",
+                "responded": True,
+                "matched": True,
+            },
+        }
+    )
+
+    assert len(state.outcomes) == 10
+    assert [outcome["trial_index"] for outcome in state.outcomes] == list(range(3, 13))
+    assert state.outcomes[-1]["chosen_shape"] == "star"
+    assert state.outcomes[-1]["matched"]
+
+
+def test_choice_history_renderer_places_all_ten_icons_in_one_row():
+    state = OperatorMonitorState(history_s=10.0, trial_history=12)
+    for trial_index in range(1, 13):
+        state.apply(
+            {
+                "type": "trial_result",
+                "payload": {
+                    "trial_index": trial_index,
+                    "chosen_shape": "circle",
+                    "responded": True,
+                    "matched": True,
+                },
+            }
+        )
+
+    class Canvas:
+        def __init__(self):
+            self.rectangles = []
+
+        def create_rectangle(self, *coordinates, **_kwargs):
+            self.rectangles.append(coordinates)
+
+        def create_text(self, *_args, **_kwargs):
+            pass
+
+        def create_oval(self, *_args, **_kwargs):
+            pass
+
+    window = object.__new__(_MonitorWindow)
+    window.state = state
+    window.canvas = Canvas()
+
+    window._draw_outcomes(10, 20, 300, 50)
+
+    assert len(window.canvas.rectangles) == 10
+    assert [coordinates[0] for coordinates in window.canvas.rectangles] == [
+        10 + index * 30 for index in range(10)
+    ]
+    assert all(coordinates[1] == 20 for coordinates in window.canvas.rectangles)
 
 
 def test_operator_monitor_state_tracks_latest_camera_and_task_frame_counts():

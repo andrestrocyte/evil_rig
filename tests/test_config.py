@@ -86,6 +86,34 @@ session_export:
     ]
 
 
+def test_production_defaults_use_mm_layout_and_ten_choice_history():
+    config = SessionConfig()
+
+    assert config.session_export.layout == "mm_hierarchy"
+    assert config.monitor.trial_history == 10
+
+
+def test_dm_200_uses_bounded_streamdio_chunks():
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "dm_200.yaml"
+    config = SessionConfig.from_yaml(config_path)
+
+    assert config.session_export.layout == "mm_hierarchy"
+    assert config.session_export.streamdio_chunk_s == 45
+    assert config.session_export.streamdio_memory_mode == "bounded"
+    assert config.monitor.trial_history == 10
+    assert config.integrations.mm_flir_roi_gui
+
+
+def test_official_profiles_use_mm_layout_visual_roi_and_ten_choices():
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+
+    for filename in ("centering_50.yaml", "dm_50.yaml", "dm_100.yaml", "dm_200.yaml"):
+        config = SessionConfig.from_yaml(config_dir / filename)
+        assert config.session_export.layout == "mm_hierarchy", filename
+        assert config.monitor.trial_history == 10, filename
+        assert config.integrations.mm_flir_roi_gui, filename
+
+
 def test_monitor_record_path_loads_from_yaml():
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "config.yaml"

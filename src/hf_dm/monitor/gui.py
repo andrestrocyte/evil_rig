@@ -52,6 +52,8 @@ _BPOD_STATE_COLORS = {
     "Abort": "#d64545",
 }
 
+_MAX_CHOICE_HISTORY = 10
+
 
 @dataclass(frozen=True)
 class MonitorDisplayBounds:
@@ -329,9 +331,9 @@ class OperatorMonitor:
 class OperatorMonitorState:
     """Pure dashboard model kept separate from Tk rendering for tests."""
 
-    def __init__(self, *, history_s: float = 20.0, trial_history: int = 12):
+    def __init__(self, *, history_s: float = 20.0, trial_history: int = 10):
         self.history_s = max(1.0, float(history_s))
-        self.trial_history = max(1, int(trial_history))
+        self.trial_history = min(_MAX_CHOICE_HISTORY, max(1, int(trial_history)))
         self.session_info: dict[str, Any] = {}
         self.summary: dict[str, Any] = {}
         self.current_trial: int | None = None
@@ -429,7 +431,7 @@ class OperatorMonitorState:
             if payload.get("trial_index") is not None:
                 self.current_trial = _optional_int(payload.get("trial_index"))
         elif event_type == "trial_result":
-            self.outcomes.append(payload)
+            self._update_outcome(payload)
             self.current_phase = "iti"
         elif event_type == "force_sample":
             value = _optional_float(payload.get("value"))
@@ -548,6 +550,21 @@ class OperatorMonitorState:
             and float(self.bpod_state_marker_events[0].get("mono_s", 0.0)) < cutoff
         ):
             self.bpod_state_marker_events.popleft()
+
+    def _update_outcome(self, payload: dict[str, Any]) -> None:
+        """Append a trial once, replacing a repeated update in its existing slot."""
+        trial_index = _optional_int(payload.get("trial_index"))
+        if trial_index is None:
+            self.outcomes.append(payload)
+            return
+        outcomes = list(self.outcomes)
+        for index, outcome in enumerate(outcomes):
+            if _optional_int(outcome.get("trial_index")) == trial_index:
+                outcomes[index] = payload
+                self.outcomes.clear()
+                self.outcomes.extend(outcomes)
+                return
+        self.outcomes.append(payload)
 
 
 def _optional_float(value: Any) -> float | None:
@@ -1143,34 +1160,29 @@ class _MonitorWindow:
         self._draw_outcomes(ix, iy, iw, ih)
 
     def _draw_outcomes(self, x: int, y: int, w: int, h: int) -> None:
-        row_h = max(38, min(54, h))
-        col_w = max(54, min(72, w // max(1, min(self.state.trial_history, 6))))
-        symbol_r = max(10, min(14, row_h // 3))
-        max_cols = max(1, w // col_w)
-        for idx, outcome in enumerate(list(self.state.outcomes)[-self.state.trial_history :]):
-            col = idx % max_cols
-            row = idx // max_cols
-            yy = y + row * row_h
-            if yy + row_h > y + h:
-                break
-            xx = x + col * col_w
+        outcomes = list(self.state.outcomes)[-_MAX_CHOICE_HISTORY:]
+        slot_count = max(1, _MAX_CHOICE_HISTORY)
+        col_w = max(1, w // slot_count)
+        box_w = max(20, min(col_w - 4, 48))
+        box_h = max(32, min(h, 44))
+        symbol_r = max(6, min(11, box_h // 4, box_w // 4))
+        for idx, outcome in enumerate(outcomes):
+            xx = x + idx * col_w
             chosen_shape = outcome.get("chosen_shape")
             responded = bool(outcome.get("responded", chosen_shape in ("star", "circle")))
             matched = bool(outcome.get("matched", False))
             fill = "#49b979" if matched else "#5b9ee8" if responded else "#e06060"
-            box_w = min(col_w - 8, 58)
-            box_h = min(row_h - 8, 44)
-            self.canvas.create_rectangle(xx, yy, xx + box_w, yy + box_h, fill="#f8fafb", outline="#d7dde2")
+            self.canvas.create_rectangle(xx, y, xx + box_w, y + box_h, fill="#f8fafb", outline="#d7dde2")
             self.canvas.create_text(
-                xx + 6,
-                yy + 8,
+                xx + 4,
+                y + 7,
                 anchor="w",
                 text=str(outcome.get("trial_index", "")),
                 fill="#687780",
-                font=("Segoe UI", 8, "bold"),
+                font=("Segoe UI", 7, "bold"),
             )
-            cx = xx + box_w // 2 + 8
-            cy = yy + box_h // 2 + 4
+            cx = xx + box_w // 2
+            cy = y + box_h // 2 + 6
             if chosen_shape == "star":
                 self._draw_star(cx, cy, symbol_r, fill)
             elif chosen_shape == "circle":

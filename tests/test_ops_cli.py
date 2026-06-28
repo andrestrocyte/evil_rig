@@ -130,6 +130,89 @@ def test_ops_cli_camera_roi_setup_interactive_prompts(tmp_path, monkeypatch, cap
     assert "roi_offset_y: 24" in written
 
 
+def test_ops_cli_camera_roi_setup_selects_visual_roi(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "config.yaml"
+    output_path = tmp_path / "roi.yaml"
+    config_path.write_text(
+        "camera:\n  frequency_hz: 30\n  serial_number: CAM1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "hf_dm.camera.roi_gui.select_spinnaker_roi",
+        lambda **_kwargs: {"width": 640, "height": 480, "offset_x": 16, "offset_y": 8},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hf-dm",
+            "camera-roi-setup",
+            "--config",
+            str(config_path),
+            "--output",
+            str(output_path),
+            "--visual",
+        ],
+    )
+
+    main()
+
+    result = json.loads(capsys.readouterr().out)
+    written = output_path.read_text(encoding="utf-8")
+    assert result["mode"] == "visual"
+    assert not result["cancelled"]
+    assert result["roi"] == {"width": 640, "height": 480, "offset_x": 16, "offset_y": 8}
+    assert "roi_width: 640" in written
+    assert "roi_offset_x: 16" in written
+
+
+def test_ops_cli_camera_roi_setup_cancel_preserves_config(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "config.yaml"
+    original = "camera:\n  frequency_hz: 30\n"
+    config_path.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(
+        "hf_dm.camera.roi_gui.select_spinnaker_roi",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hf-dm", "camera-roi-setup", "--config", str(config_path), "--visual"],
+    )
+
+    main()
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["cancelled"]
+    assert result["output"] is None
+    assert config_path.read_text(encoding="utf-8") == original
+
+
+def test_ops_cli_camera_roi_setup_rejects_visual_numeric_mix(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("camera:\n  frequency_hz: 30\n", encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hf-dm",
+            "camera-roi-setup",
+            "--config",
+            str(config_path),
+            "--visual",
+            "--width",
+            "640",
+        ],
+    )
+
+    try:
+        main()
+    except SystemExit as exc:
+        assert "cannot be combined" in str(exc)
+    else:
+        raise AssertionError("visual and numeric ROI modes were accepted together")
+
+
 def test_ops_cli_export_preview_video(tmp_path, monkeypatch, capsys):
     video_dir = tmp_path / "video"
     video_dir.mkdir()
