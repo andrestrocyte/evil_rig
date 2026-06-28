@@ -10,8 +10,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from hf_dm.config import SessionConfig
+from hf_dm.config import SessionConfig, config_to_dict
 from hf_dm.data.recorder import SessionRecorder
+from hf_dm.data.session_export import resolve_session_output
 from hf_dm.display.pygame_display import TaskDisplay
 from hf_dm.fsm.relay import RelayMessageIds
 from hf_dm.fsm.runtime import TrialRuntime
@@ -25,7 +26,7 @@ from hf_dm.hardware.bringup_constants import (
 )
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.simulated_bpod import SimulatedBpod
-from hf_dm.streamdio.wheel import Direction, WheelKinematics
+from hf_dm.streamdio.wheel import Direction, WheelKinematics, _percentile
 
 SimChoiceMode = Literal["matched", "opposite", "timeout", "cw", "ccw", "alternate"]
 
@@ -65,6 +66,7 @@ class SimulatedWheel:
         self.force_last: float | None = None
         self.force_min: float | None = None
         self.force_max: float | None = None
+        self.force_values: list[float] = []
         self.last_pulse_monotonic = time.perf_counter()
 
     def handle_event(
@@ -92,10 +94,12 @@ class SimulatedWheel:
             self.force_samples += 1
             self.force_last = 1000.0 + abs(self.net_pulses) * 2.0
             self.force_sum += self.force_last
+            self.force_values.append(self.force_last)
             self.force_min = self.force_last if self.force_min is None else min(self.force_min, self.force_last)
             self.force_max = self.force_last if self.force_max is None else max(self.force_max, self.force_last)
 
         force_mean = self.force_sum / self.force_samples if self.force_samples else None
+        force_p95 = _percentile(self.force_values, 95.0) if self.force_values else None
         return {
             "net_pulses": self.net_pulses,
             "cw_pulses": self.cw_pulses,
@@ -103,6 +107,7 @@ class SimulatedWheel:
             "force_samples": self.force_samples,
             "force_last": self.force_last,
             "force_mean": force_mean,
+            "force_p95": force_p95,
             "force_min": self.force_min,
             "force_max": self.force_max,
             "quiescent_for_s": time.perf_counter() - self.last_pulse_monotonic,
@@ -404,12 +409,30 @@ class SimulatedHFDecisionSession(HFDecisionSession):
         self.speaker_relay = SimulatedSpeakerRelay()
         self.dio = SimulatedDIO()
         self.display = TaskDisplay(self.config.display, self.config.frame2ttl)
-        self.recorder = SessionRecorder(
+        out, base_name = resolve_session_output(
             Path(self.config.results_dir),
+            subject_id=self.config.subject_id,
+            phase=self.config.phase.value,
+            layout=self.config.session_export.layout,
+        )
+        self.recorder = SessionRecorder(
+            out,
             self.config.subject_id,
             self.config.phase.value,
+            base_name=base_name,
         )
+        self.recorder.set_export_options(config_to_dict(self.config)["session_export"])
         self.recorder.set_metadata(self._session_metadata())
+        self.recorder.register_stream(
+            "streamdio",
+            {
+                "type": "streamdio_sim",
+                "force_channel": self.config.wheel.force_channel,
+                "lick_channels": list(self.config.licks.channels),
+                "frame2ttl_channels": self._frame2ttl_input_channels(),
+            },
+        )
+        self._configure_monitor_record_path()
         self._start_operator_monitor()
         if self.config.camera.record_video:
             video = SimulatedVideoRecorder(
@@ -425,6 +448,16 @@ class SimulatedHFDecisionSession(HFDecisionSession):
             )
             session_dir = video.start()
             self.camera_recorder = video
+            self.recorder.register_stream(
+                "spinnaker_video",
+                {
+                    "type": "spinnaker_sim",
+                    "backend": "spinnaker_sim",
+                    "save_dir": str(session_dir),
+                    "target_trigger_hz": self.config.camera.frequency_hz,
+                    "exposure_us": self.config.camera.exposure_us,
+                },
+            )
             self.recorder.log_event(
                 "video_recording_started",
                 {"backend": "spinnaker_sim", "save_dir": str(session_dir)},

@@ -110,6 +110,48 @@ def test_raw_streamdio_events_accept_camera_none_fields_and_log_licks(tmp_path):
     assert [event.event_type for event in session.recorder.events].count("lick") == 1
 
 
+def test_streamdio_status_snapshot_is_bounded_debug_data_and_stream_summary(tmp_path):
+    session = HFDecisionSession(SessionConfig())
+    session.recorder = SessionRecorder(tmp_path, "S1", "dm")
+    session.recorder.register_stream("streamdio", {"type": "streamdio", "stream_port": "COM7"})
+    session.dio = MagicMock()
+    session.dio.get_module_status.return_value = {
+        "streaming_active": True,
+        "analog_input_status": {"channel": 13},
+    }
+    session._cap_touch_status_snapshot_count = 2
+    session._latest_cap_touch_status = {"channel": LICK_INPUT_CHANNEL, "last_value": 812}
+
+    session._capture_streamdio_module_status(12.5)
+    session._update_streamdio_status_summary()
+
+    assert [event.event_type for event in session.recorder.events] == ["session_start"]
+    assert session.recorder.debug_event_counts == {"streamdio_module_status_snapshot": 1}
+    status_poll = session.recorder.get_stream_summaries()["streamdio"]["status_poll"]
+    assert status_poll["module_status_snapshot_count"] == 1
+    assert status_poll["module_status_error_count"] == 0
+    assert status_poll["cap_touch_status_snapshot_count"] == 2
+    assert status_poll["latest_module_status"]["streaming_active"] is True
+    assert status_poll["latest_cap_touch_status"]["last_value"] == 812
+
+
+def test_prepare_bpod_run_records_discarded_idle_serial_bytes(tmp_path):
+    session = HFDecisionSession(SessionConfig())
+    session.recorder = SessionRecorder(tmp_path, "S1", "dm")
+    session.speaker_relay = MagicMock()
+    session.speaker_relay.prepare_bpod_run.return_value = 5
+
+    session._prepare_bpod_run(3)
+
+    event = session.recorder.events[-1]
+    assert event.event_type == "bpod_serial_input_discarded"
+    assert event.payload == {
+        "trial_number": 3,
+        "byte_count": 5,
+        "reason": "idle_module_relay_bytes_before_fsm",
+    }
+
+
 def test_run_finalizes_after_video_and_hardware_cleanup(tmp_path):
     cfg = SessionConfig(n_trials=1, results_dir=str(tmp_path))
     session = OneTrialSession(cfg)

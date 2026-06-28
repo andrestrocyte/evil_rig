@@ -1,3 +1,4 @@
+import json
 import queue
 
 from hf_dm.config import MonitorConfig, SessionConfig
@@ -13,6 +14,7 @@ from hf_dm.hardware.bringup_constants import (
 )
 from hf_dm.monitor import OperatorMonitor, OperatorMonitorState
 from hf_dm.monitor.gui import (
+    _MonitorTelemetryRecorder,
     _frame_age_text,
     _frame_to_netpbm,
     _frame_to_pillow_image,
@@ -305,6 +307,27 @@ def test_operator_monitor_replaces_stale_frames_per_source_queue():
     assert monitor.published_counts["camera_frame"] == 2
     assert monitor.published_counts["task_frame"] == 1
     assert monitor.dropped_frames == 1
+
+
+def test_monitor_telemetry_recorder_writes_compact_jsonl(tmp_path):
+    path = tmp_path / "monitor_telemetry.jsonl"
+    recorder = _MonitorTelemetryRecorder(str(path))
+
+    recorder.write_message(
+        "frame",
+        {
+            "type": "camera_frame",
+            "payload": {"frame_index": 1, "data": b"abcd", "width": 2, "height": 2},
+        },
+    )
+    recorder.write_status({"render_count": 1})
+    recorder.close()
+
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["kind"] == "frame"
+    assert rows[0]["message"]["payload"]["data"] == "<4 bytes>"
+    assert rows[1]["kind"] == "status"
+    assert rows[1]["message"]["payload"]["render_count"] == 1
 
 
 def test_operator_monitor_drains_latest_child_status():

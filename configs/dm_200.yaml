@@ -104,5 +104,27 @@ monitor:
   task_preview_width: 220
   task_preview_height: 120
   task_preview_rotate_left: true
+  streamdio_status_interval_s: 30.0
+  record_path: auto
+
+video:
+  record_video: true
+  export_spinnaker_summary: true
+  duplicate_preview_video: false
+
+integrations:
+  mm_soundcard_status: true
+  mm_alyx_register: false
+  mm_flir_roi_gui: false
+
+session_export:
+  layout: flat
+  manifest: true
+  config_snapshot: true
+  export_csv_on_finalize: true
+  export_timeline: true
+  streamdio_chunk_s: 0
+  streamdio_memory_mode: full
+  streamdio_recent_events: 50000
 
 results_dir: data/sessions

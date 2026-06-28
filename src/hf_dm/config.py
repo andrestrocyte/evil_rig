@@ -147,6 +147,31 @@ class CameraConfig:
     pixel_format: str = "Mono8"
     acquisition_timeout_ms: int = 1000
     save_dir: str = "data/videos"
+    roi_width: int | None = None
+    roi_height: int | None = None
+    roi_offset_x: int | None = None
+    roi_offset_y: int | None = None
+
+
+@dataclass
+class VideoExportConfig:
+    record_video: bool | None = None
+    export_spinnaker_summary: bool = True
+    duplicate_preview_video: bool = False
+    preview_video_codec: str = "FFV1"
+    preview_video_fps: float | None = None
+
+
+@dataclass
+class IntegrationConfig:
+    mm_soundcard_status: bool = True
+    mm_alyx_register: bool = False
+    mm_flir_roi_gui: bool = False
+    alyx_api_url: str | None = None
+    alyx_token: str | None = None
+    alyx_project: str | None = None
+    alyx_user: str | None = None
+    alyx_timeout_s: float = 5.0
 
 
 @dataclass
@@ -170,6 +195,22 @@ class MonitorConfig:
     task_preview_width: int = 220
     task_preview_height: int = 120
     task_preview_rotate_left: bool = True
+    streamdio_status_interval_s: float = 30.0
+    record_path: str | None = None
+
+
+@dataclass
+class SessionExportConfig:
+    layout: str = "flat"
+    manifest: bool = True
+    config_snapshot: bool = True
+    export_csv_on_finalize: bool = True
+    export_timeline: bool = True
+    streamdio_chunk_s: float = 0.0
+    streamdio_memory_mode: str = "full"
+    streamdio_recent_events: int = 50000
+    source_config_path: str | None = None
+    cli_overrides: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -191,7 +232,10 @@ class SessionConfig:
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     engagement: EngagementConfig = field(default_factory=EngagementConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
+    video: VideoExportConfig = field(default_factory=VideoExportConfig)
+    integrations: IntegrationConfig = field(default_factory=IntegrationConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
+    session_export: SessionExportConfig = field(default_factory=SessionExportConfig)
     results_dir: str = "data/sessions"
 
     @staticmethod
@@ -215,9 +259,13 @@ class SessionConfig:
         display_raw = raw.get("display", {})
         engagement_raw = raw.get("engagement", {})
         camera_raw = raw.get("camera", {})
+        video_raw = raw.get("video", {})
+        integrations_raw = raw.get("integrations", {})
         monitor_raw = raw.get("monitor", {})
+        session_export_raw = raw.get("session_export", {})
         wheel_raw = raw.get("wheel", {})
         frame2ttl_raw = raw.get("frame2ttl", {})
+        video_record_video = video_raw.get("record_video", None)
 
         def channels(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
             value = lick_raw.get(name, default)
@@ -409,7 +457,12 @@ class SessionConfig:
             camera=CameraConfig(
                 frequency_hz=int(camera_raw.get("frequency_hz", 30)),
                 exposure_us=int(camera_raw.get("exposure_us", 10_000)),
-                record_video=bool(camera_raw.get("record_video", True)),
+                record_video=bool(
+                    camera_raw.get(
+                        "record_video",
+                        True if video_record_video is None else video_record_video,
+                    )
+                ),
                 required=bool(camera_raw.get("required", True)),
                 video_notes=str(
                     camera_raw.get(
@@ -436,6 +489,77 @@ class SessionConfig:
                 pixel_format=str(camera_raw.get("pixel_format", "Mono8")),
                 acquisition_timeout_ms=int(camera_raw.get("acquisition_timeout_ms", 1000)),
                 save_dir=str(camera_raw.get("save_dir", "data/videos")),
+                roi_width=(
+                    int(camera_raw["roi_width"])
+                    if camera_raw.get("roi_width") not in (None, "")
+                    else None
+                ),
+                roi_height=(
+                    int(camera_raw["roi_height"])
+                    if camera_raw.get("roi_height") not in (None, "")
+                    else None
+                ),
+                roi_offset_x=(
+                    int(camera_raw["roi_offset_x"])
+                    if camera_raw.get("roi_offset_x") not in (None, "")
+                    else None
+                ),
+                roi_offset_y=(
+                    int(camera_raw["roi_offset_y"])
+                    if camera_raw.get("roi_offset_y") not in (None, "")
+                    else None
+                ),
+            ),
+            video=VideoExportConfig(
+                record_video=(
+                    bool(video_record_video)
+                    if video_record_video not in (None, "")
+                    else None
+                ),
+                export_spinnaker_summary=bool(
+                    video_raw.get("export_spinnaker_summary", True)
+                ),
+                duplicate_preview_video=bool(
+                    video_raw.get("duplicate_preview_video", False)
+                ),
+                preview_video_codec=str(video_raw.get("preview_video_codec", "FFV1")),
+                preview_video_fps=(
+                    float(video_raw["preview_video_fps"])
+                    if video_raw.get("preview_video_fps") not in (None, "")
+                    else None
+                ),
+            ),
+            integrations=IntegrationConfig(
+                mm_soundcard_status=bool(
+                    integrations_raw.get("mm_soundcard_status", True)
+                ),
+                mm_alyx_register=bool(
+                    integrations_raw.get("mm_alyx_register", False)
+                ),
+                mm_flir_roi_gui=bool(
+                    integrations_raw.get("mm_flir_roi_gui", False)
+                ),
+                alyx_api_url=(
+                    str(integrations_raw["alyx_api_url"])
+                    if integrations_raw.get("alyx_api_url") not in (None, "")
+                    else None
+                ),
+                alyx_token=(
+                    str(integrations_raw["alyx_token"])
+                    if integrations_raw.get("alyx_token") not in (None, "")
+                    else None
+                ),
+                alyx_project=(
+                    str(integrations_raw["alyx_project"])
+                    if integrations_raw.get("alyx_project") not in (None, "")
+                    else None
+                ),
+                alyx_user=(
+                    str(integrations_raw["alyx_user"])
+                    if integrations_raw.get("alyx_user") not in (None, "")
+                    else None
+                ),
+                alyx_timeout_s=float(integrations_raw.get("alyx_timeout_s", 5.0)),
             ),
             monitor=MonitorConfig(
                 enabled=bool(monitor_raw.get("enabled", False)),
@@ -471,9 +595,57 @@ class SessionConfig:
                 task_preview_rotate_left=bool(
                     monitor_raw.get("task_preview_rotate_left", True)
                 ),
+                streamdio_status_interval_s=float(
+                    monitor_raw.get("streamdio_status_interval_s", 30.0)
+                ),
+                record_path=(
+                    str(monitor_raw["record_path"])
+                    if monitor_raw.get("record_path") not in (None, "")
+                    else None
+                ),
+            ),
+            session_export=SessionExportConfig(
+                layout=str(session_export_raw.get("layout", "flat")),
+                manifest=bool(session_export_raw.get("manifest", True)),
+                config_snapshot=bool(
+                    session_export_raw.get("config_snapshot", True)
+                ),
+                export_csv_on_finalize=bool(
+                    session_export_raw.get("export_csv_on_finalize", True)
+                ),
+                export_timeline=bool(
+                    session_export_raw.get("export_timeline", True)
+                ),
+                streamdio_chunk_s=float(
+                    session_export_raw.get("streamdio_chunk_s", 0.0)
+                ),
+                streamdio_memory_mode=str(
+                    session_export_raw.get("streamdio_memory_mode", "full")
+                ),
+                streamdio_recent_events=int(
+                    session_export_raw.get("streamdio_recent_events", 50000)
+                ),
+                source_config_path=(
+                    str(session_export_raw["source_config_path"])
+                    if session_export_raw.get("source_config_path") not in (None, "")
+                    else None
+                ),
+                cli_overrides=_normalize_cli_overrides(
+                    session_export_raw.get("cli_overrides")
+                ),
             ),
             results_dir=str(raw.get("results_dir", "data/sessions")),
         )
+
+
+def _normalize_cli_overrides(value: Any) -> list[dict[str, Any]]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, dict):
+        return [dict(value)]
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, dict)]
+    return [{"value": str(value)}]
 
 
 def config_to_dict(config: SessionConfig) -> dict[str, Any]:

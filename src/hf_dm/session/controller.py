@@ -15,6 +15,7 @@ from bpod_core.fsm import StateMachine
 from hf_dm.audio.white_noise import WhiteNoisePlayer
 from hf_dm.config import SessionConfig, TrainingPhase, config_to_dict, task_design_summary
 from hf_dm.camera.spinnaker import HeadlessSpinnakerRecorder
+from hf_dm.data.session_export import resolve_session_output, session_bundle_dir
 from hf_dm.hardware.discovery import connect_bpod_core
 from hf_dm.data.recorder import SessionRecorder, SessionSummary, TrialRecord
 from hf_dm.display.pygame_display import TaskDisplay
@@ -72,8 +73,13 @@ class HFDecisionSession:
         self._closed = False
         self._last_choice_loop_stats: dict[str, float | int | str | bool] = {}
         self._active_trial_runtime: TrialRuntime | None = None
-        self._cap_touch_poll_stop = threading.Event()
-        self._cap_touch_poll_thread: threading.Thread | None = None
+        self._streamdio_status_poll_stop = threading.Event()
+        self._streamdio_status_poll_thread: threading.Thread | None = None
+        self._streamdio_module_status_snapshot_count = 0
+        self._streamdio_module_status_error_count = 0
+        self._latest_streamdio_module_status: dict | None = None
+        self._cap_touch_status_snapshot_count = 0
+        self._latest_cap_touch_status: dict | None = None
         self._trial_schedule = self._build_trial_schedule()
 
     def connect(self) -> None:
@@ -95,9 +101,33 @@ class HFDecisionSession:
             extra_input_channels=self._frame2ttl_input_channels(),
         )
         self.display = TaskDisplay(self.config.display, self.config.frame2ttl)
-        out = Path(self.config.results_dir)
-        self.recorder = SessionRecorder(out, self.config.subject_id, self.config.phase.value)
+        out, base_name = resolve_session_output(
+            Path(self.config.results_dir),
+            subject_id=self.config.subject_id,
+            phase=self.config.phase.value,
+            layout=self.config.session_export.layout,
+        )
+        self.recorder = SessionRecorder(
+            out,
+            self.config.subject_id,
+            self.config.phase.value,
+            base_name=base_name,
+        )
+        self.recorder.set_export_options(config_to_dict(self.config)["session_export"])
         self.recorder.set_metadata(self._session_metadata())
+        self.recorder.register_stream(
+            "streamdio",
+            {
+                "type": "streamdio",
+                "config_port": self.dio.config_port,
+                "stream_port": self.dio.stream_port,
+                "module_info": self._streamdio_module_info(),
+                "force_channel": FORCE_ANALOG_CHANNEL,
+                "lick_channels": list(self.config.licks.channels),
+                "frame2ttl_channels": self._frame2ttl_input_channels(),
+            },
+        )
+        self._configure_monitor_record_path()
         self._configure_cap_touch_digitizer_from_config()
         self._start_operator_monitor()
         self._start_optional_video_recording()
@@ -162,7 +192,7 @@ class HFDecisionSession:
                 "transition": cap_touch_power,
             },
         )
-        self._start_cap_touch_status_poll()
+        self._start_streamdio_status_poll()
         self.dio.start_camera_session(
             frequency_hz=self.config.camera.frequency_hz,
             exposure_us=self.config.camera.exposure_us,
@@ -186,6 +216,7 @@ class HFDecisionSession:
                 ),
                 "dio_config": self.dio.config_port,
                 "dio_stream": self.dio.stream_port,
+                "streamdio_module_info": self._streamdio_module_info(),
                 "camera_hz": self.config.camera.frequency_hz,
                 "camera_backend": self.config.camera.backend,
                 "lick_channels": list(self.config.licks.channels),
@@ -207,7 +238,7 @@ class HFDecisionSession:
                     self._wait_for_bpod_trial_threads()
                 except Exception:
                     logger.exception("Failed to abort active Bpod trial during cleanup")
-            self._stop_cap_touch_status_poll()
+            self._stop_streamdio_status_poll()
             if self.relay is not None:
                 try:
                     result = self.relay.task_outputs_off()
@@ -235,6 +266,11 @@ class HFDecisionSession:
                             {"error": f"{type(exc).__name__}: {exc}"},
                         )
             if self.white_noise_player is not None:
+                if self.recorder is not None:
+                    self.recorder.log_event(
+                        "white_noise_shutdown",
+                        {"status": self._sound_status()},
+                    )
                 self.white_noise_player.stop()
                 self.white_noise_player = None
             if self.dio is not None:
@@ -354,7 +390,34 @@ class HFDecisionSession:
             "config": config_to_dict(self.config),
             "trial_schedule": list(self._trial_schedule),
             "task_summary": task_design_summary(self.config),
+            "streamdio_module_info": self._streamdio_module_info(),
         }
+
+    def _streamdio_module_info(self) -> dict:
+        if self.dio is None:
+            return {}
+        raw = getattr(self.dio, "raw", None)
+        module_info = getattr(raw, "module_info", None)
+        if not isinstance(module_info, dict):
+            return {}
+        return {
+            str(key): value.item() if hasattr(value, "item") else value
+            for key, value in module_info.items()
+        }
+
+    def _configure_monitor_record_path(self) -> None:
+        record_path = self.config.monitor.record_path
+        if record_path is None or str(record_path).lower() != "auto":
+            return
+        if self.recorder is None:
+            return
+        bundle_dir = session_bundle_dir(
+            self.recorder.base_path,
+            layout=self.config.session_export.layout,
+        )
+        exports_dir = bundle_dir / "exports"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        self.config.monitor.record_path = str(exports_dir / "monitor_telemetry.jsonl")
 
     def _start_operator_monitor(self) -> None:
         if not self.config.monitor.enabled:
@@ -474,22 +537,42 @@ class HFDecisionSession:
                 },
             )
 
-    def _start_cap_touch_status_poll(self) -> None:
+    def _start_streamdio_status_poll(self) -> None:
         if self.monitor is None or self.dio is None:
             return
-        if CAP_TOUCH_INPUT_CHANNEL not in {int(channel) for channel in self.config.licks.channels}:
-            return
-        if self._cap_touch_poll_thread is not None and self._cap_touch_poll_thread.is_alive():
+        if (
+            self._streamdio_status_poll_thread is not None
+            and self._streamdio_status_poll_thread.is_alive()
+        ):
             return
 
-        max_hz = min(20.0, max(1.0, float(self.config.monitor.force_sample_hz)))
-        interval_s = 1.0 / max_hz
-        self._cap_touch_poll_stop.clear()
+        cap_touch_enabled = CAP_TOUCH_INPUT_CHANNEL in {
+            int(channel) for channel in self.config.licks.channels
+        }
+        cap_touch_hz = min(20.0, max(1.0, float(self.config.monitor.force_sample_hz)))
+        poll_interval_s = 1.0 / cap_touch_hz if cap_touch_enabled else 1.0
+        module_status_interval_s = max(
+            1.0,
+            float(self.config.monitor.streamdio_status_interval_s),
+        )
+        self._streamdio_status_poll_stop.clear()
+        self._streamdio_module_status_snapshot_count = 0
+        self._streamdio_module_status_error_count = 0
+        self._latest_streamdio_module_status = None
+        self._cap_touch_status_snapshot_count = 0
+        self._latest_cap_touch_status = None
 
         def poll() -> None:
-            while not self._cap_touch_poll_stop.wait(interval_s):
+            next_module_status_mono = 0.0
+            while not self._streamdio_status_poll_stop.wait(poll_interval_s):
                 if self.dio is None:
                     return
+                now = time.perf_counter()
+                if now >= next_module_status_mono:
+                    self._capture_streamdio_module_status(module_status_interval_s)
+                    next_module_status_mono = now + module_status_interval_s
+                if not cap_touch_enabled:
+                    continue
                 try:
                     status = self.dio.get_cap_touch_status()
                 except Exception as exc:
@@ -503,10 +586,12 @@ class HFDecisionSession:
                         },
                     )
                     return
+                self._cap_touch_status_snapshot_count += 1
+                self._latest_cap_touch_status = dict(status)
                 channel = int(status.get("channel", CAP_TOUCH_INPUT_CHANNEL))
                 self._publish_monitor_throttled(
                     "cap_touch_status",
-                    max_hz,
+                    cap_touch_hz,
                     "cap_touch_sample",
                     {
                         "channel": channel,
@@ -527,19 +612,80 @@ class HFDecisionSession:
                     },
                 )
 
-        self._cap_touch_poll_thread = threading.Thread(
+        self._streamdio_status_poll_thread = threading.Thread(
             target=poll,
-            name="hf-dm-cap-touch-status",
+            name="hf-dm-streamdio-status",
             daemon=True,
         )
-        self._cap_touch_poll_thread.start()
+        self._streamdio_status_poll_thread.start()
 
-    def _stop_cap_touch_status_poll(self) -> None:
-        self._cap_touch_poll_stop.set()
-        thread = self._cap_touch_poll_thread
+    def _capture_streamdio_module_status(self, interval_s: float) -> None:
+        if self.dio is None:
+            return
+        try:
+            status = self.dio.get_module_status()
+        except Exception as exc:
+            self._streamdio_module_status_error_count += 1
+            payload = {
+                "source": "monitor_thread",
+                "interval_s": float(interval_s),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            logger.warning("StreamDIO module status snapshot failed: %s", exc)
+            if self.recorder is not None:
+                self.recorder.log_debug_event(
+                    "streamdio_module_status_error",
+                    payload,
+                )
+        else:
+            self._streamdio_module_status_snapshot_count += 1
+            self._latest_streamdio_module_status = dict(status)
+            payload = {
+                "source": "monitor_thread",
+                "interval_s": float(interval_s),
+                "status": status,
+            }
+            if self.recorder is not None:
+                self.recorder.log_debug_event(
+                    "streamdio_module_status_snapshot",
+                    payload,
+                )
+        self._publish_monitor("streamdio_status", payload)
+
+    def _stop_streamdio_status_poll(self) -> None:
+        self._streamdio_status_poll_stop.set()
+        thread = self._streamdio_status_poll_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
-        self._cap_touch_poll_thread = None
+        self._streamdio_status_poll_thread = None
+        self._update_streamdio_status_summary()
+
+    def _update_streamdio_status_summary(self) -> None:
+        if self.recorder is None:
+            return
+        if not (
+            self._streamdio_module_status_snapshot_count
+            or self._streamdio_module_status_error_count
+            or self._cap_touch_status_snapshot_count
+        ):
+            return
+        streamdio = self.recorder.get_stream_summaries().get("streamdio", {})
+        status_poll = {
+            "source": "monitor_thread",
+            "module_status_interval_s": max(
+                1.0,
+                float(self.config.monitor.streamdio_status_interval_s),
+            ),
+            "module_status_snapshot_count": self._streamdio_module_status_snapshot_count,
+            "module_status_error_count": self._streamdio_module_status_error_count,
+            "cap_touch_status_snapshot_count": self._cap_touch_status_snapshot_count,
+        }
+        if self._latest_streamdio_module_status is not None:
+            status_poll["latest_module_status"] = self._latest_streamdio_module_status
+        if self._latest_cap_touch_status is not None:
+            status_poll["latest_cap_touch_status"] = self._latest_cap_touch_status
+        streamdio["status_poll"] = status_poll
+        self.recorder.register_stream("streamdio", streamdio)
 
     def _publish_monitor(self, event_type: str, payload: dict | None = None) -> None:
         if self.monitor is not None:
@@ -1140,7 +1286,13 @@ class HFDecisionSession:
             "gate_on_mono_s": on_done,
             "gate_off_mono_s": off_done,
             "duration_s": off_done - on_done,
+            "sound_status": self._sound_status(),
         }
+
+    def _sound_status(self) -> dict:
+        if self.white_noise_player is None:
+            return {}
+        return self.white_noise_player.status
 
     def _start_optional_video_recording(self) -> None:
         if self.recorder is None:
@@ -1168,6 +1320,10 @@ class HFDecisionSession:
                 fps=camera_cfg.frequency_hz,
                 exposure_us=camera_cfg.exposure_us,
                 pixel_format=camera_cfg.pixel_format,
+                roi_width=camera_cfg.roi_width,
+                roi_height=camera_cfg.roi_height,
+                roi_offset_x=camera_cfg.roi_offset_x,
+                roi_offset_y=camera_cfg.roi_offset_y,
                 gain_db=camera_cfg.gain_db,
                 gamma=camera_cfg.gamma,
                 acquisition_timeout_ms=camera_cfg.acquisition_timeout_ms,
@@ -1182,6 +1338,23 @@ class HFDecisionSession:
             )
             session_dir = recorder.start()
             self.camera_recorder = recorder
+            self.recorder.register_stream(
+                "spinnaker_video",
+                {
+                    "type": "spinnaker",
+                    "backend": recorder.backend,
+                    "save_dir": str(session_dir),
+                    "target_trigger_hz": camera_cfg.frequency_hz,
+                    "exposure_us": camera_cfg.exposure_us,
+                    "pixel_format": camera_cfg.pixel_format,
+                    "roi": {
+                        "width": camera_cfg.roi_width,
+                        "height": camera_cfg.roi_height,
+                        "offset_x": camera_cfg.roi_offset_x,
+                        "offset_y": camera_cfg.roi_offset_y,
+                    },
+                },
+            )
             self.recorder.log_event(
                 "video_recording_started",
                 {
@@ -1213,6 +1386,13 @@ class HFDecisionSession:
         assert self.recorder is not None
         try:
             summary = self.camera_recorder.stop()
+            self.recorder.register_stream(
+                "spinnaker_video",
+                {
+                    "type": "spinnaker",
+                    **summary,
+                },
+            )
             self.recorder.log_event("video_recording_stopped", summary)
         except Exception as exc:
             logger.exception("Failed to stop headless Spinnaker recording")
@@ -1693,6 +1873,7 @@ class HFDecisionSession:
                     actions=self.speaker_relay.bpod_state_marker_act(state_name),
                 )
             self.recorder.log_fsm_definition("bpod_opcode_diagnostic", fsm)
+            self._prepare_bpod_run(0)
             self.bpod.run(fsm, trial_number=0)
             while self.bpod.is_running:
                 if self.display is not None:
@@ -1878,6 +2059,13 @@ class HFDecisionSession:
             self.recorder.log_event("choice_loop_stats", stats)
 
     @staticmethod
+    def _lick_rate_hz(lick_count: int, duration_s: float) -> float:
+        duration = max(0.0, float(duration_s))
+        if duration <= 0.0:
+            return 0.0
+        return float(max(0, int(lick_count))) / duration
+
+    @staticmethod
     def _actual_transition_time(transition: dict | list[dict]) -> float:
         transitions = transition if isinstance(transition, list) else [transition]
         return max(
@@ -1900,6 +2088,23 @@ class HFDecisionSession:
         softcode_thread = getattr(self.bpod, "_softcode_thread", None)
         if softcode_thread is not None and hasattr(softcode_thread, "drain"):
             softcode_thread.drain()
+
+    def _prepare_bpod_run(self, trial_number: int) -> None:
+        if self.speaker_relay is None:
+            return
+        prepare = getattr(self.speaker_relay, "prepare_bpod_run", None)
+        if not callable(prepare):
+            return
+        discarded = int(prepare())
+        if discarded > 0 and self.recorder is not None:
+            self.recorder.log_event(
+                "bpod_serial_input_discarded",
+                {
+                    "trial_number": int(trial_number),
+                    "byte_count": discarded,
+                    "reason": "idle_module_relay_bytes_before_fsm",
+                },
+            )
 
     def _handle_bpod_softcode(self, softcode: int) -> None:
         """Execute verified host outputs when the Bpod FSM enters a state."""
@@ -2103,6 +2308,7 @@ class HFDecisionSession:
                         "duration_s": self.config.timing.timeout_noise_s,
                         "source": "bpod_serial_pin27_gate",
                         "trigger": "bpod_state_entry",
+                        "sound_status": self._sound_status(),
                     },
                 )
                 self._publish_monitor(
@@ -2125,6 +2331,7 @@ class HFDecisionSession:
                         "duration_s": self.config.timing.timeout_noise_s,
                         "source": "bpod_serial_pin27_gate",
                         "trigger": "bpod_state_entry",
+                        "sound_status": self._sound_status(),
                     },
                 )
                 self._publish_monitor(
@@ -2327,6 +2534,7 @@ class HFDecisionSession:
             (1.0 / max(1, self.config.display.fps)) * 3.0,
         )
 
+        self._prepare_bpod_run(trial_index)
         self.bpod.run(fsm, trial_number=trial_index)
         try:
             while self.bpod.is_running:
@@ -2460,7 +2668,7 @@ class HFDecisionSession:
                             frame_interval_max_s = max(frame_interval_max_s, interval_s)
                             if interval_s >= stall_threshold_s:
                                 stall_count += 1
-                                self.recorder.log_event(
+                                self.recorder.log_debug_event(
                                     "choice_loop_stall",
                                     {
                                         "trial_index": trial_index,
@@ -2820,7 +3028,7 @@ class HFDecisionSession:
                 frame_interval_max_s = max(frame_interval_max_s, interval_s)
                 if interval_s >= stall_threshold_s:
                     stall_count += 1
-                    self.recorder.log_event(
+                    self.recorder.log_debug_event(
                         "choice_loop_stall",
                         {
                             "trial_index": trial_index,
@@ -3012,6 +3220,7 @@ class HFDecisionSession:
                         "trial_index": trial_index,
                         "duration_s": self.config.timing.timeout_noise_s,
                         "command_start_mono_s": noise_cmd_start_mono_s,
+                        "sound_status": self._sound_status(),
                     },
                 )
                 noise_result = self._pulse_audible_white_noise(
@@ -3129,12 +3338,17 @@ class HFDecisionSession:
                 force_samples=snap["force_samples"],
                 force_last=snap["force_last"],
                 force_mean=snap["force_mean"],
+                force_p95=snap.get("force_p95"),
                 force_min=snap["force_min"],
                 force_max=snap["force_max"],
                 trial_start_wall_s=trial_wall,
                 trial_start_mono_s=trial_mono,
                 camera_ttl_timestamps_us=[ts for ts, _ in cam_events],
                 lick_count=len(lick_events),
+                lick_rate_hz=self._lick_rate_hz(
+                    len(lick_events),
+                    float(loop_stats.get("duration_s", response_time_s)),
+                ),
                 lick_timestamps_us=[int(event["timestamp_us"]) for event in lick_events],
                 lick_relative_times_s=[float(event["relative_time_s"]) for event in lick_events],
                 lick_channels=[int(event["channel"]) for event in lick_events],
@@ -3242,6 +3456,7 @@ class HFDecisionSession:
                 force_samples=snap["force_samples"],
                 force_last=snap["force_last"],
                 force_mean=snap["force_mean"],
+                force_p95=snap.get("force_p95"),
                 force_min=snap["force_min"],
                 force_max=snap["force_max"],
                 trial_start_wall_s=trial_wall,
@@ -3263,6 +3478,10 @@ class HFDecisionSession:
                 bpod_state_entries=len(result["runtime"]["state_entries"]),
                 camera_ttl_timestamps_us=[ts for ts, _ in cam_events],
                 lick_count=len(lick_events),
+                lick_rate_hz=self._lick_rate_hz(
+                    len(lick_events),
+                    float(loop_stats.get("duration_s", result["response_time_s"])),
+                ),
                 lick_timestamps_us=[int(event["timestamp_us"]) for event in lick_events],
                 lick_relative_times_s=[float(event["relative_time_s"]) for event in lick_events],
                 lick_channels=[int(event["channel"]) for event in lick_events],
@@ -3506,6 +3725,7 @@ class HFDecisionSession:
                     "trial_index": trial_index,
                     "duration_s": self.config.timing.timeout_noise_s,
                     "reason": "centering_timeout",
+                    "sound_status": self._sound_status(),
                 },
             )
             noise_result = self._pulse_audible_white_noise(
@@ -3551,12 +3771,17 @@ class HFDecisionSession:
                 force_samples=snap["force_samples"],
                 force_last=snap["force_last"],
                 force_mean=snap["force_mean"],
+                force_p95=snap.get("force_p95"),
                 force_min=snap["force_min"],
                 force_max=snap["force_max"],
                 trial_start_wall_s=trial_wall,
                 trial_start_mono_s=trial_mono,
                 camera_ttl_timestamps_us=[ts for ts, _ in cam_events],
                 lick_count=len(lick_events),
+                lick_rate_hz=self._lick_rate_hz(
+                    len(lick_events),
+                    response_time_s,
+                ),
                 lick_timestamps_us=[int(event["timestamp_us"]) for event in lick_events],
                 lick_relative_times_s=[float(event["relative_time_s"]) for event in lick_events],
                 lick_channels=[int(event["channel"]) for event in lick_events],

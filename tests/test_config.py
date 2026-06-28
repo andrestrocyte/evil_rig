@@ -47,3 +47,135 @@ frame2ttl:
     assert config.frame2ttl.input_pin == FRAME2TTL_INPUT_PIN
     assert config.frame2ttl.patch_size_px == 72
     assert config.frame2ttl.patch_corner == "bottom_right"
+
+
+def test_session_export_defaults_and_yaml_load():
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text(
+            """
+session_export:
+  layout: mm_hierarchy
+  manifest: true
+  config_snapshot: true
+  export_csv_on_finalize: false
+  export_timeline: false
+  streamdio_chunk_s: 45
+  streamdio_memory_mode: bounded
+  streamdio_recent_events: 123
+  cli_overrides:
+    - source: pytest
+      values:
+        monitor.enabled: true
+""",
+            encoding="utf-8",
+        )
+
+        config = SessionConfig.from_yaml(path)
+
+    assert config.session_export.layout == "mm_hierarchy"
+    assert config.session_export.manifest
+    assert config.session_export.config_snapshot
+    assert not config.session_export.export_csv_on_finalize
+    assert not config.session_export.export_timeline
+    assert config.session_export.streamdio_chunk_s == 45
+    assert config.session_export.streamdio_memory_mode == "bounded"
+    assert config.session_export.streamdio_recent_events == 123
+    assert config.session_export.cli_overrides == [
+        {"source": "pytest", "values": {"monitor.enabled": True}}
+    ]
+
+
+def test_monitor_record_path_loads_from_yaml():
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text(
+            """
+monitor:
+  streamdio_status_interval_s: 12.5
+  record_path: auto
+""",
+            encoding="utf-8",
+        )
+
+        config = SessionConfig.from_yaml(path)
+
+    assert config.monitor.record_path == "auto"
+    assert config.monitor.streamdio_status_interval_s == 12.5
+
+
+def test_camera_roi_loads_from_yaml():
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text(
+            """
+camera:
+  roi_width: 640
+  roi_height: 480
+  roi_offset_x: 32
+  roi_offset_y: 16
+""",
+            encoding="utf-8",
+        )
+
+        config = SessionConfig.from_yaml(path)
+
+    assert config.camera.roi_width == 640
+    assert config.camera.roi_height == 480
+    assert config.camera.roi_offset_x == 32
+    assert config.camera.roi_offset_y == 16
+
+
+def test_video_export_config_loads_from_yaml():
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text(
+            """
+video:
+  record_video: false
+  export_spinnaker_summary: true
+  duplicate_preview_video: true
+  preview_video_codec: FFV1
+  preview_video_fps: 12.5
+""",
+            encoding="utf-8",
+        )
+
+        config = SessionConfig.from_yaml(path)
+
+    assert config.video.record_video is False
+    assert not config.camera.record_video
+    assert config.video.export_spinnaker_summary
+    assert config.video.duplicate_preview_video
+    assert config.video.preview_video_codec == "FFV1"
+    assert config.video.preview_video_fps == 12.5
+
+
+def test_integrations_config_loads_from_yaml():
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text(
+            """
+integrations:
+  mm_soundcard_status: true
+  mm_alyx_register: true
+  mm_flir_roi_gui: false
+  alyx_api_url: https://alyx.example.test/api
+  alyx_token: secret
+  alyx_project: hf_dm
+  alyx_user: rig
+  alyx_timeout_s: 2.5
+""",
+            encoding="utf-8",
+        )
+
+        config = SessionConfig.from_yaml(path)
+
+    assert config.integrations.mm_soundcard_status
+    assert config.integrations.mm_alyx_register
+    assert not config.integrations.mm_flir_roi_gui
+    assert config.integrations.alyx_api_url == "https://alyx.example.test/api"
+    assert config.integrations.alyx_token == "secret"
+    assert config.integrations.alyx_project == "hf_dm"
+    assert config.integrations.alyx_user == "rig"
+    assert config.integrations.alyx_timeout_s == 2.5

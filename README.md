@@ -27,6 +27,10 @@ Cap-touch power is held high for the whole session. Input channel 14 is enabled 
 digital stream; each configured high edge is stored both as a raw module-timestamped event and as
 an explicit `lick` session event while force remains sampled on AI13.
 
+The `pybpod_rotaryencoder_module` is deliberately not used in runtime here: this rig reads wheel
+pulses through StreamDIO DI01/DI03, not the Sanworks Bpod rotary module. A legacy adapter would need
+to be mutually exclusive with the StreamDIO wheel path.
+
 ## Architecture
 
 ```
@@ -76,6 +80,10 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e /path/to/bpod-core
 pip install -e /path/to/MM_PyBpod2_andrestrocyte   # StreamDIO + optional sound module
 pip install -e .
+# optional offline preview-video exporter:
+pip install -e .[video]
+# optional MM-style cold-path helpers used by some rigs:
+pip install -e .[mm]
 ```
 
 Requires Python >= 3.10, Windows rig (same as bringups), Bpod State Machine 2+.
@@ -98,13 +106,40 @@ camera:
   backend: spinnaker
   serial_number: null      # optional: choose a specific camera
   pixel_format: Mono8
+  roi_width: null           # optional Spinnaker ROI crop; null keeps full sensor
+  roi_height: null
+  roi_offset_x: null
+  roi_offset_y: null
   acquisition_timeout_ms: 1000
   save_dir: data/videos
 ```
 
+Optional cold-path video exports are controlled separately:
+
+```yaml
+video:
+  record_video: true              # also accepted here; camera.record_video stays compatible
+  export_spinnaker_summary: true
+  duplicate_preview_video: false  # opt-in offline FFV1 AVI from saved PGM frames
+```
+
+Optional MM-inspired integrations remain cold-path and disabled unless configured:
+
+```yaml
+integrations:
+  mm_soundcard_status: true
+  mm_alyx_register: false         # uses ALYX_API_URL/ALYX_TOKEN or alyx_* fields
+  mm_flir_roi_gui: false          # ROI is managed by hf-dm camera-roi-setup
+```
+
 The session writes a frame sequence, `frame_timestamps.csv`, and `recording_summary.json` under
-`data/videos/<subject>_<phase>_<timestamp>_spinnaker/`. With `required: true`, the task refuses to
-run if recording cannot start.
+`data/videos/<subject>_<phase>_<timestamp>_spinnaker/`. The summary includes saved frames,
+duration, mean saved FPS, requested trigger rate, exposure, preview delivery counts,
+incomplete/timeout/save-error capture counters, and a conservative estimated missing-trigger count.
+With `required: true`, the task refuses to run if
+recording cannot start. The optional preview AVI is generated only after frames are already saved,
+through `hf-dm export-preview-video` or `video.duplicate_preview_video: true`; it is never written
+from the live camera callback.
 
 ### Operator monitor GUI
 
@@ -120,6 +155,10 @@ reset every trial.
 Use `--no-monitor` for command-line checks, or `--monitor` to force it on when a YAML file has it
 disabled. `--simulate-headless` disables the monitor automatically.
 
+When `monitor.record_path: auto`, the monitor child process writes compact JSONL telemetry to
+`exports/monitor_telemetry.jsonl` in the session bundle. Frame byte payloads are replaced by byte
+counts, and task-side publishing remains nonblocking queue insertion.
+
 Cap touch uses StreamDIO input channel 14 / physical pin 25 for the lick detector and output
 channel 13 / physical pin 15 for detector power. The GUI shows both the power output and the raw
 input channel value so detector transitions are visible even before trial-level counted licks.
@@ -128,7 +167,9 @@ channel 13 and the vendored StreamDIO firmware in `firmware/` digitizes cap-touc
 into normal channel-14 high/low input events. Flash that firmware if the detector LED changes but no
 lick events appear in the GUI. With firmware version 3 or newer, the operator monitor also polls the
 firmware digitizer status at low rate so the cap-touch ADC value/baseline is visible without moving
-force off analog channel 13.
+force off analog channel 13. The same monitor thread records a bounded StreamDIO module-status
+snapshot every `monitor.streamdio_status_interval_s` (30 seconds in the official configs); the
+latest module and cap-touch status plus snapshot counts are retained in the StreamDIO summary.
 
 ## Run
 
@@ -163,7 +204,12 @@ python -m hf_dm.cli --config configs/dm_200.yaml
 python -m hf_dm.cli --config configs/dm_50.yaml --no-monitor
 ```
 
-Outputs: `data/sessions/<subject>_<phase>_<timestamp>.npz` and `.json`.
+Outputs: `data/sessions/<subject>_<phase>_<timestamp>.npz` and `.json`. By default the
+session also writes a cold-path bundle next to those files:
+`data/sessions/<subject>_<phase>_<timestamp>_bundle/manifest.json`,
+`config.snapshot.yaml`, `exports/`, `bpod_exports/`, and `continuous_streams/`.
+These derived files are written after the primary NPZ/JSON save; the StreamDIO,
+force, camera, and task loops never append CSV rows in the hot path.
 
 On this Windows rig, `python -m hf_dm.cli ...` is the reliable launcher. An editable user-site
 install may place `hf-dm-run.exe` under `%APPDATA%\Python\Python312\Scripts`, which is not always on
@@ -264,12 +310,90 @@ the saved `preflight_end` event reports wheel pulse/direction edges and cap-touc
 
 ## Data logged
 
-- Per-trial: star/circle sides, chosen shape/side, force direction, choice, reward duration, RT, pulses, force ADC stats, licks, wall/mono timestamps, camera TTL list, Frame2TTL barcode/edge summary
+- Per-trial: star/circle sides, chosen shape/side, force direction, choice, reward duration, RT, pulses, force ADC stats, licks, wall/mono timestamps, camera TTL list/interval QC, Frame2TTL barcode/edge summary
 - Exact bpod-core state/event rows for every trial in JSON and NPZ `bpod_trials_json`
 - Raw NPZ `streamdio_events`: every wheel/direction edge, force sample, camera TTL, lick, module timestamp, and high-resolution host timestamp
 - Events: `session_start`, `trial_start`, `stimulus_on`, `force_on`, `choice_detected`, `feedback_on`, `frame2ttl_*`, `pump_start`, `pump_end`, `output_actual`, `lick`, `white_noise_*`, cleanup, `trial_end`, `session_end`
 - Video: every camera frame with camera and host timestamps in `frame_timestamps.csv`
 - Session summary: end reason (`completed`, `idle_timeout`, `max_consecutive_failures`)
+
+### Session export bundle
+
+The `session_export:` YAML block controls derived data products:
+
+```yaml
+session_export:
+  layout: flat                 # flat | mm_hierarchy
+  manifest: true
+  config_snapshot: true
+  export_csv_on_finalize: true
+  export_timeline: true
+  streamdio_chunk_s: 0         # >0 writes duplicate chunk NPZs in a background thread
+  streamdio_memory_mode: full   # full | bounded; bounded keeps only recent rows in RAM
+  streamdio_recent_events: 50000
+```
+
+`layout: flat` preserves the current primary artifact paths and creates a per-session
+`*_bundle/` directory. `layout: mm_hierarchy` is opt-in and writes into
+`data/sessions/<phase>/<subject>/<YYYY-MM-DD>/<run_id>/session.npz`.
+
+The bundle includes:
+
+- `manifest.json`: relative artifact paths, SHA256 hashes, source config SHA256 when available,
+  package/git info, hardware flags, StreamDIO firmware info, final counts, video summary with
+  `recording_summary.json` / `frame_timestamps.csv` artifacts when present, a StreamDIO chunk
+  index when chunking is enabled, and recorder stats including primary and derived artifact byte
+  counts
+- `config.snapshot.yaml`: source config path, source YAML text and SHA256 when available,
+  recorded CLI/config overrides, plus the effective post-CLI config
+- `videos/spinnaker_video.json`: a bundle-local pointer to the Spinnaker recording directory,
+  summary JSON, frame timestamp CSV, and their hashes; frame files are not duplicated
+- `exports/streamdio_events.csv`, `force_trace.csv`, `camera_ttl.csv`, `frame2ttl_edges.csv`, `licks.csv`, `trials_summary.csv`, `events.csv`
+- `exports/synchronized_timeline.csv` and `alignment_anchors.json`, including the first
+  Spinnaker frame from `frame_timestamps.csv` when video timestamps are available
+- `bpod_exports/bpod_trials_flat.csv`
+- `bpod_data/bpod_trials.json`: exact captured bpod-core trial rows plus saved FSM definitions
+- optional `continuous_streams/streamdio_chunk_NNN.npz` files when `streamdio_chunk_s > 0`
+- `exports/soundcard_status.json` when the soundcard module reports white-noise playback status
+- `exports/monitor_telemetry.jsonl` when the operator monitor is enabled with `record_path: auto`
+- `exports/rig_preflight_report.json` after `hf-dm rig-preflight`, with the preflight summary,
+  config, session artifact paths, StreamDIO counts/status, and preflight start/end event payloads
+- `exports/alyx_registration.json` when `integrations.mm_alyx_register: true`; registration errors are recorded there and do not abort the session save
+- `exports/debug_events_recent.json` when bounded debug telemetry exists; high-volume debug samples
+  such as individual choice-loop stalls stay out of the main semantic event list, while aggregate
+  counts remain in `TrialRecord` and manifest `recorder_stats`
+
+For very long sessions, set `streamdio_chunk_s` and `streamdio_memory_mode: bounded`. The live task
+then keeps only the most recent `streamdio_recent_events` rows in memory, writes completed chunks in
+a daemon thread, and reconstructs the full primary NPZ/CSV/timeline from those chunks at finalize.
+
+For future cold-path tools, `hf_dm.data.session_bundle.SessionBundle` provides a small
+`start() / register_streamdio() / register_camera() / get_stream_summaries() / finalize()` facade over `SessionRecorder`.
+As a context manager it finalizes an otherwise-unfinalized recorder on exit, including error exits.
+It is a wrapper only; the live task continues to use the existing recorder and StreamDIO paths.
+
+Offline helpers:
+
+```bash
+hf-dm export-session data/sessions/<session>.json
+hf-dm validate-session data/sessions/<session>_bundle
+hf-dm export-preview-video data/videos/<session>_spinnaker
+hf-dm export-session data/sessions/<session>.json --export-preview-video
+hf-dm rig-preflight --config configs/dm_50.yaml --duration 2 --no-monitor
+hf-dm camera-roi-setup --config configs/dm_50.yaml --output configs/dm_50_roi.yaml --width 640 --height 480 --offset-x 0 --offset-y 0
+hf-dm camera-roi-setup --config configs/dm_50.yaml --output configs/dm_50_roi.yaml --interactive
+
+hf-dm-export-session data/sessions/<session>.json
+hf-dm-validate-session data/sessions/<session>_bundle
+```
+
+`validate-session` checks manifest paths, byte sizes, and SHA256 hashes, verifies source-config
+provenance from `config.snapshot.yaml`, opens NPZ artifacts, verifies the primary session NPZ schema/counts,
+validates StreamDIO chunk NPZs and their manifest index, checks known CSV row counts including Bpod
+flat rows and timeline schema/order, parses JSON/JSONL sidecars including monitor telemetry, and
+checks derived Bpod/video recording summary/pointer/preview, Alyx registration, debug-event ring,
+rig-preflight report, recorder stats, hardware flags, timeline anchor, stream/module/status JSON counts and
+consistency.
 
 ## Learning curricula
 

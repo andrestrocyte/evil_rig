@@ -88,6 +88,9 @@ class FakeArCOM:
 
 def _client() -> StreamDIOClient:
     client = object.__new__(StreamDIOClient)
+    client.config_port = "COM_CONFIG"
+    client.stream_port = "COM_STREAM"
+    client.baudrate = 115200
     client._callback = None
     client._config_lock = threading.Lock()
     client._output_condition = threading.Condition()
@@ -161,6 +164,19 @@ def test_cap_touch_status_reads_digitizer_fields():
     assert status["pin"] == 25
     assert status["last_value"] == 812
     assert status["rising_high_threshold"] == 700
+
+
+def test_module_status_collects_driver_status_snapshots():
+    client = _client()
+
+    status = client.get_module_status()
+
+    assert status["config_port"] == "COM_CONFIG"
+    assert status["stream_port"] == "COM_STREAM"
+    assert status["streaming_active"]
+    assert status["module_info"]["firmware_version"] == 4
+    assert status["analog_input_status"]["channel"] == FORCE_ANALOG_CHANNEL
+    assert status["speaker_status"]["pin"] == 27
 
 
 def test_cap_touch_threshold_configuration_sends_runtime_firmware_command():

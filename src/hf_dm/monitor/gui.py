@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import math
 import multiprocessing as mp
@@ -12,6 +13,7 @@ import time
 from collections import Counter
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from hf_dm.config import MonitorConfig
@@ -727,6 +729,62 @@ def _frame_to_pillow_image(
         return None
 
 
+class _MonitorTelemetryRecorder:
+    def __init__(self, path: str | None) -> None:
+        self.path = Path(path) if path else None
+        self._handle: Any = None
+        if self.path is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = self.path.open("a", encoding="utf-8", buffering=1)
+        except Exception:
+            logger.exception("Could not open monitor telemetry JSONL: %s", self.path)
+            self._handle = None
+
+    def write_message(self, kind: str, message: dict[str, Any]) -> None:
+        if self._handle is None:
+            return
+        try:
+            self._handle.write(
+                json.dumps(
+                    {
+                        "kind": str(kind),
+                        "record_wall_s": time.time(),
+                        "record_mono_s": time.perf_counter(),
+                        "message": self._compact_message(message),
+                    },
+                    default=str,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        except Exception:
+            logger.debug("Could not write monitor telemetry message", exc_info=True)
+
+    def write_status(self, status: dict[str, Any]) -> None:
+        self.write_message("status", {"type": "monitor_status", "payload": status})
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            self._handle.close()
+        except Exception:
+            pass
+        self._handle = None
+
+    @staticmethod
+    def _compact_message(message: dict[str, Any]) -> dict[str, Any]:
+        compact = dict(message)
+        payload = dict(compact.get("payload") or {})
+        data = payload.get("data")
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            payload["data"] = f"<{len(data)} bytes>"
+        compact["payload"] = payload
+        return compact
+
+
 def _run_monitor_process(
     config: MonitorConfig,
     event_q: Any,
@@ -743,14 +801,25 @@ def _run_monitor_process(
     except Exception:
         return
 
+    telemetry = _MonitorTelemetryRecorder(config.record_path)
     root = tk.Tk()
     try:
-        window = _MonitorWindow(root, config, event_q, camera_frame_q, task_frame_q, status_q, tk)
+        window = _MonitorWindow(
+            root,
+            config,
+            event_q,
+            camera_frame_q,
+            task_frame_q,
+            status_q,
+            tk,
+            telemetry,
+        )
         window.start()
         root.mainloop()
     except Exception:
         logger.exception("Operator monitor crashed")
     finally:
+        telemetry.close()
         try:
             root.destroy()
         except Exception:
@@ -767,6 +836,7 @@ class _MonitorWindow:
         task_frame_q: Any,
         status_q: Any,
         tk: Any,
+        telemetry: _MonitorTelemetryRecorder | None = None,
     ):
         self.root = root
         self.config = config
@@ -775,6 +845,7 @@ class _MonitorWindow:
         self.task_frame_queue = task_frame_q
         self.status_queue = status_q
         self.tk = tk
+        self.telemetry = telemetry or _MonitorTelemetryRecorder(None)
         self.state = OperatorMonitorState(
             history_s=config.history_s,
             trial_history=config.trial_history,
@@ -857,6 +928,7 @@ class _MonitorWindow:
             except Exception:
                 break
             drained += 1
+            self.telemetry.write_message("event", message)
             if message.get("type") == "shutdown":
                 shutdown = True
                 continue
@@ -868,6 +940,7 @@ class _MonitorWindow:
         ):
             if message is None:
                 continue
+            self.telemetry.write_message("frame", message)
             self.state.apply(message)
         return shutdown
 
@@ -1687,6 +1760,7 @@ class _MonitorWindow:
         }
         if error is not None:
             status["error"] = error
+        self.telemetry.write_status(status)
         while True:
             try:
                 self.status_queue.put_nowait(status)

@@ -56,6 +56,7 @@ class WheelAccumulator:
             self.force_last: float | None = None
             self.force_min: float | None = None
             self.force_max: float | None = None
+            self.force_values: list[float] = []
             self.last_pulse_monotonic = time.perf_counter()
 
     def handle_event(
@@ -84,6 +85,7 @@ class WheelAccumulator:
                 self.force_samples += 1
                 self.force_sum += numeric_value
                 self.force_last = numeric_value
+                self.force_values.append(numeric_value)
                 self.force_min = (
                     numeric_value if self.force_min is None else min(self.force_min, numeric_value)
                 )
@@ -94,8 +96,10 @@ class WheelAccumulator:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             force_mean = None
+            force_p95 = None
             if self.force_samples:
                 force_mean = self.force_sum / float(self.force_samples)
+                force_p95 = _percentile(self.force_values, 95.0)
             return {
                 "net_pulses": self.net_pulses,
                 "cw_pulses": self.cw_pulses,
@@ -103,6 +107,7 @@ class WheelAccumulator:
                 "force_samples": self.force_samples,
                 "force_last": self.force_last,
                 "force_mean": force_mean,
+                "force_p95": force_p95,
                 "force_min": self.force_min,
                 "force_max": self.force_max,
                 "quiescent_for_s": time.perf_counter() - self.last_pulse_monotonic,
@@ -111,3 +116,18 @@ class WheelAccumulator:
     def signed_position_deg(self) -> float:
         snap = self.snapshot()
         return snap["net_pulses"] * self.cfg.deg_per_pulse
+
+
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    rank = (len(ordered) - 1) * (max(0.0, min(100.0, percentile)) / 100.0)
+    lower = int(math.floor(rank))
+    upper = int(math.ceil(rank))
+    if lower == upper:
+        return float(ordered[lower])
+    fraction = rank - lower
+    return float(ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction)

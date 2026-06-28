@@ -37,6 +37,10 @@ def _uint12(value: int) -> int:
     return max(0, min(4095, int(value)))
 
 
+def _json_safe(value: Any) -> Any:
+    return value.item() if hasattr(value, "item") else value
+
+
 class StreamDIOClient:
     """Thin facade over pybpod_streamDIO_module.StreamDIOProtocol."""
 
@@ -365,6 +369,36 @@ class StreamDIOClient:
                 "falling_high_threshold": int(config_arcom.read(1, "uint16", "builtin")),
                 "falling_low_threshold": int(config_arcom.read(1, "uint16", "builtin")),
             }
+        return status
+
+    def get_module_status(self) -> dict[str, Any]:
+        """Return a one-shot StreamDIO status snapshot for cold-path reports."""
+        if self._dio is None:
+            raise RuntimeError("StreamDIO not connected")
+        status: dict[str, Any] = {
+            "config_port": self.config_port,
+            "stream_port": self.stream_port,
+            "streaming_active": bool(getattr(self._dio, "streaming_active", False)),
+            "module_info": {
+                str(key): _json_safe(value)
+                for key, value in dict(getattr(self._dio, "module_info", {}) or {}).items()
+            },
+        }
+        with self._config_lock:
+            for name, getter_name in (
+                ("analog_input_status", "get_analog_input_status"),
+                ("speaker_status", "get_speaker_status"),
+            ):
+                getter = getattr(self._dio, getter_name, None)
+                if not callable(getter):
+                    continue
+                try:
+                    status[name] = {
+                        str(key): _json_safe(value)
+                        for key, value in dict(getter()).items()
+                    }
+                except Exception as exc:
+                    status[f"{name}_error"] = f"{type(exc).__name__}: {exc}"
         return status
 
     def configure_cap_touch_digitizer(

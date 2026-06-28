@@ -170,6 +170,7 @@ def test_serial_relay_preloads_streamdio_state_markers():
 
     SerialRelay(bpod, serial_channel_index=0)
 
+    module.set_relay.assert_called_once_with(False)
     loaded = {
         call.args[0]: list(call.args[1])
         for call in module.load_serial_message.call_args_list
@@ -197,7 +198,26 @@ def test_serial_relay_sends_immediate_bytes_on_configured_output():
     relay = SerialRelay(bpod, serial_channel_index=0)
     relay.send_bytes([5, 0, 3, 1], inter_byte_s=0)
 
+    assert module.set_relay.call_count == 2
+    assert all(call.args == (False,) for call in module.set_relay.call_args_list)
     assert [call.args[0] for call in serial_out.override.call_args_list] == [5, 0, 3, 1]
+
+
+def test_serial_relay_clears_pending_input_before_bpod_run():
+    bpod = MagicMock()
+    module = MagicMock()
+    module.is_connected = True
+    module.index = 0
+    module.load_serial_message.return_value = True
+    bpod.modules = {"Serial1": module}
+    bpod.serial0.in_waiting = 7
+
+    relay = SerialRelay(bpod, serial_channel_index=0)
+    discarded = relay.prepare_bpod_run()
+
+    assert discarded == 7
+    assert all(call.args == (False,) for call in module.set_relay.call_args_list)
+    bpod.serial0.reset_input_buffer.assert_called_once_with()
 
 
 def test_choice_softcodes_are_zero_based_for_bpod_core():

@@ -203,6 +203,23 @@ def _apply_session_setup(config: SessionConfig, setup: SessionSetup) -> None:
     )
 
 
+def _record_cli_override(
+    config: SessionConfig,
+    *,
+    source: str,
+    values: dict[str, object],
+) -> None:
+    if not values:
+        return
+    config.session_export.cli_overrides.append(
+        {
+            "source": source,
+            "values": json.loads(json.dumps(values, default=str)),
+            "created_wall_time_s": datetime.now().timestamp(),
+        }
+    )
+
+
 def _normalize_modality(value: str) -> str:
     modality = str(value or "force").lower()
     if modality not in {"force", "risk", "delay"}:
@@ -448,16 +465,44 @@ def main() -> None:
     )
 
     config = SessionConfig.from_yaml(args.config)
+    config.session_export.source_config_path = str(args.config)
     if args.monitor and args.no_monitor:
         parser.error("--monitor cannot be combined with --no-monitor")
     if args.monitor:
         config.monitor.enabled = True
+        _record_cli_override(
+            config,
+            source="hf-dm-run --monitor",
+            values={"monitor.enabled": True},
+        )
     if args.no_monitor:
         config.monitor.enabled = False
+        _record_cli_override(
+            config,
+            source="hf-dm-run --no-monitor",
+            values={"monitor.enabled": False},
+        )
     if any(frame2ttl_modes):
         config.camera.record_video = False
         config.camera.required = False
         config.speaker.required = False
+        mode = (
+            "frame2ttl_diagnostic"
+            if args.frame2ttl_diagnostic
+            else "frame2ttl_barcode_diagnostic"
+            if args.frame2ttl_barcode_diagnostic
+            else "bpod_opcode_diagnostic"
+        )
+        _record_cli_override(
+            config,
+            source=f"hf-dm-run --{mode.replace('_', '-')}",
+            values={
+                "diagnostic_mode": mode,
+                "camera.record_video": False,
+                "camera.required": False,
+                "speaker.required": False,
+            },
+        )
     setup_requested = (
         args.session_mouse_dir is not None
         or args.session_modality is not None
@@ -475,7 +520,13 @@ def main() -> None:
         and not any(frame2ttl_modes)
     )
     if should_show_setup:
-        _apply_session_setup(config, _run_session_setup_dialog())
+        setup = _run_session_setup_dialog()
+        _apply_session_setup(config, setup)
+        _record_cli_override(
+            config,
+            source="hf-dm-run session setup dialog",
+            values={"setup": asdict(setup)},
+        )
     elif setup_requested:
         if args.session_mouse_dir is not None:
             setup = _setup_from_values(
@@ -487,19 +538,32 @@ def main() -> None:
                 session_name=args.session_name,
             )
             _apply_session_setup(config, setup)
+            _record_cli_override(
+                config,
+                source="hf-dm-run session setup arguments",
+                values={"setup": asdict(setup)},
+            )
         else:
+            session_arg_overrides: dict[str, object] = {}
             if args.session_modality is not None:
                 config.task.modality = args.session_modality
+                session_arg_overrides["task.modality"] = args.session_modality
             if args.session_profile is not None:
                 free, forced = PROFILE_COUNTS[args.session_profile]
                 config.task.profile_name = args.session_profile
                 config.task.n_free_trials = free
                 config.task.n_forced_trials = forced
                 config.n_trials = free + forced
+                session_arg_overrides["task.profile_name"] = args.session_profile
+                session_arg_overrides["task.n_free_trials"] = free
+                session_arg_overrides["task.n_forced_trials"] = forced
+                session_arg_overrides["n_trials"] = config.n_trials
             if args.free_trials is not None:
                 config.task.n_free_trials = max(0, int(args.free_trials))
+                session_arg_overrides["task.n_free_trials"] = config.task.n_free_trials
             if args.forced_trials is not None:
                 config.task.n_forced_trials = max(0, int(args.forced_trials))
+                session_arg_overrides["task.n_forced_trials"] = config.task.n_forced_trials
             if args.free_trials is not None or args.forced_trials is not None:
                 free = (
                     config.task.n_free_trials
@@ -507,6 +571,12 @@ def main() -> None:
                     else config.n_trials
                 )
                 config.n_trials = int(free) + int(config.task.n_forced_trials)
+                session_arg_overrides["n_trials"] = config.n_trials
+            _record_cli_override(
+                config,
+                source="hf-dm-run session arguments",
+                values=session_arg_overrides,
+            )
     if args.cap_touch_diagnostic:
         run_cap_touch_diagnostic(
             config,
@@ -522,13 +592,38 @@ def main() -> None:
         if args.simulate_headless:
             os.environ["SDL_VIDEODRIVER"] = "dummy"
             config.monitor.enabled = False
+            _record_cli_override(
+                config,
+                source="hf-dm-run --simulate-headless",
+                values={"monitor.enabled": False, "SDL_VIDEODRIVER": "dummy"},
+            )
         shorten_for_simulation(config, n_trials=args.simulate_trials)
+        _record_cli_override(
+            config,
+            source="hf-dm-run --simulate",
+            values={
+                "simulate_choice_mode": args.simulate_choice_mode,
+                "simulate_trials": args.simulate_trials,
+                "shortened_timing": True,
+                "n_trials": config.n_trials,
+            },
+        )
         session = SimulatedHFDecisionSession(
             config,
             SimulationOptions(choice_mode=args.simulate_choice_mode),
         )
     elif args.hardware_self_test:
         shorten_for_hardware_self_test(config)
+        _record_cli_override(
+            config,
+            source="hf-dm-run --hardware-self-test",
+            values={
+                "shortened_timing": True,
+                "n_trials": config.n_trials,
+                "camera.record_video": config.camera.record_video,
+                "camera.required": config.camera.required,
+            },
+        )
         logging.warning(
             "HARDWARE SELF-TEST: activating real force, pump, audible speaker, camera, and outputs"
         )

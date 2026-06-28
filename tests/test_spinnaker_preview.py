@@ -1,6 +1,10 @@
 import threading
+import sys
+import types
 
 from hf_dm.camera.spinnaker import _PreviewDispatcher, _downsample_pgm_file_preview
+from hf_dm.camera.spinnaker import _capture_stats
+from hf_dm.data.video_export import export_preview_video
 
 
 def test_preview_dispatcher_keeps_latest_frame_when_callback_is_busy():
@@ -48,3 +52,62 @@ def test_downsample_pgm_file_preview_handles_crlf_header_separator(tmp_path):
     preview = _downsample_pgm_file_preview(path, max_width=2, max_height=2)
 
     assert preview == (2, 2, bytes([0, 2, 8, 10]))
+
+
+def test_export_preview_video_writes_saved_pgm_sequence(tmp_path, monkeypatch):
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    (video_dir / "recording_summary.json").write_text(
+        '{"target_trigger_hz": 20}',
+        encoding="utf-8",
+    )
+    for index in range(2):
+        (video_dir / f"frame_{index:09d}.pgm").write_bytes(
+            b"P5\n2 2\n255\n" + bytes([index, index + 1, index + 2, index + 3])
+        )
+
+    written_shapes = []
+
+    class FakeWriter:
+        def __init__(self, *args):
+            self.args = args
+
+        def isOpened(self):
+            return True
+
+        def write(self, frame):
+            written_shapes.append(tuple(frame.shape))
+
+        def release(self):
+            pass
+
+    fake_cv2 = types.SimpleNamespace(
+        VideoWriter_fourcc=lambda *codec: 0,
+        VideoWriter=FakeWriter,
+    )
+    monkeypatch.setitem(sys.modules, "cv2", fake_cv2)
+
+    result = export_preview_video(video_dir)
+
+    assert result["frames_written"] == 2
+    assert result["fps"] == 20.0
+    assert written_shapes == [(2, 2), (2, 2)]
+    assert (video_dir / "preview_video_export.json").exists()
+
+
+def test_capture_stats_counts_saved_skipped_and_observed_frames():
+    stats = _capture_stats(
+        frames_saved=10,
+        incomplete_frames=2,
+        acquisition_timeouts=3,
+        save_errors=1,
+    )
+
+    assert stats == {
+        "frames_saved": 10,
+        "incomplete_frames": 2,
+        "acquisition_timeouts": 3,
+        "save_errors": 1,
+        "frames_skipped": 5,
+        "frames_observed": 15,
+    }

@@ -63,7 +63,7 @@ def _serial_module_name(bpod: Bpod, serial_channel_index: int) -> str:
 
 
 class SerialRelay:
-    """Preload serial messages and expose FSM action names for bpod-core."""
+    """Preload outbound serial messages without relaying module bytes to Bpod USB."""
 
     def __init__(
         self,
@@ -75,7 +75,10 @@ class SerialRelay:
         self.bpod = bpod
         self.module_name = _serial_module_name(bpod, serial_channel_index)
         self.module = bpod.modules[self.module_name]
-        self.module.set_relay(True)
+        # Bpod's module relay forwards incoming module bytes onto the same USB
+        # stream used for FSM timestamps/events. Outbound messages work with it
+        # disabled, and enabling it lets StreamDIO replies corrupt that stream.
+        self.module.set_relay(False)
         self.ids = RelayMessageIds()
         self._serial_channel_index = serial_channel_index
         self.speaker_gate_active_high = bool(speaker_gate_active_high)
@@ -124,13 +127,21 @@ class SerialRelay:
         return STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID.get(int(message_id))
 
     def send_bytes(self, byte_values: list[int], inter_byte_s: float = 0.002) -> None:
-        """Send raw bytes through the selected Bpod serial relay immediately."""
-        self.module.set_relay(True)
+        """Send raw bytes to the selected Bpod module port immediately."""
+        self.module.set_relay(False)
         output_name = f"Serial{self._serial_channel_index + 1}"
         output = self.bpod.outputs[output_name]
         for value in byte_values:
             output.override(int(value))
             time.sleep(inter_byte_s)
+
+    def prepare_bpod_run(self) -> int:
+        """Disable incoming relay and clear idle USB bytes before an FSM starts."""
+        self.module.set_relay(False)
+        serial = self.bpod.serial0
+        pending = max(0, int(getattr(serial, "in_waiting", 0) or 0))
+        serial.reset_input_buffer()
+        return pending
 
     def set_channel_state(self, channel: int, state: bool) -> None:
         self.send_bytes([int(channel), 1 if state else 0])

@@ -24,6 +24,47 @@ def _preview_due(last_preview_mono_s: float, min_interval_s: float) -> bool:
     return time.perf_counter() - last_preview_mono_s >= max(0.0, float(min_interval_s))
 
 
+def _duration_s(start_wall_s: float | None, stop_wall_s: float | None) -> float | None:
+    if start_wall_s is None or stop_wall_s is None:
+        return None
+    return max(0.0, float(stop_wall_s) - float(start_wall_s))
+
+
+def _mean_fps(frame_count: int, duration_s: float | None) -> float | None:
+    if duration_s is None or duration_s <= 0.0:
+        return None
+    return float(frame_count) / duration_s
+
+
+def _estimated_missing_triggers(
+    frame_count: int,
+    target_hz: int,
+    duration_s: float | None,
+) -> int | None:
+    if duration_s is None or duration_s <= 0.0 or target_hz <= 0:
+        return None
+    expected = int(round(float(target_hz) * duration_s))
+    return max(0, expected - int(frame_count))
+
+
+def _capture_stats(
+    *,
+    frames_saved: int,
+    incomplete_frames: int,
+    acquisition_timeouts: int,
+    save_errors: int = 0,
+) -> dict[str, int]:
+    skipped = max(0, int(incomplete_frames)) + max(0, int(acquisition_timeouts))
+    return {
+        "frames_saved": max(0, int(frames_saved)),
+        "incomplete_frames": max(0, int(incomplete_frames)),
+        "acquisition_timeouts": max(0, int(acquisition_timeouts)),
+        "save_errors": max(0, int(save_errors)),
+        "frames_skipped": skipped,
+        "frames_observed": max(0, int(frames_saved)) + skipped,
+    }
+
+
 def _downsample_array_preview(
     array: Any,
     *,
@@ -248,6 +289,10 @@ class _SpinnakerCRecorder:
         fps: int,
         exposure_us: int,
         pixel_format: str,
+        roi_width: int | None = None,
+        roi_height: int | None = None,
+        roi_offset_x: int | None = None,
+        roi_offset_y: int | None = None,
         gain_db: float | None,
         gamma: float | None,
         acquisition_timeout_ms: int,
@@ -261,6 +306,10 @@ class _SpinnakerCRecorder:
         self._fps = int(fps)
         self._exposure_us = int(exposure_us)
         self._pixel_format = str(pixel_format)
+        self._roi_width = None if roi_width is None else int(roi_width)
+        self._roi_height = None if roi_height is None else int(roi_height)
+        self._roi_offset_x = None if roi_offset_x is None else int(roi_offset_x)
+        self._roi_offset_y = None if roi_offset_y is None else int(roi_offset_y)
         self._gain_db = gain_db
         self._gamma = gamma
         self._acquisition_timeout_ms = int(acquisition_timeout_ms)
@@ -278,6 +327,9 @@ class _SpinnakerCRecorder:
         self._thread: threading.Thread | None = None
         self._error: str | None = None
         self._frame_count = 0
+        self._incomplete_frames = 0
+        self._acquisition_timeouts = 0
+        self._save_errors = 0
         self._start_wall_s: float | None = None
         self._stop_wall_s: float | None = None
         self._dll_dir_handle: Any = None
@@ -297,6 +349,14 @@ class _SpinnakerCRecorder:
     @property
     def error(self) -> str | None:
         return self._error
+
+    def _roi_summary(self) -> dict[str, int | None]:
+        return {
+            "width": self._roi_width,
+            "height": self._roi_height,
+            "offset_x": self._roi_offset_x,
+            "offset_y": self._roi_offset_y,
+        }
 
     def start(self) -> Path:
         try:
@@ -346,11 +406,31 @@ class _SpinnakerCRecorder:
             "backend": "spinnaker_c",
             "session_dir": str(self.session_dir),
             "frames_saved": int(self._frame_count),
+            "capture_stats": _capture_stats(
+                frames_saved=self._frame_count,
+                incomplete_frames=self._incomplete_frames,
+                acquisition_timeouts=self._acquisition_timeouts,
+                save_errors=self._save_errors,
+            ),
+            "target_trigger_hz": int(self._fps),
+            "exposure_us": int(self._exposure_us),
+            "pixel_format": self._pixel_format,
+            "roi": self._roi_summary(),
             "preview_frames": int(self._preview_count),
             "preview_frames_delivered": int(self._preview_dispatcher.delivered_count),
             "frame_timestamps_csv": str(self.session_dir / "frame_timestamps.csv"),
             "start_wall_s": self._start_wall_s,
             "stop_wall_s": self._stop_wall_s,
+            "duration_s": _duration_s(self._start_wall_s, self._stop_wall_s),
+            "mean_saved_fps": _mean_fps(
+                self._frame_count,
+                _duration_s(self._start_wall_s, self._stop_wall_s),
+            ),
+            "estimated_missing_triggers": _estimated_missing_triggers(
+                self._frame_count,
+                self._fps,
+                _duration_s(self._start_wall_s, self._stop_wall_s),
+            ),
             "capture_error": self._error,
             "cleanup_error": "; ".join(cleanup_errors) or None,
         }
@@ -423,6 +503,7 @@ class _SpinnakerCRecorder:
         self._bind("spinEnumerationEntryGetIntValue", [void_p, ctypes.POINTER(ctypes.c_int64)])
         self._bind("spinEnumerationSetIntValue", [void_p, ctypes.c_int64])
         self._bind("spinFloatSetValue", [void_p, ctypes.c_double])
+        self._bind_optional("spinIntegerSetValue", [void_p, ctypes.c_int64])
         self._bind("spinBooleanSetValue", [void_p, ctypes.c_ubyte])
         self._bind(
             "spinStringGetValue",
@@ -501,6 +582,7 @@ class _SpinnakerCRecorder:
         self._set_enum(node_map, "ExposureAuto", "Off")
         self._set_float(node_map, "ExposureTime", self._exposure_us)
         self._set_enum(node_map, "ExposureMode", "TriggerWidth")
+        self._apply_roi(node_map)
         self._set_enum(node_map, "PixelFormat", self._pixel_format)
         if self._gain_db is not None:
             self._set_enum(node_map, "GainAuto", "Off")
@@ -545,6 +627,26 @@ class _SpinnakerCRecorder:
         if result != 0:
             logger.debug("Could not set Spinnaker float %s=%s (%d)", name, value, result)
 
+    def _set_int(self, node_map: ctypes.c_void_p, name: str, value: int) -> None:
+        if "spinIntegerSetValue" not in self._fn:
+            return
+        node = self._get_node(node_map, name)
+        if node is None:
+            return
+        result = self._fn["spinIntegerSetValue"](node, int(value))
+        if result != 0:
+            logger.debug("Could not set Spinnaker integer %s=%s (%d)", name, value, result)
+
+    def _apply_roi(self, node_map: ctypes.c_void_p) -> None:
+        for node_name, value in (
+            ("OffsetX", self._roi_offset_x),
+            ("OffsetY", self._roi_offset_y),
+            ("Width", self._roi_width),
+            ("Height", self._roi_height),
+        ):
+            if value is not None:
+                self._set_int(node_map, node_name, max(0, int(value)))
+
     def _set_bool(self, node_map: ctypes.c_void_p, name: str, value: bool) -> None:
         node = self._get_node(node_map, name)
         if node is None:
@@ -565,6 +667,7 @@ class _SpinnakerCRecorder:
                 )
             )
             if result == self._TIMEOUT_ERROR:
+                self._acquisition_timeouts += 1
                 continue
             if result != 0:
                 self._error = f"spinCameraGetNextImageEx failed with Spinnaker error {result}"
@@ -573,14 +676,17 @@ class _SpinnakerCRecorder:
             try:
                 incomplete = ctypes.c_ubyte()
                 if self._fn["spinImageIsIncomplete"](image, ctypes.byref(incomplete)) != 0:
+                    self._incomplete_frames += 1
                     continue
                 if incomplete.value:
+                    self._incomplete_frames += 1
                     continue
                 frame_index = self._frame_count
                 filename = f"frame_{frame_index:09d}.pgm"
                 frame_path = self.session_dir / filename
                 result = int(self._fn["spinImageSaveFromExt"](image, os.fsencode(frame_path)))
                 if result != 0:
+                    self._save_errors += 1
                     self._error = f"spinImageSaveFromExt failed with Spinnaker error {result}"
                     logger.error("Spinnaker C capture loop error: %s", self._error)
                     break
@@ -685,6 +791,10 @@ class HeadlessSpinnakerRecorder:
         fps: int = 30,
         exposure_us: int = 10_000,
         pixel_format: str = "Mono8",
+        roi_width: int | None = None,
+        roi_height: int | None = None,
+        roi_offset_x: int | None = None,
+        roi_offset_y: int | None = None,
         gain_db: float | None = None,
         gamma: float | None = None,
         acquisition_timeout_ms: int = 1000,
@@ -700,6 +810,10 @@ class HeadlessSpinnakerRecorder:
         self._fps = int(fps)
         self._exposure_us = int(exposure_us)
         self._pixel_format = str(pixel_format)
+        self._roi_width = None if roi_width is None else int(roi_width)
+        self._roi_height = None if roi_height is None else int(roi_height)
+        self._roi_offset_x = None if roi_offset_x is None else int(roi_offset_x)
+        self._roi_offset_y = None if roi_offset_y is None else int(roi_offset_y)
         self._gain_db = gain_db
         self._gamma = gamma
         self._acquisition_timeout_ms = int(acquisition_timeout_ms)
@@ -719,6 +833,9 @@ class HeadlessSpinnakerRecorder:
         self._thread: threading.Thread | None = None
         self._error: str | None = None
         self._frame_count = 0
+        self._incomplete_frames = 0
+        self._acquisition_timeouts = 0
+        self._save_errors = 0
         self._start_wall_s: float | None = None
         self._stop_wall_s: float | None = None
 
@@ -740,6 +857,14 @@ class HeadlessSpinnakerRecorder:
             return self._c_backend.error
         return self._error
 
+    def _roi_summary(self) -> dict[str, int | None]:
+        return {
+            "width": self._roi_width,
+            "height": self._roi_height,
+            "offset_x": self._roi_offset_x,
+            "offset_y": self._roi_offset_y,
+        }
+
     def start(self) -> Path:
         """Start camera acquisition and background frame saving."""
         self.session_dir.mkdir(parents=True, exist_ok=True)
@@ -754,6 +879,10 @@ class HeadlessSpinnakerRecorder:
                 fps=self._fps,
                 exposure_us=self._exposure_us,
                 pixel_format=self._pixel_format,
+                roi_width=self._roi_width,
+                roi_height=self._roi_height,
+                roi_offset_x=self._roi_offset_x,
+                roi_offset_y=self._roi_offset_y,
                 gain_db=self._gain_db,
                 gamma=self._gamma,
                 acquisition_timeout_ms=self._acquisition_timeout_ms,
@@ -810,11 +939,31 @@ class HeadlessSpinnakerRecorder:
             "backend": self.backend,
             "session_dir": str(self.session_dir),
             "frames_saved": int(self._frame_count),
+            "capture_stats": _capture_stats(
+                frames_saved=self._frame_count,
+                incomplete_frames=self._incomplete_frames,
+                acquisition_timeouts=self._acquisition_timeouts,
+                save_errors=self._save_errors,
+            ),
+            "target_trigger_hz": int(self._fps),
+            "exposure_us": int(self._exposure_us),
+            "pixel_format": self._pixel_format,
+            "roi": self._roi_summary(),
             "preview_frames": int(self._preview_count),
             "preview_frames_delivered": int(self._preview_dispatcher.delivered_count),
             "frame_timestamps_csv": str(self.session_dir / "frame_timestamps.csv"),
             "start_wall_s": self._start_wall_s,
             "stop_wall_s": self._stop_wall_s,
+            "duration_s": _duration_s(self._start_wall_s, self._stop_wall_s),
+            "mean_saved_fps": _mean_fps(
+                self._frame_count,
+                _duration_s(self._start_wall_s, self._stop_wall_s),
+            ),
+            "estimated_missing_triggers": _estimated_missing_triggers(
+                self._frame_count,
+                self._fps,
+                _duration_s(self._start_wall_s, self._stop_wall_s),
+            ),
             "capture_error": self._error,
             "cleanup_error": cleanup_error,
         }
@@ -886,6 +1035,7 @@ class HeadlessSpinnakerRecorder:
         if PySpin.IsWritable(self._camera.ExposureTime):
             self._camera.ExposureTime.SetValue(float(self._exposure_us))
         self._set_pyspin_enum(nodemap, "ExposureMode", "TriggerWidth")
+        self._apply_pyspin_roi(nodemap)
 
         if self._gain_db is not None and PySpin.IsWritable(self._camera.GainAuto):
             self._camera.GainAuto.SetValue(PySpin.GainAuto_Off)
@@ -921,6 +1071,22 @@ class HeadlessSpinnakerRecorder:
         if PySpin.IsAvailable(entry) and PySpin.IsReadable(entry):
             node.SetIntValue(entry.GetValue())
 
+    def _set_pyspin_int(self, nodemap: Any, node_name: str, value: int) -> None:
+        PySpin = self._pyspin
+        node = PySpin.CIntegerPtr(nodemap.GetNode(node_name))
+        if PySpin.IsAvailable(node) and PySpin.IsWritable(node):
+            node.SetValue(max(0, int(value)))
+
+    def _apply_pyspin_roi(self, nodemap: Any) -> None:
+        for node_name, value in (
+            ("OffsetX", self._roi_offset_x),
+            ("OffsetY", self._roi_offset_y),
+            ("Width", self._roi_width),
+            ("Height", self._roi_height),
+        ):
+            if value is not None:
+                self._set_pyspin_int(nodemap, node_name, value)
+
     def _capture_loop(self) -> None:
         assert self._camera is not None
         assert self._timestamps is not None
@@ -929,11 +1095,16 @@ class HeadlessSpinnakerRecorder:
             try:
                 image = self._camera.GetNextImage(int(self._acquisition_timeout_ms))
                 if image.IsIncomplete():
+                    self._incomplete_frames += 1
                     continue
                 frame_index = self._frame_count
                 filename = f"frame_{frame_index:09d}.png"
                 frame_path = self.session_dir / filename
-                image.Save(str(frame_path))
+                try:
+                    image.Save(str(frame_path))
+                except Exception:
+                    self._save_errors += 1
+                    raise
                 camera_timestamp = None
                 try:
                     camera_timestamp = int(image.GetTimeStamp())
@@ -948,6 +1119,7 @@ class HeadlessSpinnakerRecorder:
                 self._frame_count += 1
             except Exception as exc:  # pragma: no cover - device-specific
                 if "timeout" in str(exc).lower() and self._running:
+                    self._acquisition_timeouts += 1
                     continue
                 self._error = f"{type(exc).__name__}: {exc}"
                 logger.error("Spinnaker capture loop error: %s", self._error)
