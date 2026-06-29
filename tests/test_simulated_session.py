@@ -141,6 +141,113 @@ def test_default_balancing_preserves_seeded_trial_record_snapshot(tmp_path):
     assert all(trial.reward_volume_ul is None for trial in session.recorder.trials)
 
 
+def test_extracted_runners_preserve_trial_records_and_event_stream(tmp_path):
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    config = SessionConfig(n_trials=3, random_seed=23, results_dir=str(tmp_path))
+    config.camera.record_video = False
+    config.frame2ttl.enabled = False
+    shorten_for_simulation(config)
+    session = SimulatedHFDecisionSession(
+        config,
+        SimulationOptions(choice_mode="alternate", frames_to_choice=2),
+    )
+
+    session.connect()
+    session.run()
+
+    trial_records = [
+        (
+            trial.trial_index,
+            trial.star_side,
+            trial.circle_side,
+            trial.choice,
+            trial.chosen_shape,
+            trial.choice_side,
+            trial.matched,
+            trial.responded,
+            trial.reward_duration_s,
+            trial.trial_mode,
+            trial.forced_shape,
+            trial.modality,
+            trial.reward_delivered,
+            trial.bpod_state_entries,
+        )
+        for trial in session.recorder.trials
+    ]
+    assert trial_records == [
+        (1, "left", "right", "cw", "star", "left", True, True, 0.08, "free", None, "force", True, 5),
+        (2, "right", "left", "cw", "circle", "left", False, True, 0.04, "free", None, "force", True, 5),
+        (3, "right", "left", "timeout", None, None, False, False, 0.0, "free", None, "force", False, 4),
+    ]
+
+    session_start = [
+        "session_start",
+        "session_metadata",
+        "streamdio_streaming_started",
+        "all_off_startup_verified",
+        "white_noise_ready",
+        "cap_touch_power_on",
+        "streamdio_camera_triggers_started",
+        "hardware_connected",
+    ]
+    responded_trial = [
+        "trial_start",
+        "fsm_definition_added",
+        "bpod_state_marker",
+        "bpod_state_marker",
+        "force_on",
+        "lick_edge",
+        "lick",
+        "stimulus_on",
+        "choice_detected",
+        "bpod_state_marker",
+        "force_off",
+        "stimulus_off",
+        "bpod_state_marker",
+        "pump_start",
+        "bpod_state_marker",
+        "pump_end",
+        "bpod_trial_complete",
+        "choice_loop_stats",
+        "trial_end",
+    ]
+    timeout_trial = [
+        "trial_start",
+        "fsm_definition_added",
+        "bpod_state_marker",
+        "bpod_state_marker",
+        "force_on",
+        "lick_edge",
+        "lick",
+        "stimulus_on",
+        "bpod_state_marker",
+        "force_off",
+        "white_noise_start",
+        "stimulus_off",
+        "choice_timeout",
+        "bpod_state_marker",
+        "white_noise_end",
+        "bpod_trial_complete",
+        "choice_loop_stats",
+        "trial_end",
+    ]
+    session_end = [
+        "task_outputs_cleanup_verified",
+        "speaker_gate_cleanup",
+        "streamdio_camera_triggers_stopped",
+        "all_off_cleanup_verified",
+        "session_end",
+    ]
+    event_stream = [event.event_type for event in session.recorder.events]
+    assert event_stream == (
+        session_start
+        + responded_trial
+        + responded_trial
+        + timeout_trial
+        + session_end
+    )
+
+
 def test_blocked_side_schedule_is_balanced_reproducible_and_capped():
     config = SessionConfig(n_trials=200, random_seed=71)
     config.task.side_balancing = "blocked"

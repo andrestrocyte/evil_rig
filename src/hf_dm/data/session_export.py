@@ -1044,6 +1044,7 @@ def _manifest(
         },
         "stream_summaries": metadata.get("stream_summaries") or {},
         "video": video_summary,
+        "clock_alignment": _clock_alignment(event_dicts, streamdio_rows, metadata),
         "artifacts": artifact_entries,
         "fsm_definition_count": (
             len(fsm_definitions)
@@ -1059,6 +1060,116 @@ def _manifest(
     if continuous_streams is not None:
         manifest["continuous_streams"] = continuous_streams
     return manifest
+
+
+def _clock_alignment(
+    events: list[dict[str, Any]],
+    streamdio_rows: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    wall_perf_anchors: list[tuple[float, float]] = []
+    module_perf_anchors: list[tuple[float, float]] = []
+    module_wall_anchors: list[tuple[float, float]] = []
+
+    for event in events:
+        event_type = str(event.get("event_type", ""))
+        if event_type not in {"bpod_state_marker", "frame2ttl_edge"}:
+            continue
+        payload = event.get("payload") or {}
+        record_perf_s = _finite_float(event.get("monotonic_s"))
+        payload_perf_s = _finite_float(payload.get("host_perf_counter_s"))
+        perf_s = payload_perf_s if payload_perf_s is not None else record_perf_s
+        wall_s = _finite_float(payload.get("wall_time_s", event.get("wall_time_s")))
+        module_us = _finite_float(
+            payload.get("module_timestamp_us", payload.get("timestamp_us"))
+        )
+        module_s = None if module_us is None else module_us / 1_000_000.0
+        wall_perf_s = (
+            payload_perf_s
+            if payload.get("wall_time_s") is not None
+            else record_perf_s
+        )
+        if wall_perf_s is not None and wall_s is not None:
+            wall_perf_anchors.append((wall_perf_s, wall_s))
+        if module_s is not None and perf_s is not None:
+            module_perf_anchors.append((module_s, perf_s))
+        if module_s is not None and wall_s is not None:
+            module_wall_anchors.append((module_s, wall_s))
+
+    frame2ttl_channel = _frame2ttl_channel(metadata)
+    for row in streamdio_rows:
+        if row.get("event_type") != "dio_input":
+            continue
+        if _optional_int(row.get("channel")) != frame2ttl_channel:
+            continue
+        module_us = _finite_float(row.get("module_timestamp_us"))
+        perf_s = _finite_float(row.get("host_perf_counter_s"))
+        if module_us is not None and perf_s is not None:
+            module_perf_anchors.append((module_us / 1_000_000.0, perf_s))
+
+    return {
+        "model": "target_s = slope * source_s + intercept",
+        "pairs": {
+            "perf_counter_to_wall": _fit_affine_clock_pair(
+                wall_perf_anchors,
+                source_clock="perf_counter_s",
+                target_clock="wall_time_s",
+            ),
+            "streamdio_to_perf_counter": _fit_affine_clock_pair(
+                module_perf_anchors,
+                source_clock="streamdio_module_s",
+                target_clock="perf_counter_s",
+            ),
+            "streamdio_to_wall": _fit_affine_clock_pair(
+                module_wall_anchors,
+                source_clock="streamdio_module_s",
+                target_clock="wall_time_s",
+            ),
+        },
+    }
+
+
+def _fit_affine_clock_pair(
+    anchors: list[tuple[float, float]],
+    *,
+    source_clock: str,
+    target_clock: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "source_clock": source_clock,
+        "target_clock": target_clock,
+        "status": "insufficient_anchors",
+        "slope": None,
+        "intercept": None,
+        "n_anchors": len(anchors),
+        "max_abs_residual_s": None,
+        "rms_residual_s": None,
+    }
+    if len(anchors) < 2:
+        return result
+
+    source = np.asarray([anchor[0] for anchor in anchors], dtype=float)
+    target = np.asarray([anchor[1] for anchor in anchors], dtype=float)
+    source_centered = source - float(np.mean(source))
+    denominator = float(np.dot(source_centered, source_centered))
+    if denominator <= np.finfo(float).eps:
+        result["status"] = "degenerate_anchors"
+        return result
+
+    target_centered = target - float(np.mean(target))
+    slope = float(np.dot(source_centered, target_centered) / denominator)
+    intercept = float(np.mean(target) - slope * np.mean(source))
+    residuals = target - (slope * source + intercept)
+    result.update(
+        {
+            "status": "ok",
+            "slope": slope,
+            "intercept": intercept,
+            "max_abs_residual_s": float(np.max(np.abs(residuals))),
+            "rms_residual_s": float(np.sqrt(np.mean(np.square(residuals)))),
+        }
+    )
+    return result
 
 
 def _continuous_stream_summary(
@@ -1208,6 +1319,13 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _finite_float(value: Any) -> float | None:
+    parsed = _optional_float(value)
+    if parsed is None or not np.isfinite(parsed):
+        return None
+    return parsed
 
 
 def _first_mono(events: list[dict[str, Any]]) -> float:

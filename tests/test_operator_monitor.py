@@ -267,6 +267,158 @@ def test_choice_history_is_a_rolling_ten_and_replaces_trial_updates():
     assert state.outcomes[-1]["matched"]
 
 
+def test_psychometric_summary_uses_all_trials_and_replaces_trial_updates():
+    state = OperatorMonitorState(history_s=10.0, trial_history=3)
+    trial_results = [
+        (1, True, True, 1.0, "right"),
+        (2, True, False, 2.0, "left"),
+        (3, False, False, 20.0, None),
+        (4, True, True, 3.0, "right"),
+        (5, True, False, 4.0, "right"),
+    ]
+    for trial_index, responded, matched, response_time_s, choice_side in trial_results:
+        state.apply(
+            {
+                "type": "trial_result",
+                "payload": {
+                    "trial_index": trial_index,
+                    "responded": responded,
+                    "matched": matched,
+                    "response_time_s": response_time_s,
+                    "choice_side": choice_side,
+                },
+            }
+        )
+
+    assert len(state.outcomes) == 3
+    assert state.psychometric_summary() == {
+        "n_trials": 5,
+        "n_responded": 4,
+        "matched_rate": 0.5,
+        "mean_response_time_s": 2.5,
+        "side_bias": 0.5,
+        "n_left": 1,
+        "n_right": 3,
+    }
+
+    state.apply(
+        {
+            "type": "trial_result",
+            "payload": {
+                "trial_index": 5,
+                "responded": True,
+                "matched": True,
+                "response_time_s": 5.0,
+                "choice_side": "left",
+            },
+        }
+    )
+
+    assert state.psychometric_summary() == {
+        "n_trials": 5,
+        "n_responded": 4,
+        "matched_rate": 0.75,
+        "mean_response_time_s": 2.75,
+        "side_bias": 0.0,
+        "n_left": 2,
+        "n_right": 2,
+    }
+
+
+def test_monitor_window_constructs_and_renders_psychometric_panel_headless(monkeypatch):
+    class Root:
+        def title(self, _value):
+            pass
+
+        def configure(self, **_kwargs):
+            pass
+
+        def geometry(self, _value):
+            pass
+
+        def minsize(self, _width, _height):
+            pass
+
+        def protocol(self, _name, _callback):
+            pass
+
+    class Canvas:
+        def __init__(self, *_args, **_kwargs):
+            self.texts = []
+
+        def pack(self, **_kwargs):
+            pass
+
+        def bind(self, _event, _callback):
+            pass
+
+        def delete(self, _target):
+            pass
+
+        def create_text(self, *_args, **kwargs):
+            self.texts.append(str(kwargs.get("text", "")))
+            return len(self.texts)
+
+        def __getattr__(self, name):
+            if name.startswith("create_"):
+                return lambda *_args, **_kwargs: 1
+            raise AttributeError(name)
+
+    class Tk:
+        pass
+
+    tk = Tk()
+    tk.Canvas = Canvas
+
+    monkeypatch.setattr("hf_dm.monitor.gui._pick_display_bounds", lambda _index: None)
+    window = _MonitorWindow(
+        Root(),
+        MonitorConfig(enabled=True),
+        queue.Queue(),
+        queue.Queue(),
+        queue.Queue(),
+        queue.Queue(),
+        tk,
+    )
+    window.state.apply(
+        {
+            "type": "trial_result",
+            "payload": {
+                "trial_index": 1,
+                "responded": True,
+                "matched": True,
+                "response_time_s": 1.25,
+                "choice_side": "right",
+                "chosen_shape": "star",
+            },
+        }
+    )
+
+    window._render()
+
+    assert window._render_count == 1
+    assert "Behavior" in window.canvas.texts
+    assert "Matched" in window.canvas.texts
+    assert "Mean RT" in window.canvas.texts
+    assert "Side bias" in window.canvas.texts
+    assert "100%" in window.canvas.texts
+    assert "1.25 s" in window.canvas.texts
+
+
+def test_disabled_monitor_path_does_not_construct_monitor(monkeypatch):
+    session = HFDecisionSession(SessionConfig())
+    assert session.config.monitor.enabled is False
+
+    def fail_if_constructed(_config):
+        raise AssertionError("disabled monitor must not be constructed")
+
+    monkeypatch.setattr("hf_dm.session.controller.OperatorMonitor", fail_if_constructed)
+
+    session._start_operator_monitor()
+
+    assert session.monitor is None
+
+
 def test_choice_history_renderer_places_all_ten_icons_in_one_row():
     state = OperatorMonitorState(history_s=10.0, trial_history=12)
     for trial_index in range(1, 13):

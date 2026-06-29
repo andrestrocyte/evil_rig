@@ -10,6 +10,7 @@ from hf_dm.config import SessionConfig, config_to_dict
 from hf_dm.data.recorder import SessionRecorder, SessionSummary, TrialRecord
 from hf_dm.data.session_bundle import SessionBundle
 from hf_dm.data.session_export import (
+    _clock_alignment,
     export_existing_session,
     resolve_session_output,
     sha256_file,
@@ -64,6 +65,72 @@ def test_trial_record_derives_camera_ttl_interval_stats():
     assert trial.camera_ttl_interval_count == 2
     assert np.isclose(trial.camera_ttl_mean_interval_s, 0.034)
     assert np.isclose(trial.camera_ttl_max_interval_s, 0.034)
+
+
+def test_clock_alignment_fits_state_marker_and_frame2ttl_anchors():
+    events = [
+        {
+            "event_type": "bpod_state_marker",
+            "wall_time_s": 100.0 + 2.0 * index,
+            "monotonic_s": 10.0 + index,
+            "payload": {
+                "module_timestamp_us": (5 + index) * 1_000_000,
+                "host_perf_counter_s": 10.0 + index,
+            },
+        }
+        for index in range(3)
+    ]
+    streamdio_rows = [
+        {
+            "event_type": "dio_input",
+            "channel": 5,
+            "module_timestamp_us": 8_000_000,
+            "host_perf_counter_s": 13.0,
+        },
+        {
+            "event_type": "dio_input",
+            "channel": 5,
+            "module_timestamp_us": 9_000_000,
+            "host_perf_counter_s": 14.0,
+        },
+    ]
+
+    alignment = _clock_alignment(
+        events,
+        streamdio_rows,
+        {"config": {"frame2ttl": {"input_channel": 5}}},
+    )
+
+    pairs = alignment["pairs"]
+    assert pairs["perf_counter_to_wall"] == {
+        "source_clock": "perf_counter_s",
+        "target_clock": "wall_time_s",
+        "status": "ok",
+        "slope": 2.0,
+        "intercept": 80.0,
+        "n_anchors": 3,
+        "max_abs_residual_s": 0.0,
+        "rms_residual_s": 0.0,
+    }
+    assert pairs["streamdio_to_perf_counter"]["status"] == "ok"
+    assert pairs["streamdio_to_perf_counter"]["n_anchors"] == 5
+    assert np.isclose(pairs["streamdio_to_perf_counter"]["slope"], 1.0)
+    assert np.isclose(pairs["streamdio_to_perf_counter"]["intercept"], 5.0)
+    assert pairs["streamdio_to_wall"]["status"] == "ok"
+    assert np.isclose(pairs["streamdio_to_wall"]["slope"], 2.0)
+    assert np.isclose(pairs["streamdio_to_wall"]["intercept"], 90.0)
+
+
+def test_clock_alignment_degrades_gracefully_with_too_few_anchors():
+    alignment = _clock_alignment([], [], {"config": {}})
+
+    for pair in alignment["pairs"].values():
+        assert pair["status"] == "insufficient_anchors"
+        assert pair["n_anchors"] == 0
+        assert pair["slope"] is None
+        assert pair["intercept"] is None
+        assert pair["max_abs_residual_s"] is None
+        assert pair["rms_residual_s"] is None
 
 
 def _refresh_manifest_artifact_sha(manifest_path, artifact_path) -> None:
@@ -148,6 +215,22 @@ def test_session_finalize_writes_manifest_snapshot_and_exports(tmp_path):
     assert manifest["counts"]["force_samples"] == 1
     assert manifest["counts"]["frame2ttl_edges"] == 1
     assert manifest["counts"]["bpod_trial_rows"] == 1
+    assert manifest["clock_alignment"]["model"] == (
+        "target_s = slope * source_s + intercept"
+    )
+    assert set(manifest["clock_alignment"]["pairs"]) == {
+        "perf_counter_to_wall",
+        "streamdio_to_perf_counter",
+        "streamdio_to_wall",
+    }
+    for pair in manifest["clock_alignment"]["pairs"].values():
+        assert {
+            "slope",
+            "intercept",
+            "n_anchors",
+            "max_abs_residual_s",
+            "rms_residual_s",
+        } <= set(pair)
     assert "bpod_data/bpod_trials.json" in artifact_paths
     assert manifest["config"]["source_config_path"] == str(source_config)
     assert manifest["config"]["source_config_sha256"] == sha256_file(source_config)

@@ -25,7 +25,7 @@ from hf_dm.hardware.bringup_constants import (
     STREAMDIO_STATE_MARKER_MESSAGE_IDS,
 )
 from hf_dm.session.controller import HFDecisionSession
-from hf_dm.session.simulated_bpod import SimulatedBpod
+from hf_dm.session.runners.simulated_bpod import SimulatedBpod
 from hf_dm.streamdio.wheel import Direction, WheelKinematics, _percentile
 
 SimChoiceMode = Literal["matched", "opposite", "timeout", "cw", "ccw", "alternate"]

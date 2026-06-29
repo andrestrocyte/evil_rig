@@ -5,11 +5,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from hf_dm.fsm import softcodes as sc
-from hf_dm.fsm.builders import (
+from hf_dm.fsm.builders import build_host_supervised_decision_fsm
+from hf_dm.fsm.reference import (
     build_all_off_fsm,
     build_choice_epoch_fsm,
     build_decision_trial_fsm,
-    build_host_supervised_decision_fsm,
     build_iti_fsm,
     build_reward_fsm,
 )

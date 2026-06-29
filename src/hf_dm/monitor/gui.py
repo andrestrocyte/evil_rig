@@ -358,6 +358,7 @@ class OperatorMonitorState:
         self.pump_events: deque[tuple[float, bool]] = deque()
         self.noise_events: deque[tuple[float, bool]] = deque()
         self.outcomes: deque[dict[str, Any]] = deque(maxlen=self.trial_history)
+        self._psychometric_trials: dict[int, dict[str, Any]] = {}
         self.camera_ttl_count = 0
         self.lick_count = 0
         self.lick_edge_count = 0
@@ -557,6 +558,7 @@ class OperatorMonitorState:
         if trial_index is None:
             self.outcomes.append(payload)
             return
+        self._psychometric_trials[trial_index] = dict(payload)
         outcomes = list(self.outcomes)
         for index, outcome in enumerate(outcomes):
             if _optional_int(outcome.get("trial_index")) == trial_index:
@@ -565,6 +567,49 @@ class OperatorMonitorState:
                 self.outcomes.extend(outcomes)
                 return
         self.outcomes.append(payload)
+
+    def psychometric_summary(self) -> dict[str, int | float | None]:
+        trials = list(self._psychometric_trials.values())
+        responded = [
+            trial
+            for trial in trials
+            if bool(
+                trial.get(
+                    "responded",
+                    trial.get("chosen_shape") in {"star", "circle"},
+                )
+            )
+        ]
+        matched_count = sum(bool(trial.get("matched", False)) for trial in responded)
+        response_times = [
+            response_time
+            for trial in responded
+            if (response_time := _optional_float(trial.get("response_time_s"))) is not None
+            and response_time >= 0.0
+        ]
+        sides = [
+            str(trial.get("choice_side")).lower()
+            for trial in responded
+            if str(trial.get("choice_side")).lower() in {"left", "right"}
+        ]
+        left_count = sides.count("left")
+        right_count = sides.count("right")
+        side_count = left_count + right_count
+        return {
+            "n_trials": len(trials),
+            "n_responded": len(responded),
+            "matched_rate": (
+                None if not responded else matched_count / len(responded)
+            ),
+            "mean_response_time_s": (
+                None if not response_times else sum(response_times) / len(response_times)
+            ),
+            "side_bias": (
+                None if not side_count else (right_count - left_count) / side_count
+            ),
+            "n_left": left_count,
+            "n_right": right_count,
+        }
 
 
 def _optional_float(value: Any) -> float | None:
@@ -1156,8 +1201,47 @@ class _MonitorWindow:
         self._draw_speaker_icon(ix + iw - 58, iy + 22, active=self.state.noise_active)
 
     def _draw_choices_panel(self, x: int, y: int, w: int, h: int) -> None:
-        ix, iy, iw, ih = self._panel(x, y, w, h, "Latest Choices")
-        self._draw_outcomes(ix, iy, iw, ih)
+        ix, iy, iw, ih = self._panel(x, y, w, h, "Behavior")
+        summary_h = min(26, max(20, ih // 3))
+        self._draw_psychometric_summary(ix, iy, iw, summary_h)
+        self._draw_outcomes(ix, iy + summary_h, iw, max(1, ih - summary_h))
+
+    def _draw_psychometric_summary(self, x: int, y: int, w: int, h: int) -> None:
+        summary = self.state.psychometric_summary()
+        matched_rate = summary["matched_rate"]
+        mean_rt = summary["mean_response_time_s"]
+        side_bias = summary["side_bias"]
+        if side_bias is None:
+            bias_text = "-"
+        elif abs(float(side_bias)) < 0.005:
+            bias_text = "0%"
+        else:
+            direction = "R" if float(side_bias) > 0.0 else "L"
+            bias_text = f"{abs(float(side_bias)):.0%} {direction}"
+        values = (
+            ("Matched", "-" if matched_rate is None else f"{float(matched_rate):.0%}"),
+            ("Mean RT", "-" if mean_rt is None else f"{float(mean_rt):.2f} s"),
+            ("Side bias", bias_text),
+        )
+        column_w = max(1, w // len(values))
+        for index, (label, value) in enumerate(values):
+            xx = x + index * column_w
+            self.canvas.create_text(
+                xx,
+                y + h // 2,
+                anchor="w",
+                text=label,
+                fill="#697782",
+                font=("Segoe UI", 8),
+            )
+            self.canvas.create_text(
+                xx + min(56, max(38, column_w // 2)),
+                y + h // 2,
+                anchor="w",
+                text=value,
+                fill="#1f2933",
+                font=("Segoe UI", 9, "bold"),
+            )
 
     def _draw_outcomes(self, x: int, y: int, w: int, h: int) -> None:
         outcomes = list(self.state.outcomes)[-_MAX_CHOICE_HISTORY:]
