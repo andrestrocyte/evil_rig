@@ -93,6 +93,7 @@ class TimingConfig:
 class RewardConfig:
     matched_pump_s: float = 0.08
     opposite_pump_s: float = 0.04
+    calibration_path: str | None = None
 
 
 @dataclass
@@ -103,6 +104,9 @@ class TaskDesignConfig:
     n_forced_trials: int = 0
     risk_star_probability: float = 0.66
     delay_star_extra_s: float = 2.0
+    side_balancing: str = "bernoulli"
+    max_consecutive_side: int = 0
+    max_consecutive_forced: int = 0
     selected_mouse_dir: str | None = None
     session_name: str | None = None
     session_dir: str | None = None
@@ -176,6 +180,13 @@ class IntegrationConfig:
 
 
 @dataclass
+class WelfareConfig:
+    subjects_dir: str = "subjects"
+    water_target_ml: float | None = None
+    append_session_water: bool = True
+
+
+@dataclass
 class MonitorConfig:
     enabled: bool = False
     display_index: int | None = 0
@@ -235,6 +246,7 @@ class SessionConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     video: VideoExportConfig = field(default_factory=VideoExportConfig)
     integrations: IntegrationConfig = field(default_factory=IntegrationConfig)
+    welfare: WelfareConfig = field(default_factory=WelfareConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     session_export: SessionExportConfig = field(default_factory=SessionExportConfig)
     results_dir: str = "data/sessions"
@@ -262,6 +274,7 @@ class SessionConfig:
         camera_raw = raw.get("camera", {})
         video_raw = raw.get("video", {})
         integrations_raw = raw.get("integrations", {})
+        welfare_raw = raw.get("welfare", {})
         monitor_raw = raw.get("monitor", {})
         session_export_raw = raw.get("session_export", {})
         wheel_raw = raw.get("wheel", {})
@@ -284,7 +297,11 @@ class SessionConfig:
                 value = [part.strip() for part in value.split(",")]
             if not isinstance(value, (list, tuple)) or len(value) != 3:
                 return default
-            return tuple(max(0, min(255, int(part))) for part in value)
+            return (
+                max(0, min(255, int(value[0]))),
+                max(0, min(255, int(value[1]))),
+                max(0, min(255, int(value[2]))),
+            )
 
         def optional_lick_int(name: str) -> int | None:
             value = lick_raw.get(name)
@@ -395,6 +412,11 @@ class SessionConfig:
             reward=RewardConfig(
                 matched_pump_s=float(reward_raw.get("matched_pump_s", 0.08)),
                 opposite_pump_s=float(reward_raw.get("opposite_pump_s", 0.04)),
+                calibration_path=(
+                    str(reward_raw["calibration_path"])
+                    if reward_raw.get("calibration_path") not in (None, "")
+                    else None
+                ),
             ),
             task=TaskDesignConfig(
                 modality=str(task_raw.get("modality", "force")).lower(),
@@ -407,6 +429,9 @@ class SessionConfig:
                 n_forced_trials=int(task_raw.get("n_forced_trials", 0)),
                 risk_star_probability=float(task_raw.get("risk_star_probability", 0.66)),
                 delay_star_extra_s=float(task_raw.get("delay_star_extra_s", 2.0)),
+                side_balancing=str(task_raw.get("side_balancing", "bernoulli")).lower(),
+                max_consecutive_side=int(task_raw.get("max_consecutive_side", 0)),
+                max_consecutive_forced=int(task_raw.get("max_consecutive_forced", 0)),
                 selected_mouse_dir=(
                     str(task_raw["selected_mouse_dir"])
                     if task_raw.get("selected_mouse_dir") not in (None, "")
@@ -562,6 +587,17 @@ class SessionConfig:
                 ),
                 alyx_timeout_s=float(integrations_raw.get("alyx_timeout_s", 5.0)),
             ),
+            welfare=WelfareConfig(
+                subjects_dir=str(welfare_raw.get("subjects_dir", "subjects")),
+                water_target_ml=(
+                    float(welfare_raw["water_target_ml"])
+                    if welfare_raw.get("water_target_ml") not in (None, "")
+                    else None
+                ),
+                append_session_water=bool(
+                    welfare_raw.get("append_session_water", True)
+                ),
+            ),
             monitor=MonitorConfig(
                 enabled=bool(monitor_raw.get("enabled", False)),
                 display_index=(
@@ -637,6 +673,8 @@ class SessionConfig:
             ),
             results_dir=str(raw.get("results_dir", "data/sessions")),
         )
+        if config.session_export.source_config_path is None:
+            config.session_export.source_config_path = str(path.resolve())
         return validate_session_config(config)
 
 
@@ -777,10 +815,35 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
     for field_name in ("matched_pump_s", "opposite_pump_s"):
         value = getattr(config.reward, field_name)
         require(finite(value) and value >= 0, f"reward.{field_name}", "must be finite and non-negative", value)
+    if config.reward.calibration_path is not None:
+        require(
+            bool(str(config.reward.calibration_path).strip()),
+            "reward.calibration_path",
+            "must not be empty when configured",
+            config.reward.calibration_path,
+        )
 
     task = config.task
     require(task.modality in {"force", "risk", "delay"}, "task.modality", "must be force, risk, or delay", task.modality)
     require(task.n_forced_trials >= 0, "task.n_forced_trials", "must be non-negative", task.n_forced_trials)
+    require(
+        task.side_balancing in {"bernoulli", "blocked"},
+        "task.side_balancing",
+        "must be bernoulli or blocked",
+        task.side_balancing,
+    )
+    require(
+        task.max_consecutive_side >= 0,
+        "task.max_consecutive_side",
+        "must be non-negative",
+        task.max_consecutive_side,
+    )
+    require(
+        task.max_consecutive_forced >= 0,
+        "task.max_consecutive_forced",
+        "must be non-negative",
+        task.max_consecutive_forced,
+    )
     if task.n_free_trials is not None:
         require(task.n_free_trials >= 0, "task.n_free_trials", "must be non-negative", task.n_free_trials)
         require(
@@ -788,6 +851,19 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
             "task.n_free_trials/task.n_forced_trials",
             "must sum to n_trials when n_free_trials is explicit",
             [task.n_free_trials, task.n_forced_trials, config.n_trials],
+        )
+    effective_free = (
+        max(0, config.n_trials - task.n_forced_trials)
+        if task.n_free_trials is None
+        else max(0, task.n_free_trials)
+    )
+    if task.max_consecutive_forced > 0:
+        require(
+            task.n_forced_trials
+            <= task.max_consecutive_forced * (effective_free + 1),
+            "task.max_consecutive_forced",
+            "cannot satisfy this cap with the configured free/forced trial counts",
+            task.max_consecutive_forced,
         )
     require(
         finite(task.risk_star_probability) and 0 <= task.risk_star_probability <= 1,
@@ -888,6 +964,20 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
         )
     require(export.streamdio_recent_events > 0, "session_export.streamdio_recent_events", "must be greater than zero", export.streamdio_recent_events)
     require(config.integrations.alyx_timeout_s > 0, "integrations.alyx_timeout_s", "must be greater than zero", config.integrations.alyx_timeout_s)
+    require(
+        bool(str(config.welfare.subjects_dir).strip()),
+        "welfare.subjects_dir",
+        "must not be empty",
+        config.welfare.subjects_dir,
+    )
+    if config.welfare.water_target_ml is not None:
+        require(
+            finite(config.welfare.water_target_ml)
+            and config.welfare.water_target_ml >= 0,
+            "welfare.water_target_ml",
+            "must be finite and non-negative",
+            config.welfare.water_target_ml,
+        )
     return issues
 
 
@@ -955,6 +1045,9 @@ def task_design_summary(config: SessionConfig) -> dict[str, Any]:
         "n_trials": total,
         "n_free_trials": n_free,
         "n_forced_trials": n_forced,
+        "side_balancing": task.side_balancing,
+        "max_consecutive_side": task.max_consecutive_side,
+        "max_consecutive_forced": task.max_consecutive_forced,
         "choice_modes": {
             "free": "star and circle both visible; either centered shape ends the trial",
             "forced": "only the forced shape is visible; only that side can end the trial before timeout",

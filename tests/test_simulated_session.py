@@ -1,15 +1,26 @@
 import json
 import os
+from itertools import groupby
 
 import numpy as np
 
 from hf_dm.config import SessionConfig, TrainingPhase
 from hf_dm.hardware.bringup_constants import FRAME2TTL_INPUT_CHANNEL
+from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.simulated import (
     SimulatedHFDecisionSession,
     SimulationOptions,
     shorten_for_simulation,
 )
+from hf_dm.valve_calibration import (
+    ValveMeasurement,
+    fit_valve_calibration,
+    save_valve_calibration,
+)
+
+
+def _max_run(values):
+    return max((sum(1 for _ in group) for _, group in groupby(values)), default=0)
 
 
 def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
@@ -78,6 +89,139 @@ def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
         "PostTimeout_Pre",
         "PostTimeout",
     ]
+
+
+def test_default_balancing_preserves_seeded_trial_record_snapshot(tmp_path):
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    config = SessionConfig(n_trials=6, random_seed=23, results_dir=str(tmp_path))
+    config.camera.record_video = False
+    config.camera.save_dir = str(tmp_path / "videos")
+    shorten_for_simulation(config)
+    session = SimulatedHFDecisionSession(
+        config,
+        SimulationOptions(choice_mode="alternate", frames_to_choice=2),
+    )
+
+    session.connect()
+    session.run()
+
+    snapshot = [
+        (
+            trial.trial_index,
+            trial.star_side,
+            trial.circle_side,
+            trial.choice,
+            trial.chosen_shape,
+            trial.matched,
+            trial.reward_duration_s,
+            trial.trial_mode,
+            trial.forced_shape,
+            trial.modality,
+            trial.reward_delivered,
+            trial.risk_star_probability,
+        )
+        for trial in session.recorder.trials
+    ]
+    assert snapshot == [
+        (1, "right", "left", "ccw", "star", True, 0.08, "free", None, "force", True, None),
+        (2, "right", "left", "cw", "circle", False, 0.04, "free", None, "force", True, None),
+        (3, "right", "left", "timeout", None, False, 0.0, "free", None, "force", False, None),
+        (4, "left", "right", "cw", "star", True, 0.08, "free", None, "force", True, None),
+        (5, "left", "right", "ccw", "circle", False, 0.04, "free", None, "force", True, None),
+        (6, "right", "left", "timeout", None, False, 0.0, "free", None, "force", False, None),
+    ]
+    sidecar = json.loads(session.recorder.base_path.with_suffix(".json").read_text(encoding="utf-8"))
+    provenance = sidecar["metadata"]["runtime_provenance"]
+    header = json.loads(session.recorder.journal_path.read_text(encoding="utf-8").splitlines()[0])
+    assert "git_commit" in provenance
+    assert provenance["git_dirty"] in {True, False, None}
+    assert provenance["package_version"] == "0.1.0"
+    assert header["payload"]["git_commit"] == provenance["git_commit"]
+    assert header["payload"]["git_dirty"] == provenance["git_dirty"]
+    assert all(trial.reward_volume_ul is None for trial in session.recorder.trials)
+
+
+def test_blocked_side_schedule_is_balanced_reproducible_and_capped():
+    config = SessionConfig(n_trials=200, random_seed=71)
+    config.task.side_balancing = "blocked"
+    config.task.max_consecutive_side = 4
+
+    first = HFDecisionSession(config)
+    second_config = SessionConfig(n_trials=200, random_seed=71)
+    second_config.task.side_balancing = "blocked"
+    second_config.task.max_consecutive_side = 4
+    second = HFDecisionSession(second_config)
+    first_sides = [spec["star_side"] for spec in first._trial_schedule]
+    second_sides = [spec["star_side"] for spec in second._trial_schedule]
+
+    assert first_sides == second_sides
+    assert abs(first_sides.count("left") - first_sides.count("right")) <= 1
+    assert _max_run(first_sides) <= 4
+    assert [first._choose_star_side(index) for index in range(1, 201)] == first_sides
+
+
+def test_bernoulli_side_schedule_honors_explicit_run_cap():
+    config = SessionConfig(n_trials=200, random_seed=72)
+    config.task.max_consecutive_side = 3
+
+    session = HFDecisionSession(config)
+    sides = [spec["star_side"] for spec in session._trial_schedule]
+
+    assert _max_run(sides) <= 3
+    assert [session._choose_star_side(index) for index in range(1, 201)] == sides
+
+
+def test_forced_trial_schedule_respects_requested_run_cap():
+    config = SessionConfig(n_trials=24, random_seed=19)
+    config.task.n_free_trials = 12
+    config.task.n_forced_trials = 12
+    config.task.max_consecutive_forced = 2
+
+    session = HFDecisionSession(config)
+    modes = [spec["trial_mode"] for spec in session._trial_schedule]
+
+    assert modes.count("free") == 12
+    assert modes.count("forced") == 12
+    forced_runs = [sum(1 for _ in group) for mode, group in groupby(modes) if mode == "forced"]
+    assert max(forced_runs) <= 2
+
+
+def test_simulated_session_annotates_reward_volume_without_changing_pump_time(tmp_path):
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    calibration_path = tmp_path / "valve.json"
+    calibration = save_valve_calibration(
+        fit_valve_calibration(
+            [
+                ValveMeasurement(0.04, 20.0, 10),
+                ValveMeasurement(0.08, 40.0, 10),
+            ]
+        ),
+        calibration_path,
+    )
+    config = SessionConfig(n_trials=3, random_seed=23, results_dir=str(tmp_path / "sessions"))
+    config.camera.record_video = False
+    config.reward.calibration_path = str(calibration_path)
+    config.welfare.subjects_dir = str(tmp_path / "subjects")
+    shorten_for_simulation(config)
+    session = SimulatedHFDecisionSession(
+        config,
+        SimulationOptions(choice_mode="alternate", frames_to_choice=2),
+    )
+
+    session.connect()
+    session.run()
+
+    assert [trial.reward_duration_s for trial in session.recorder.trials] == [0.08, 0.04, 0.0]
+    assert [trial.reward_volume_ul for trial in session.recorder.trials] == [4.0, 2.0, None]
+    assert session.recorder.metadata["reward_calibration"]["sha256"] == calibration.sha256
+    assert sum(
+        event.event_type == "reward_volume_annotated"
+        for event in session.recorder.events
+    ) == 2
+    with np.load(session.recorder.base_path.with_suffix(".npz"), allow_pickle=True) as data:
+        volumes = data["trials"]["reward_volume_ul"]
+        assert volumes[:2].tolist() == [4.0, 2.0]
+        assert np.isnan(volumes[2])
 
 
 def test_simulated_centering_requires_wheel_motion_and_rewards_at_center(tmp_path):

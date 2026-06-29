@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from hf_dm.config import SessionConfig, config_to_dict
-from hf_dm.data.recorder import SessionRecorder
+from hf_dm.data.recorder import SessionRecorder, capture_runtime_provenance
 from hf_dm.data.session_export import resolve_session_output
 from hf_dm.display.pygame_display import TaskDisplay
 from hf_dm.fsm.relay import RelayMessageIds
@@ -402,6 +402,7 @@ class SimulatedHFDecisionSession(HFDecisionSession):
 
     def connect(self) -> None:
         self._closed = False
+        self.runtime_provenance = capture_runtime_provenance()
         self.bpod = SimulatedBpod()
         self.bpod.set_softcode_handler(self._handle_bpod_softcode)
         self.bpod.set_serial_handler(self._handle_simulated_bpod_serial_action)
@@ -420,6 +421,7 @@ class SimulatedHFDecisionSession(HFDecisionSession):
             self.config.subject_id,
             self.config.phase.value,
             base_name=base_name,
+            runtime_provenance=self.runtime_provenance,
         )
         self.recorder.set_export_options(config_to_dict(self.config)["session_export"])
         self.recorder.set_metadata(self._session_metadata())

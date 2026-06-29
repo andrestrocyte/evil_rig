@@ -122,6 +122,7 @@ def test_preflight_report_falls_back_to_registered_stream_summary():
                     "config_port": "COM6",
                     "stream_port": "COM7",
                     "module_info": {"firmware_version": 4},
+                    "buffer_stats": {"buffer_overruns": 0},
                 }
             }
         ),
@@ -132,6 +133,7 @@ def test_preflight_report_falls_back_to_registered_stream_summary():
     assert status["source"] == "session_stream_summary"
     assert status["module_info"]["firmware_version"] == 4
     assert status["config_port"] == "COM6"
+    assert status["buffer_stats"]["buffer_overruns"] == 0
 
 
 def test_ops_cli_camera_roi_setup_writes_yaml(tmp_path, monkeypatch, capsys):
@@ -415,8 +417,15 @@ def test_ops_cli_rig_preflight_writes_report_and_refreshes_manifest(
 
     assert result["end_reason"] == "preflight"
     assert result["validation"]["valid"] is True
+    assert result["preflight_validation"] == report["validation"]
     assert report["summary"]["end_reason"] == "preflight"
     assert report["duration_s"] == 0.25
+    assert report["validation"]["status"] in {"PASS", "WARN", "FAIL"}
+    assert report["validation"]["results"]
+    assert all(
+        set(item) == {"name", "status", "detail", "hint"}
+        for item in report["validation"]["results"]
+    )
     assert report["streamdio"]["module_status"]["config_port"] == "COM_CONFIG"
     assert report["streamdio"]["module_status"]["module_info"]["firmware_version"] == 4
     assert any(

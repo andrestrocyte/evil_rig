@@ -18,6 +18,8 @@ from hf_dm.config import (
     validate_session_config,
 )
 from hf_dm.data.recorder import recover_session_journal
+from hf_dm.session_qc import QcThresholds, evaluate_session_qc, format_qc_table
+from hf_dm.subject_log import append_weight_entry
 from hf_dm.data.session_export import (
     export_existing_session,
     session_bundle_dir,
@@ -25,6 +27,8 @@ from hf_dm.data.session_export import (
 )
 from hf_dm.data.video_export import export_preview_video
 from hf_dm.session.controller import HFDecisionSession
+from hf_dm.valve_calibration import run_guided_valve_calibration
+from hf_dm.validation import ValidationResult, validation_report
 
 
 def main() -> None:
@@ -62,6 +66,54 @@ def main() -> None:
         help="Session directory, incomplete marker, or .journal.jsonl file",
     )
     recover_parser.add_argument("--end-reason", default="recovered_after_crash")
+
+    qc_parser = sub.add_parser(
+        "session-qc",
+        help="Evaluate curriculum and acquisition QC for a finalized session",
+    )
+    qc_parser.add_argument("session", type=Path, help="Session bundle, manifest, .json, or .npz")
+    qc_parser.add_argument("--min-responded-rate", type=float, default=0.50)
+    qc_parser.add_argument("--warn-responded-rate", type=float, default=0.40)
+    qc_parser.add_argument("--min-matched-rate", type=float, default=0.55)
+    qc_parser.add_argument("--warn-matched-rate", type=float, default=0.45)
+    qc_parser.add_argument("--max-mean-response-time", type=float, default=12.0)
+    qc_parser.add_argument("--warn-mean-response-time", type=float, default=15.0)
+    qc_parser.add_argument("--max-stalls", type=int, default=0)
+    qc_parser.add_argument("--warn-stalls", type=int, default=2)
+    qc_parser.add_argument("--max-frame-time", type=float, default=0.10)
+    qc_parser.add_argument("--warn-frame-time", type=float, default=0.20)
+
+    valve_parser = sub.add_parser(
+        "calibrate-valve",
+        help="Run a guided StreamDIO reward-valve calibration",
+    )
+    valve_parser.add_argument("--config", type=Path, required=True)
+    valve_parser.add_argument(
+        "--durations-ms",
+        default="20,40,60,80,100",
+        help="Comma-separated valve opening durations in milliseconds",
+    )
+    valve_parser.add_argument("--repetitions", type=int, default=10)
+    valve_parser.add_argument("--output", type=Path, default=None)
+    valve_parser.add_argument("--water-density", type=float, default=1.0)
+    valve_parser.add_argument("--inter-pulse", type=float, default=0.10)
+    valve_parser.add_argument("--overwrite", action="store_true")
+    valve_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the rig is clear and a collection vessel is in place",
+    )
+
+    weight_parser = sub.add_parser(
+        "log-weight",
+        help="Append a local subject weight/water-target record",
+    )
+    weight_parser.add_argument("subject")
+    weight_parser.add_argument("--weight", type=float, required=True)
+    weight_parser.add_argument("--water-target", type=float, default=None)
+    weight_parser.add_argument("--date", default=None)
+    weight_parser.add_argument("--subjects-dir", type=Path, default=Path("subjects"))
+    weight_parser.add_argument("--notes", default=None)
 
     preview_parser = sub.add_parser(
         "export-preview-video",
@@ -158,6 +210,72 @@ def main() -> None:
         if not result["validation"]["valid"]:
             raise SystemExit(1)
         return
+    if args.command == "session-qc":
+        thresholds = QcThresholds(
+            min_responded_rate=args.min_responded_rate,
+            warn_responded_rate=args.warn_responded_rate,
+            min_matched_responded_rate=args.min_matched_rate,
+            warn_matched_responded_rate=args.warn_matched_rate,
+            max_mean_response_time_s=args.max_mean_response_time,
+            warn_mean_response_time_s=args.warn_mean_response_time,
+            max_choice_loop_stalls=args.max_stalls,
+            warn_choice_loop_stalls=args.warn_stalls,
+            max_choice_loop_frame_s=args.max_frame_time,
+            warn_choice_loop_frame_s=args.warn_frame_time,
+        )
+        result = evaluate_session_qc(args.session, thresholds=thresholds)
+        print(format_qc_table(result))
+        if result["overall_status"] == "FAIL":
+            raise SystemExit(1)
+        return
+    if args.command == "calibrate-valve":
+        if not args.yes:
+            confirmation = input(
+                "Calibration will actuate the reward pump. Clear the rig, place a tared "
+                "collection vessel, and type CALIBRATE to continue: "
+            )
+            if confirmation.strip() != "CALIBRATE":
+                raise SystemExit("Valve calibration cancelled")
+        try:
+            durations_s = [
+                float(item.strip()) / 1000.0
+                for item in str(args.durations_ms).split(",")
+                if item.strip()
+            ]
+            if len(durations_s) < 2 or any(duration <= 0 for duration in durations_s):
+                raise ValueError
+        except ValueError:
+            parser.error("--durations-ms requires at least two positive comma-separated values")
+        if args.repetitions <= 0:
+            parser.error("--repetitions must be greater than zero")
+        if args.water_density <= 0:
+            parser.error("--water-density must be greater than zero")
+        if args.inter_pulse < 0:
+            parser.error("--inter-pulse must be non-negative")
+        config = SessionConfig.from_yaml(args.config)
+        config.session_export.source_config_path = str(args.config.resolve())
+        result = run_guided_valve_calibration(
+            config,
+            durations_s=durations_s,
+            repetitions=args.repetitions,
+            output=args.output,
+            water_density_mg_per_ul=args.water_density,
+            inter_pulse_s=args.inter_pulse,
+            overwrite=args.overwrite,
+        )
+        print(json.dumps(result, indent=2))
+        return
+    if args.command == "log-weight":
+        result = append_weight_entry(
+            args.subjects_dir,
+            args.subject,
+            weight_g=args.weight,
+            water_target_ml=args.water_target,
+            entry_date=args.date,
+            notes=args.notes,
+        )
+        print(json.dumps(result, indent=2))
+        return
     if args.command == "export-preview-video":
         result = export_preview_video(
             args.session,
@@ -204,6 +322,7 @@ def main() -> None:
             duration_s=args.duration,
             config_path=args.config,
         )
+        preflight_report = json.loads(report_path.read_text(encoding="utf-8"))
         json_path = session.recorder.base_path.with_suffix(".json")
         export_result = export_existing_session(json_path)
         validation = _validate_after_export(export_result)
@@ -213,6 +332,7 @@ def main() -> None:
                     "end_reason": summary.end_reason,
                     "duration_s": args.duration,
                     "report": str(report_path),
+                    "preflight_validation": preflight_report.get("validation"),
                     "bundle_dir": export_result.get("bundle_dir"),
                     "manifest": export_result.get("manifest"),
                     "validation": validation,
@@ -407,6 +527,15 @@ def _write_rig_preflight_report(
         for event in recorder.events
         if str(event.event_type).startswith("preflight")
     ]
+    module_status = _streamdio_module_status(session)
+    typed_validation = validation_report(
+        _preflight_validation_results(
+            session,
+            duration_s=float(duration_s),
+            preflight_events=preflight_events,
+            module_status=module_status,
+        )
+    )
     report = {
         "schema_version": 1,
         "generated_wall_time_s": time.time(),
@@ -423,15 +552,121 @@ def _write_rig_preflight_report(
         },
         "config": config_to_dict(session.config),
         "preflight_events": preflight_events,
+        "validation": typed_validation,
         "streamdio": {
             "event_count": int(getattr(recorder, "_streamdio_total_count", 0)),
             "recent_in_memory_count": len(recorder.streamdio_events),
             "counts_by_type": dict(sorted(getattr(recorder, "_streamdio_counts", {}).items())),
-            "module_status": _streamdio_module_status(session),
+            "module_status": module_status,
         },
     }
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report_path
+
+
+def _preflight_validation_results(
+    session: HFDecisionSession,
+    *,
+    duration_s: float,
+    preflight_events: list[dict[str, object]],
+    module_status: dict[str, object],
+) -> list[ValidationResult]:
+    recorder = session.recorder
+    assert recorder is not None
+    end_payload: dict[str, object] = {}
+    for event in reversed(preflight_events):
+        if event.get("event_type") == "preflight_end" and isinstance(event.get("payload"), dict):
+            end_payload = dict(event["payload"])
+            break
+    results = [
+        ValidationResult(
+            name="preflight_completed",
+            status=(
+                "PASS"
+                if recorder.summary is not None and recorder.summary.end_reason == "preflight"
+                else "FAIL"
+            ),
+            detail=(
+                f"end_reason={recorder.summary.end_reason}"
+                if recorder.summary is not None
+                else "session summary missing"
+            ),
+            hint="Inspect preflight_error events and the session journal.",
+        ),
+        ValidationResult(
+            name="streamdio_connection",
+            status="PASS" if isinstance(module_status.get("module_info"), dict) else "FAIL",
+            detail=(
+                f"module={module_status.get('module_info')}"
+                if module_status.get("module_info")
+                else "StreamDIO module metadata missing"
+            ),
+            hint="Check COM assignments, cable ownership, and StreamDIO firmware.",
+        ),
+        ValidationResult(
+            name="streamdio_events",
+            status="PASS" if int(getattr(recorder, "_streamdio_total_count", 0)) > 0 else "FAIL",
+            detail=f"events={int(getattr(recorder, '_streamdio_total_count', 0))}",
+            hint="Confirm USB2 streaming is active and no other process owns the port.",
+        ),
+    ]
+    overruns = _nested_int(module_status, "buffer_overruns")
+    results.append(
+        ValidationResult(
+            name="streamdio_buffer_overruns",
+            status="WARN" if overruns is None else ("PASS" if overruns == 0 else "FAIL"),
+            detail="not reported" if overruns is None else f"overruns={overruns}",
+            hint="Reduce host load or inspect StreamDIO USB streaming if overruns are non-zero.",
+        )
+    )
+    force_samples = int(end_payload.get("force_samples_seen") or 0)
+    results.append(
+        ValidationResult(
+            name="force_adc_stream",
+            status=("PASS" if force_samples > 0 else ("WARN" if duration_s <= 0 else "FAIL")),
+            detail=f"samples={force_samples}",
+            hint="Check analog channel 13/pin 14 and the StreamDIO acquisition configuration.",
+        )
+    )
+    camera_events = int(end_payload.get("camera_events_seen") or 0)
+    camera_required = bool(session.config.camera.required and session.config.camera.record_video)
+    camera_status = "PASS" if camera_events > 0 else ("FAIL" if camera_required else "WARN")
+    results.append(
+        ValidationResult(
+            name="camera_trigger_stream",
+            status=camera_status,
+            detail=f"camera_ttls={camera_events}",
+            hint="Check the camera trigger cable and StreamDIO camera output configuration.",
+        )
+    )
+    preflight_errors = [
+        event
+        for event in preflight_events
+        if str(event.get("event_type")) == "preflight_error"
+    ]
+    results.append(
+        ValidationResult(
+            name="preflight_runtime_errors",
+            status="FAIL" if preflight_errors else "PASS",
+            detail=f"errors={len(preflight_errors)}",
+            hint="Inspect the preflight_error payload for the originating exception.",
+        )
+    )
+    return results
+
+
+def _nested_int(value: object, key: str) -> int | None:
+    if isinstance(value, dict):
+        if key in value:
+            try:
+                return int(value[key])
+            except (TypeError, ValueError):
+                return None
+        for item in value.values():
+            found = _nested_int(item, key)
+            if found is not None:
+                return found
+    return None
 
 
 def _streamdio_module_status(session: HFDecisionSession) -> dict[str, object]:

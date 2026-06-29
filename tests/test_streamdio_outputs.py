@@ -1,5 +1,4 @@
 import threading
-import time
 from collections import defaultdict
 
 from hf_dm.hardware.bringup_constants import (
@@ -11,6 +10,31 @@ from hf_dm.hardware.bringup_constants import (
 )
 from hf_dm.streamdio.client import StreamDIOClient
 from hf_dm.streamdio.outputs import StreamDIOOutputs
+
+
+def test_streamdio_stop_retains_driver_buffer_stats():
+    class StreamingProtocol:
+        streaming_active = True
+        _buffer_stats = {
+            "bytes_read": 120,
+            "events_processed": 10,
+            "buffer_overruns": 0,
+        }
+
+        def stop_streaming(self):
+            self.streaming_active = False
+
+    client = object.__new__(StreamDIOClient)
+    client._dio = StreamingProtocol()
+    client._last_buffer_stats = {}
+
+    client.stop_streaming()
+
+    assert client.get_buffer_stats() == {
+        "bytes_read": 120,
+        "events_processed": 10,
+        "buffer_overruns": 0,
+    }
 
 
 class FakeProtocol:

@@ -178,6 +178,12 @@ latest module and cap-touch status plus snapshot counts are retained in the Stre
 # Validate all semantic settings without opening Bpod, StreamDIO, camera, or displays.
 hf-dm validate-config configs/dm_50.yaml
 
+# Append today's subject weight and optional water target.
+hf-dm log-weight mouse01 --weight 24.3 --water-target 1.2
+
+# Guided valve calibration. WARNING: actuates the real reward pump.
+hf-dm calibrate-valve --config configs/dm_50.yaml --durations-ms 20,40,60,80,100 --repetitions 10
+
 # No-trial hardware preflight: Bpod/StreamDIO/Spinnaker streams and cleanup only.
 python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration 2
 
@@ -312,9 +318,37 @@ require touching/turning the physical inputs.
 For an input check, run a longer `--preflight`, turn the wheel both ways, and touch the lick sensor;
 the saved `preflight_end` event reports wheel pulse/direction edges and cap-touch input edges.
 
+### Counterbalancing, calibration, and welfare records
+
+The defaults retain the historical Bernoulli side draw and unlimited runs. Counterbalancing is
+setup-time only and opt-in:
+
+```yaml
+task:
+  side_balancing: blocked
+  max_consecutive_side: 4
+  max_consecutive_forced: 2
+
+reward:
+  matched_pump_s: 0.08
+  opposite_pump_s: 0.04
+  calibration_path: calibrations/valve_20260629.json
+
+welfare:
+  subjects_dir: subjects
+  water_target_ml: 1.2
+  append_session_water: true
+```
+
+Blocked sides are precomputed from the session seed in balanced truncated-geometric blocks. A
+calibration file only annotates delivered reward in microliters; pump open-time remains the control
+variable. Calibrated sessions append one idempotent water-delivery row to
+`subjects/<subject>/water_log.jsonl`. Without `reward.calibration_path`, trial behavior and records
+remain unchanged apart from the new nullable `reward_volume_ul` field.
+
 ## Data logged
 
-- Per-trial: star/circle sides, chosen shape/side, force direction, choice, reward duration, RT, pulses, force ADC stats, licks, wall/mono timestamps, camera TTL list/interval QC, Frame2TTL barcode/edge summary
+- Per-trial: star/circle sides, chosen shape/side, force direction, choice, reward duration, optional calibrated `reward_volume_ul`, RT, pulses, force ADC stats, licks, wall/mono timestamps, camera TTL list/interval QC, Frame2TTL barcode/edge summary
 - Exact bpod-core state/event rows for every trial in JSON and NPZ `bpod_trials_json`
 - Raw NPZ `streamdio_events`: every wheel/direction edge, force sample, camera TTL, lick, module timestamp, and high-resolution host timestamp
 - Events: `session_start`, `trial_start`, `stimulus_on`, `force_on`, `choice_detected`, `feedback_on`, `frame2ttl_*`, `pump_start`, `pump_end`, `output_actual`, `lick`, `white_noise_*`, cleanup, `trial_end`, `session_end`
@@ -322,6 +356,8 @@ the saved `preflight_end` event reports wheel pulse/direction edges and cap-touc
 - Session summary: end reason (`completed`, `idle_timeout`, `max_consecutive_failures`)
 - Crash journal: append-only `session.journal.jsonl`; completed trials are flushed and fsynced before
   the next trial. `session.incomplete.json` remains only when finalization did not complete.
+- Runtime provenance: the Git commit, dirty-tree flag, package version, and capture time are captured
+  before hardware startup, included in the first journal row, and retained in final metadata/manifest data.
 
 ### Session export bundle
 
@@ -389,6 +425,9 @@ hf-dm export-session data/sessions/<session>.json
 hf-dm validate-session data/sessions/<session>_bundle
 hf-dm validate-config configs/dm_50.yaml
 hf-dm recover-session data/sessions/<phase>/<subject>/<date>/<run>
+hf-dm session-qc data/sessions/<phase>/<subject>/<date>/<run>
+hf-dm log-weight mouse01 --weight 24.3 --water-target 1.2
+hf-dm calibrate-valve --config configs/dm_50.yaml --output calibrations/valve_20260629.json
 hf-dm export-preview-video data/videos/<session>_spinnaker
 hf-dm export-session data/sessions/<session>.json --export-preview-video
 hf-dm rig-preflight --config configs/dm_50.yaml --duration 2 --no-monitor
@@ -420,8 +459,14 @@ trials and Bpod rows, incorporates any completed StreamDIO chunks, atomically re
 NPZ/JSON artifacts, and runs the normal manifest validator. The incomplete marker is removed only
 after primary writes and configured exports succeed.
 
-GitHub Actions runs critical Ruff checks and the hardware-free pytest suite on both Windows and
-Linux. Physical rig certification remains the job of `rig-preflight` and hardware diagnostics.
+`session-qc` writes `session.qc.json` next to the manifest and reports PASS/WARN/FAIL for response
+rate, matched rate, response time, choice-loop stalls, and worst frame duration. Calibrated sessions
+also require a successful subject-water log event. FAIL returns a non-zero exit code; all numeric
+thresholds are exposed as CLI options.
+
+GitHub Actions runs the Ruff default correctness rules, stable-module mypy checks, and the
+hardware-free pytest suite on both Windows and Linux. Physical rig certification remains the job of
+`rig-preflight` and hardware diagnostics; their reports use typed `name/status/detail/hint` results.
 
 `validate-session` checks manifest paths, byte sizes, and SHA256 hashes, verifies source-config
 provenance from `config.snapshot.yaml`, opens NPZ artifacts, verifies the primary session NPZ schema/counts,

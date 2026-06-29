@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import os
 import queue
+import subprocess
 import threading
 import time
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Literal
 
@@ -18,6 +20,67 @@ import numpy as np
 Direction = Literal["cw", "ccw"]
 Choice = Literal["cw", "ccw", "timeout", "centering"]
 JournalMode = Literal["new", "resume", "disabled"]
+
+
+def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
+    """Capture code identity once, before acquisition artifacts are created."""
+    try:
+        package_version: str | None = version("bpod-hf-dm")
+    except PackageNotFoundError:
+        package_version = None
+
+    candidates = (
+        [Path(cwd)]
+        if cwd is not None
+        else [Path(__file__).resolve().parents[3], Path.cwd()]
+    )
+    git_commit: str | None = None
+    git_dirty: bool | None = None
+    git_root: str | None = None
+    for candidate in candidates:
+        try:
+            root_result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=str(candidate),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            if root_result.returncode != 0:
+                continue
+            root = Path(root_result.stdout.strip())
+            commit_result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(root),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            dirty_result = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=normal"],
+                cwd=str(root),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            if commit_result.returncode != 0 or dirty_result.returncode != 0:
+                continue
+            git_commit = commit_result.stdout.strip() or None
+            git_dirty = bool(dirty_result.stdout.strip())
+            git_root = str(root)
+            break
+        except Exception:
+            continue
+    return {
+        "git_commit": git_commit,
+        "git_dirty": git_dirty,
+        "git_root": git_root,
+        "package_version": package_version,
+        "provenance_captured_wall_s": time.time(),
+    }
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -80,6 +143,7 @@ class TrialRecord:
     trial_start_wall_s: float
     trial_start_mono_s: float
     force_p95: float | None = None
+    reward_volume_ul: float | None = None
     star_side: str | None = None
     circle_side: str | None = None
     star_direction: str | None = None
@@ -168,6 +232,7 @@ class SessionRecorder:
         *,
         base_name: str | None = None,
         journal_mode: JournalMode = "new",
+        runtime_provenance: dict[str, Any] | None = None,
     ):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -213,6 +278,9 @@ class SessionRecorder:
         self._journal_lock = threading.RLock()
         self._journal_sequence = 0
         self._journal_mode: JournalMode = journal_mode
+        self.runtime_provenance = json.loads(
+            json.dumps(runtime_provenance or {}, default=str)
+        )
         self._finalized = False
         self._open_journal(subject_id=subject_id, phase=phase)
         if journal_mode != "resume":
@@ -256,6 +324,7 @@ class SessionRecorder:
             "base_path": str(self.base_path),
             "session_start_wall_s": self._session_start_wall,
             "session_start_mono_s": self._session_start_mono,
+            **self.runtime_provenance,
         }
         self._journal_append("session_header", header, durable=True)
         _atomic_write_text(
@@ -447,6 +516,7 @@ class SessionRecorder:
             raise RuntimeError(f"SessionRecorder already finalized: {self.base_path}")
         finalize_start = time.perf_counter()
         self.summary = summary
+        self._append_session_water_log(summary)
         self.log_event("session_end", {"end_reason": summary.end_reason})
         self._journal_append("session_summary", asdict(summary), durable=True)
         self.close_journal()
@@ -609,6 +679,53 @@ class SessionRecorder:
         self._finalized = True
         return json_path if npz_error is not None else npz_path
 
+    def _append_session_water_log(self, summary: SessionSummary) -> None:
+        config = self.metadata.get("config")
+        if not isinstance(config, dict):
+            return
+        welfare = config.get("welfare") or {}
+        if not isinstance(welfare, dict) or not bool(
+            welfare.get("append_session_water", True)
+        ):
+            return
+        if not isinstance(self.metadata.get("reward_calibration"), dict):
+            return
+        volumes = [
+            float(trial.reward_volume_ul)
+            for trial in self.trials
+            if trial.reward_volume_ul is not None
+        ]
+        subjects_dir = Path(str(welfare.get("subjects_dir") or "subjects"))
+        if not subjects_dir.is_absolute():
+            runtime = self.metadata.get("runtime_provenance") or {}
+            git_root = runtime.get("git_root") if isinstance(runtime, dict) else None
+            subjects_dir = (Path(str(git_root)) if git_root else Path.cwd()) / subjects_dir
+        try:
+            from hf_dm.subject_log import append_session_water_entry
+
+            result = append_session_water_entry(
+                subjects_dir,
+                summary.subject_id,
+                water_delivered_ul=sum(volumes),
+                water_target_ml=welfare.get("water_target_ml"),
+                session_id=str(self.base_path),
+                entry_date=datetime.fromtimestamp(summary.session_end_wall_s).date().isoformat(),
+            )
+            self.log_event(
+                "subject_water_logged",
+                {
+                    "path": result["path"],
+                    "appended": result["appended"],
+                    "water_delivered_ul": sum(volumes),
+                    "calibrated_trial_count": len(volumes),
+                },
+            )
+        except Exception as exc:
+            self.log_event(
+                "subject_water_log_error",
+                {"error": f"{type(exc).__name__}: {exc}"},
+            )
+
     @staticmethod
     def recover(
         path: Path | str,
@@ -758,6 +875,7 @@ class SessionRecorder:
             ("choice", "U8"),
             ("matched", "?"),
             ("reward_duration_s", "f8"),
+            ("reward_volume_ul", "f8"),
             ("responded", "?"),
             ("response_time_s", "f8"),
             ("net_pulses", "i4"),
@@ -818,6 +936,7 @@ class SessionRecorder:
                     t.choice,
                     t.matched,
                     t.reward_duration_s,
+                    t.reward_volume_ul if t.reward_volume_ul is not None else np.nan,
                     t.responded,
                     t.response_time_s,
                     t.net_pulses,
@@ -1084,14 +1203,14 @@ def recover_session_journal(
             recorder.export_options.update(payload)
         elif kind == "stream_summary":
             name = str(payload.get("name") or "unknown")
-            summary = payload.get("summary")
-            if isinstance(summary, dict):
-                recorder.stream_summaries[name] = dict(summary)
+            stream_summary = payload.get("summary")
+            if isinstance(stream_summary, dict):
+                recorder.stream_summaries[name] = dict(stream_summary)
         elif kind == "fsm_definition":
-            name = payload.get("fsm_name")
+            fsm_name = payload.get("fsm_name")
             fsm_json = payload.get("fsm_json")
-            if name is not None and fsm_json is not None:
-                recorder.fsm_definitions[str(name)] = str(fsm_json)
+            if fsm_name is not None and fsm_json is not None:
+                recorder.fsm_definitions[str(fsm_name)] = str(fsm_json)
 
     if recorder.stream_summaries:
         recorder.metadata["stream_summaries"] = dict(recorder.stream_summaries)

@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from hf_dm.config import SessionConfig, config_to_dict, validate_session_config
-from hf_dm.data.recorder import SessionRecorder, SessionSummary
+from hf_dm.data.recorder import (
+    SessionRecorder,
+    SessionSummary,
+    capture_runtime_provenance,
+)
 from hf_dm.data.session_export import resolve_session_output, session_bundle_dir
 
 
@@ -34,15 +38,24 @@ class SessionBundle:
             phase=config.phase.value,
             layout=config.session_export.layout,
         )
+        runtime_provenance = capture_runtime_provenance()
         recorder = SessionRecorder(
             out,
             config.subject_id,
             config.phase.value,
             base_name=base_name,
+            runtime_provenance=runtime_provenance,
         )
         config_dict = config_to_dict(config)
         recorder.set_export_options(config_dict["session_export"])
-        recorder.set_metadata(metadata or {"config": config_dict})
+        effective_metadata = {"config": config_dict, **(metadata or {})}
+        effective_metadata.update(
+            {
+                "runtime_provenance": runtime_provenance,
+                **runtime_provenance,
+            }
+        )
+        recorder.set_metadata(effective_metadata)
         return cls(recorder=recorder, config=config)
 
     @property

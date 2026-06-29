@@ -12,6 +12,7 @@ from hf_dm.data.recorder import (
     recover_session_journal,
 )
 from hf_dm.data.session_export import session_bundle_dir, validate_session
+from hf_dm.session_qc import evaluate_session_qc
 
 
 def _trial(index=1):
@@ -109,6 +110,7 @@ def test_recover_session_repairs_truncated_tail_and_finalizes(tmp_path):
     sidecar = json.loads(recorder.base_path.with_suffix(".json").read_text(encoding="utf-8"))
     assert sidecar["summary"]["end_reason"] == "recovered_after_crash"
     assert sidecar["summary"]["n_trials_completed"] == 1
+    assert evaluate_session_qc(result["bundle_dir"], write=False)["overall_status"] == "PASS"
 
 
 def test_session_journal_sequences_concurrent_event_writers(tmp_path):

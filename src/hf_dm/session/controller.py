@@ -23,7 +23,12 @@ from hf_dm.config import (
 from hf_dm.camera.spinnaker import HeadlessSpinnakerRecorder
 from hf_dm.data.session_export import resolve_session_output, session_bundle_dir
 from hf_dm.hardware.discovery import connect_bpod_core
-from hf_dm.data.recorder import SessionRecorder, SessionSummary, TrialRecord
+from hf_dm.data.recorder import (
+    SessionRecorder,
+    SessionSummary,
+    TrialRecord,
+    capture_runtime_provenance,
+)
 from hf_dm.display.pygame_display import TaskDisplay
 from hf_dm.frame2ttl import (
     TOTAL_BITS as FRAME2TTL_TOTAL_BITS,
@@ -49,6 +54,10 @@ from hf_dm.hardware.bringup_constants import (
     STREAMDIO_STATE_MARKER_NAMES,
 )
 from hf_dm.monitor import OperatorMonitor
+from hf_dm.valve_calibration import (
+    RewardCalibration,
+    resolve_reward_calibration_path,
+)
 from hf_dm.streamdio.client import StreamDIOClient
 from hf_dm.streamdio.outputs import StreamDIOOutputs
 from hf_dm.streamdio.wheel import Direction, WheelAccumulator
@@ -60,6 +69,7 @@ class HFDecisionSession:
     def __init__(self, config: SessionConfig):
         self.config = validate_session_config(config)
         self.rng = random.Random(config.random_seed)
+        self.reward_calibration = self._load_reward_calibration()
         self.bpod: Bpod | None = None
         self.relay: StreamDIOOutputs | None = None
         self.speaker_relay: SerialRelay | None = None
@@ -86,10 +96,12 @@ class HFDecisionSession:
         self._latest_streamdio_module_status: dict | None = None
         self._cap_touch_status_snapshot_count = 0
         self._latest_cap_touch_status: dict | None = None
+        self.runtime_provenance: dict[str, object] = {}
         self._trial_schedule = self._build_trial_schedule()
 
     def connect(self) -> None:
         self._closed = False
+        self.runtime_provenance = capture_runtime_provenance()
         ports = self.config.ports
         self.bpod = connect_bpod_core(None if ports.bpod_port == "AUTO" else ports.bpod_port)
         self.bpod.reset_session_clock()
@@ -118,6 +130,7 @@ class HFDecisionSession:
             self.config.subject_id,
             self.config.phase.value,
             base_name=base_name,
+            runtime_provenance=self.runtime_provenance,
         )
         self.recorder.set_export_options(config_to_dict(self.config)["session_export"])
         self.recorder.set_metadata(self._session_metadata())
@@ -324,6 +337,7 @@ class HFDecisionSession:
             if self.dio is not None:
                 try:
                     self.dio.close()
+                    self._update_streamdio_buffer_summary()
                 except Exception as exc:
                     logger.exception("Failed to close StreamDIO")
                     if self.recorder is not None:
@@ -368,16 +382,106 @@ class HFDecisionSession:
         if total > 0:
             self.config.n_trials = total
 
-        schedule: list[dict[str, str | None]] = [
+        free_specs: list[dict[str, str | None]] = [
             {"trial_mode": "free", "forced_shape": None} for _ in range(n_free)
         ]
         forced_shapes = ["star" if idx % 2 == 0 else "circle" for idx in range(n_forced)]
         self.rng.shuffle(forced_shapes)
-        schedule.extend(
+        forced_specs = [
             {"trial_mode": "forced", "forced_shape": shape} for shape in forced_shapes
-        )
-        self.rng.shuffle(schedule)
+        ]
+        if task.max_consecutive_forced > 0:
+            schedule = self._schedule_with_forced_cap(
+                free_specs,
+                forced_specs,
+                int(task.max_consecutive_forced),
+            )
+        else:
+            schedule = [*free_specs, *forced_specs]
+            self.rng.shuffle(schedule)
+        if task.side_balancing == "blocked" or task.max_consecutive_side > 0:
+            if task.side_balancing == "blocked":
+                sides = self._balanced_star_side_sequence(
+                    len(schedule),
+                    max_consecutive=int(task.max_consecutive_side),
+                )
+            else:
+                sides = self._capped_bernoulli_side_sequence(
+                    len(schedule),
+                    max_consecutive=int(task.max_consecutive_side),
+                )
+            for spec, side in zip(schedule, sides):
+                spec["star_side"] = side
         return schedule
+
+    def _schedule_with_forced_cap(
+        self,
+        free_specs: list[dict[str, str | None]],
+        forced_specs: list[dict[str, str | None]],
+        cap: int,
+    ) -> list[dict[str, str | None]]:
+        if cap <= 0:
+            schedule = [*free_specs, *forced_specs]
+            self.rng.shuffle(schedule)
+            return schedule
+        if len(forced_specs) > cap * (len(free_specs) + 1):
+            raise ValueError("max_consecutive_forced cannot be satisfied by this trial schedule")
+        gap_counts = [0] * (len(free_specs) + 1)
+        for _ in forced_specs:
+            available = [index for index, count in enumerate(gap_counts) if count < cap]
+            gap_counts[self.rng.choice(available)] += 1
+        schedule: list[dict[str, str | None]] = []
+        forced_index = 0
+        for gap_index, count in enumerate(gap_counts):
+            schedule.extend(forced_specs[forced_index : forced_index + count])
+            forced_index += count
+            if gap_index < len(free_specs):
+                schedule.append(free_specs[gap_index])
+        return schedule
+
+    def _balanced_star_side_sequence(
+        self,
+        n_trials: int,
+        *,
+        max_consecutive: int,
+    ) -> list[Side]:
+        if n_trials <= 0:
+            return []
+        first: Side = self.rng.choice(["left", "right"])
+        second = self._opposite_side(first)
+        paired_remaining = n_trials // 2
+        sides: list[Side] = []
+        while paired_remaining > 0:
+            upper = paired_remaining
+            if max_consecutive > 0:
+                upper = min(upper, max_consecutive)
+            block_length = 1
+            while block_length < upper and self.rng.random() > 0.35:
+                block_length += 1
+            sides.extend([first] * block_length)
+            sides.extend([second] * block_length)
+            paired_remaining -= block_length
+        if n_trials % 2:
+            sides.append(first)
+        return sides
+
+    def _capped_bernoulli_side_sequence(
+        self,
+        n_trials: int,
+        *,
+        max_consecutive: int,
+    ) -> list[Side]:
+        sides: list[Side] = []
+        for _ in range(max(0, n_trials)):
+            if (
+                max_consecutive > 0
+                and len(sides) >= max_consecutive
+                and len(set(sides[-max_consecutive:])) == 1
+            ):
+                sides.append(self._opposite_side(sides[-1]))
+            else:
+                sides.append(self.rng.choice(["left", "right"]))
+        return sides
 
     def _trial_spec(self, trial_index: int) -> dict[str, str | None]:
         if 1 <= trial_index <= len(self._trial_schedule):
@@ -397,7 +501,27 @@ class HFDecisionSession:
             "trial_schedule": list(self._trial_schedule),
             "task_summary": task_design_summary(self.config),
             "streamdio_module_info": self._streamdio_module_info(),
+            "runtime_provenance": dict(self.runtime_provenance),
+            "reward_calibration": (
+                self.reward_calibration.metadata()
+                if self.reward_calibration is not None
+                else None
+            ),
+            **self.runtime_provenance,
         }
+
+    def _load_reward_calibration(self) -> RewardCalibration | None:
+        path = resolve_reward_calibration_path(self.config)
+        if path is None:
+            return None
+        calibration = RewardCalibration.load(path)
+        for duration in (
+            self.config.reward.matched_pump_s,
+            self.config.reward.opposite_pump_s,
+        ):
+            if duration > 0:
+                calibration.volume_for_duration(duration)
+        return calibration
 
     def _streamdio_module_info(self) -> dict:
         if self.dio is None:
@@ -693,6 +817,19 @@ class HFDecisionSession:
         streamdio["status_poll"] = status_poll
         self.recorder.register_stream("streamdio", streamdio)
 
+    def _update_streamdio_buffer_summary(self) -> None:
+        if self.recorder is None or self.dio is None:
+            return
+        getter = getattr(self.dio, "get_buffer_stats", None)
+        if not callable(getter):
+            return
+        stats = getter()
+        if not isinstance(stats, dict) or not stats:
+            return
+        streamdio = self.recorder.get_stream_summaries().get("streamdio", {})
+        streamdio["buffer_stats"] = dict(stats)
+        self.recorder.register_stream("streamdio", streamdio)
+
     def _publish_monitor(self, event_type: str, payload: dict | None = None) -> None:
         if self.monitor is not None:
             self.monitor.publish(event_type, payload or {})
@@ -893,6 +1030,19 @@ class HFDecisionSession:
 
     def _add_trial_record(self, trial: TrialRecord) -> None:
         assert self.recorder is not None
+        if self.reward_calibration is not None and trial.reward_duration_s > 0:
+            trial.reward_volume_ul = self.reward_calibration.volume_for_duration(
+                trial.reward_duration_s
+            )
+            self.recorder.log_event(
+                "reward_volume_annotated",
+                {
+                    "trial_index": trial.trial_index,
+                    "reward_duration_s": trial.reward_duration_s,
+                    "reward_volume_ul": trial.reward_volume_ul,
+                    "calibration_sha256": self.reward_calibration.sha256,
+                },
+            )
         self.recorder.add_trial(trial)
         self._publish_monitor(
             "trial_result",
@@ -908,6 +1058,7 @@ class HFDecisionSession:
                 "matched": trial.matched,
                 "responded": trial.responded,
                 "reward_duration_s": trial.reward_duration_s,
+                "reward_volume_ul": trial.reward_volume_ul,
                 "reward_delay_s": trial.reward_delay_s,
                 "reward_delivered": trial.reward_delivered,
                 "response_time_s": trial.response_time_s,
@@ -2380,7 +2531,9 @@ class HFDecisionSession:
         return "no_star_force_effect"
 
     def _choose_star_side(self, trial_index: int) -> Side:
-        del trial_index
+        side = self._trial_spec(trial_index).get("star_side")
+        if side in {"left", "right"}:
+            return side
         return self.rng.choice(["left", "right"])
 
     def _reward_plan_for_trial(self) -> dict[str, float | bool | str | None]:
@@ -3280,7 +3433,6 @@ class HFDecisionSession:
         trial_mono = time.perf_counter()
         camera_start_idx = len(self.dio.get_camera_events())
         lick_start_idx = self._lick_event_count()
-        frame2ttl_start_idx = self._frame2ttl_event_count()
         self.recorder.log_event("trial_start", {"trial_index": trial_index, "force_direction": force_direction})
         self._publish_monitor(
             "trial_start",

@@ -1,9 +1,15 @@
 from unittest.mock import MagicMock
 
 from hf_dm.config import SessionConfig
-from hf_dm.data.recorder import SessionRecorder, TrialRecord
-from hf_dm.hardware.bringup_constants import LICK_INPUT_CHANNEL
+from hf_dm.data.recorder import SessionEvent, SessionRecorder, TrialRecord
+from hf_dm.hardware.bringup_constants import (
+    CCW_FORCE_OUTPUT_CHANNEL,
+    CW_FORCE_OUTPUT_CHANNEL,
+    LICK_INPUT_CHANNEL,
+    PUMP_OUTPUT_CHANNEL,
+)
 from hf_dm.session.controller import HFDecisionSession
+from hf_dm.session.hardware_self_test import HardwareSelfTestSession
 
 
 class FakeRelay:
@@ -203,3 +209,122 @@ def test_preflight_saves_stream_camera_and_cleanup_events(tmp_path):
     assert event_types.index("preflight_end") < event_types.index("session_end")
     assert event_types.index("video_recording_stopped") < event_types.index("session_end")
     assert session.display.closed
+
+
+def test_hardware_self_test_returns_typed_validation_results(tmp_path):
+    config = SessionConfig(n_trials=3)
+    session = HardwareSelfTestSession(config)
+    recorder = SessionRecorder(tmp_path, "S1", "decision_making")
+    session.recorder = recorder
+    shapes = ("star", "circle", None)
+    choices = ("cw", "ccw", "timeout")
+    rewards = (config.reward.matched_pump_s, config.reward.opposite_pump_s, 0.0)
+    state_sequences = {
+        "star": [
+            "Quiescence_Pre", "Quiescence", "ChoiceWindow_Pre", "ChoiceWindow",
+            "ChoiceBlankHigh_Pre", "ChoiceBlankHigh", "RewardHigh_Pre", "RewardHigh",
+            "PostRewardHigh_Pre", "PostRewardHigh",
+        ],
+        "circle": [
+            "Quiescence_Pre", "Quiescence", "ChoiceWindow_Pre", "ChoiceWindow",
+            "ChoiceBlankLow_Pre", "ChoiceBlankLow", "RewardLow_Pre", "RewardLow",
+            "PostRewardLow_Pre", "PostRewardLow",
+        ],
+        None: [
+            "Quiescence_Pre", "Quiescence", "ChoiceWindow_Pre", "ChoiceWindow",
+            "TimeoutNoise_Pre", "TimeoutNoise", "PostTimeout_Pre", "PostTimeout",
+        ],
+    }
+    for index, (shape, choice, reward) in enumerate(zip(shapes, choices, rewards), start=1):
+        recorder.trials.append(
+            TrialRecord(
+                trial_index=index,
+                phase="decision_making",
+                force_direction="cw",
+                choice=choice,
+                matched=shape == "star",
+                reward_duration_s=reward,
+                responded=shape is not None,
+                response_time_s=0.2,
+                net_pulses=3,
+                cw_pulses=3,
+                ccw_pulses=0,
+                final_position_deg=35.0,
+                force_samples=2,
+                force_last=1.0,
+                force_mean=1.0,
+                force_min=1.0,
+                force_max=1.0,
+                trial_start_wall_s=float(index),
+                trial_start_mono_s=100.0 + index,
+                chosen_shape=shape,
+                camera_ttl_timestamps_us=[index * 1000, index * 1000 + 100],
+            )
+        )
+        recorder.bpod_trials.append(
+            {
+                "trial_index": index,
+                "events": [
+                    {"type": "StateStart", "state": state}
+                    for state in state_sequences[shape]
+                ],
+            }
+        )
+        if shape is not None:
+            choice_mono = 10.0 + index
+            recorder.events.extend(
+                [
+                    SessionEvent(1.0, choice_mono, "choice_detected", {"trial_index": index}),
+                    SessionEvent(
+                        1.0,
+                        choice_mono + config.timing.choice_blank_s,
+                        "pump_start",
+                        {
+                            "trial_index": index,
+                            "actual_on_mono_s": choice_mono + config.timing.choice_blank_s,
+                        },
+                    ),
+                    SessionEvent(
+                        1.0,
+                        choice_mono + config.timing.choice_blank_s + reward,
+                        "pump_end",
+                        {"trial_index": index, "actual_open_s": reward},
+                    ),
+                ]
+            )
+    for channel in (
+        PUMP_OUTPUT_CHANNEL,
+        CW_FORCE_OUTPUT_CHANNEL,
+        CCW_FORCE_OUTPUT_CHANNEL,
+        config.licks.power_output_channel,
+    ):
+        for state in (0, 1):
+            recorder.events.append(
+                SessionEvent(1.0, 1.0, "output_actual", {"channel": channel, "state": state})
+            )
+    recorder.events.extend(
+        [
+            SessionEvent(1.0, 1.0, "white_noise_start", {}),
+            SessionEvent(1.0, 1.1, "white_noise_end", {}),
+            SessionEvent(
+                1.0,
+                1.2,
+                "video_recording_stopped",
+                {"frames_saved": 6, "capture_error": None},
+            ),
+        ]
+    )
+    recorder.streamdio_events = [
+        ("camera", -1, -1, index, index / 1000.0, index / 1000.0)
+        for index in range(6)
+    ]
+
+    report = session.validate_results()
+
+    assert report["status"] == "PASS"
+    assert report["passed"]
+    assert report["results"]
+    assert all(
+        set(result) == {"name", "status", "detail", "hint"}
+        for result in report["results"]
+    )

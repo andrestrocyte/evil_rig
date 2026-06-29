@@ -149,8 +149,6 @@ def test_reward_fsm_validates(mock_relay):
 
 
 def test_iti_fsm_validates():
-    from bpod_core.fsm import StateMachine
-
     fsm = build_iti_fsm(3.0)
     fsm.check()
 

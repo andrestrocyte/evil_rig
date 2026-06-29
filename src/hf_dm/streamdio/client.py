@@ -74,6 +74,7 @@ class StreamDIOClient:
         self._output_states: dict[int, int] = {}
         self._output_sequences: dict[int, int] = defaultdict(int)
         self._output_events: dict[int, tuple[int, int, float, float]] = {}
+        self._last_buffer_stats: dict[str, int] = {}
 
     def open(
         self,
@@ -447,7 +448,25 @@ class StreamDIOClient:
     def stop_streaming(self) -> None:
         if self._dio is not None and getattr(self._dio, "streaming_active", False):
             self._dio.stop_streaming()
+            stats = getattr(self._dio, "_buffer_stats", None)
+            if isinstance(stats, dict):
+                self._last_buffer_stats = {
+                    str(key): int(value)
+                    for key, value in stats.items()
+                    if isinstance(value, (int, float))
+                }
             time.sleep(0.05)
+
+    def get_buffer_stats(self) -> dict[str, int]:
+        if self._dio is not None:
+            stats = getattr(self._dio, "_buffer_stats", None)
+            if isinstance(stats, dict):
+                return {
+                    str(key): int(value)
+                    for key, value in stats.items()
+                    if isinstance(value, (int, float))
+                }
+        return dict(self._last_buffer_stats)
 
     def get_camera_events(self) -> list[tuple[int, float]]:
         """Return (timestamp_us, relative_s) for camera TTL events in history."""

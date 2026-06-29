@@ -470,7 +470,7 @@ def _extract_export_options(metadata: dict[str, Any]) -> dict[str, Any]:
 
 
 def _to_dict(value: Any) -> dict[str, Any]:
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return asdict(value)
     if isinstance(value, dict):
         return dict(value)
@@ -989,6 +989,17 @@ def _manifest(
         if row.get("event_type") == "analog_input"
         and int(row.get("channel") or -1) == force_channel
     )
+    runtime_provenance = metadata.get("runtime_provenance") or {}
+    package_version = (
+        runtime_provenance.get("package_version")
+        if "package_version" in runtime_provenance
+        else _package_version()
+    )
+    git_commit = (
+        runtime_provenance.get("git_commit")
+        if "git_commit" in runtime_provenance
+        else _git_commit(base_path.parent)
+    )
     manifest = {
         "schema_version": 1,
         "created_wall_time_s": time.time(),
@@ -996,8 +1007,12 @@ def _manifest(
         "layout": options.get("layout", "flat"),
         "package": {
             "name": "bpod-hf-dm",
-            "version": _package_version(),
-            "git_commit": _git_commit(base_path.parent),
+            "version": package_version,
+            "git_commit": git_commit,
+            "git_dirty": runtime_provenance.get("git_dirty"),
+            "provenance_captured_wall_s": runtime_provenance.get(
+                "provenance_captured_wall_s"
+            ),
         },
         "config": _config_provenance(metadata),
         "summary": summary,
@@ -1199,7 +1214,7 @@ def _first_mono(events: list[dict[str, Any]]) -> float:
     for event in events:
         value = event.get("monotonic_s")
         if value not in (None, ""):
-            return float(value)
+            return float(str(value))
     return 0.0
 
 
@@ -1467,9 +1482,8 @@ def _validate_manifest_counts(manifest: dict[str, Any], bundle_dir: Path) -> lis
     payload, rel = _primary_session_json_payload(manifest, bundle_dir)
     metadata: dict[str, Any] = {}
     if payload is not None:
-        metadata = (
-            payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-        )
+        raw_metadata = payload.get("metadata")
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
         trials = payload.get("trials")
         if isinstance(trials, list):
             _append_count_mismatch(
@@ -1594,7 +1608,8 @@ def _validate_manifest_counts(manifest: dict[str, Any], bundle_dir: Path) -> lis
                 frame2ttl_edges,
                 npz_rel,
             )
-    video = manifest.get("video") if isinstance(manifest.get("video"), dict) else {}
+    raw_video = manifest.get("video")
+    video: dict[str, Any] = dict(raw_video) if isinstance(raw_video, dict) else {}
     video_frames = _optional_int(video.get("n_frames")) or 0
     _append_count_mismatch(
         errors,
@@ -1787,20 +1802,20 @@ def _compare_chunk_summary(
                 f"{declared_value} != {actual_value}"
             )
     for field in ("first_relative_time_s", "last_relative_time_s"):
-        declared_value = _optional_float(declared.get(field))
-        actual_value = _optional_float(actual.get(field))
-        if declared_value is None and actual_value is None:
+        declared_time = _optional_float(declared.get(field))
+        actual_time = _optional_float(actual.get(field))
+        if declared_time is None and actual_time is None:
             continue
-        if declared_value is None or actual_value is None:
+        if declared_time is None or actual_time is None:
             errors.append(
                 f"continuous stream chunk {field} mismatch: {rel}: "
-                f"{declared_value} != {actual_value}"
+                f"{declared_time} != {actual_time}"
             )
             continue
-        if abs(declared_value - actual_value) > 1e-9:
+        if abs(declared_time - actual_time) > 1e-9:
             errors.append(
                 f"continuous stream chunk {field} mismatch: {rel}: "
-                f"{declared_value} != {actual_value}"
+                f"{declared_time} != {actual_time}"
             )
 
 
@@ -2215,7 +2230,7 @@ def _validate_timeline_csv(path: Path, rel: str) -> list[str]:
             session_mono = row.get("session_mono_s")
             if session_mono not in (None, ""):
                 try:
-                    current_time = float(session_mono)
+                    current_time = float(str(session_mono))
                 except ValueError:
                     errors.append(
                         f"timeline csv invalid session_mono_s: {rel}:{row_index}: "
@@ -2230,7 +2245,7 @@ def _validate_timeline_csv(path: Path, rel: str) -> list[str]:
             detail_json = row.get("detail_json")
             if detail_json not in (None, ""):
                 try:
-                    json.loads(detail_json)
+                    json.loads(str(detail_json))
                 except json.JSONDecodeError as exc:
                     errors.append(
                         f"timeline csv invalid detail_json: {rel}:{row_index}: {exc.msg}"
@@ -2489,6 +2504,44 @@ def _validate_rig_preflight_report_json(
             errors.append(f"rig preflight streamdio missing counts_by_type: {rel}")
         if not isinstance(streamdio.get("module_status"), dict):
             errors.append(f"rig preflight streamdio missing module_status object: {rel}")
+    validation = payload.get("validation")
+    if not isinstance(validation, dict):
+        errors.append(f"rig preflight report missing validation object: {rel}")
+    else:
+        status = validation.get("status")
+        if status not in {"PASS", "WARN", "FAIL"}:
+            errors.append(f"rig preflight report invalid validation status: {rel}")
+        if not isinstance(validation.get("passed"), bool):
+            errors.append(f"rig preflight report invalid validation passed flag: {rel}")
+        results = validation.get("results")
+        if not isinstance(results, list) or not results:
+            errors.append(f"rig preflight report missing validation results: {rel}")
+        else:
+            result_statuses = set()
+            for index, result in enumerate(results):
+                if not isinstance(result, dict):
+                    errors.append(
+                        f"rig preflight validation result is not an object: {rel}[{index}]"
+                    )
+                    continue
+                if not isinstance(result.get("name"), str) or not result.get("name"):
+                    errors.append(f"rig preflight validation missing name: {rel}[{index}]")
+                result_status = result.get("status")
+                if result_status not in {"PASS", "WARN", "FAIL"}:
+                    errors.append(f"rig preflight validation invalid status: {rel}[{index}]")
+                else:
+                    result_statuses.add(result_status)
+                if not isinstance(result.get("detail"), str):
+                    errors.append(f"rig preflight validation missing detail: {rel}[{index}]")
+            expected_status = (
+                "FAIL"
+                if "FAIL" in result_statuses
+                else "WARN"
+                if "WARN" in result_statuses
+                else "PASS"
+            )
+            if status != expected_status:
+                errors.append(f"rig preflight validation aggregate mismatch: {rel}")
     return errors
 
 

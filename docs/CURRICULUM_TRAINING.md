@@ -78,16 +78,19 @@ print(matched.mean(), trials["response_time_s"].mean())
 
 ## Daily rig checklist
 
-1. Run no-trial hardware preflight:
+1. Record subject weight and the licensed water target:
+   `hf-dm log-weight <subject> --weight <grams> --water-target <ml>`
+2. Run no-trial hardware preflight:
    `python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration 2`
-2. Confirm the preflight has zero errors/overruns and matching camera TTL/frame counts.
-3. After code/hardware changes, run the real-output diagnostic with the rig clear:
+3. Confirm the typed preflight results have no FAIL entries, zero overruns, and camera TTLs.
+4. After code/hardware changes, run the real-output diagnostic with the rig clear:
    `python -m hf_dm.cli --config configs/dm_50.yaml --hardware-self-test`
-4. Confirm no old Python, PyBpod, notebook, or serial-monitor process owns COM7/COM8.
-5. Run the stage config:
+5. Confirm no old Python, PyBpod, notebook, or serial-monitor process owns COM7/COM8.
+6. Run the stage config:
    `python -m hf_dm.cli --config configs/dm_50.yaml`
-6. Verify `.npz`/`.json` in `data/sessions/` and video/timestamps in `data/videos/`.
-7. Check `choice_loop_stall_count`, licks, raw force/wheel events, camera TTLs, and `session_end`.
+7. Verify `.npz`/`.json` in `data/sessions/` and video/timestamps in `data/videos/`.
+8. Run `hf-dm session-qc <session>` and review every WARN/FAIL result.
+9. Check calibrated water totals, licks, raw force/wheel events, camera TTLs, and `session_end`.
 
 ## Suggested calendar
 

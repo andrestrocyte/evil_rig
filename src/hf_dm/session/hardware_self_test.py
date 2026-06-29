@@ -17,6 +17,7 @@ from hf_dm.hardware.bringup_constants import (
 from hf_dm.fsm.runtime import TrialRuntime
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.streamdio.wheel import Direction
+from hf_dm.validation import ValidationResult, validation_report
 
 SelfTestChoice = Literal["matched", "opposite", "timeout"]
 
@@ -180,6 +181,11 @@ class HardwareSelfTestSession(HFDecisionSession):
                 event_by_trial.setdefault(int(trial_index), {})[event.event_type] = event
 
         failures: list[str] = []
+        check_failures: dict[str, list[str]] = {}
+
+        def fail(check: str, detail: str) -> None:
+            failures.append(detail)
+            check_failures.setdefault(check, []).append(detail)
         max_choice_to_pump_s = 0.0
         max_reward_error_s = 0.0
         bpod_states_by_trial = {
@@ -231,7 +237,8 @@ class HardwareSelfTestSession(HFDecisionSession):
                 ]
             actual_states = bpod_states_by_trial.get(trial.trial_index, [])
             if actual_states != expected_states:
-                failures.append(
+                fail(
+                    "bpod_state_sequences",
                     f"trial {trial.trial_index}: decoded Bpod states "
                     f"{actual_states}, expected {expected_states}"
                 )
@@ -241,7 +248,10 @@ class HardwareSelfTestSession(HFDecisionSession):
                 pump_start = trial_events.get("pump_start")
                 pump_end = trial_events.get("pump_end")
                 if choice_event is None or pump_start is None or pump_end is None:
-                    failures.append(f"trial {trial.trial_index}: missing choice/pump events")
+                    fail(
+                        "reward_event_chain",
+                        f"trial {trial.trial_index}: missing choice/pump events",
+                    )
                     continue
                 choice_to_pump_s = (
                     float(pump_start.payload["actual_on_mono_s"])
@@ -255,21 +265,27 @@ class HardwareSelfTestSession(HFDecisionSession):
                 )
                 expected_choice_to_pump_s = self.config.timing.choice_blank_s
                 if abs(choice_to_pump_s - expected_choice_to_pump_s) > 0.050:
-                    failures.append(
+                    fail(
+                        "choice_to_pump_timing",
                         f"trial {trial.trial_index}: choice-to-pump error "
                         f"{choice_to_pump_s - expected_choice_to_pump_s:+.6f}s"
                     )
                 if abs(actual_open_s - trial.reward_duration_s) > 0.010:
-                    failures.append(
+                    fail(
+                        "reward_duration_timing",
                         f"trial {trial.trial_index}: pump duration error "
                         f"{actual_open_s - trial.reward_duration_s:+.6f}s"
                     )
             if trial.force_samples <= 0:
-                failures.append(f"trial {trial.trial_index}: no force ADC samples")
+                fail("force_adc", f"trial {trial.trial_index}: no force ADC samples")
             if not trial.camera_ttl_timestamps_us:
-                failures.append(f"trial {trial.trial_index}: no camera TTL timestamps")
+                fail(
+                    "camera_ttl_per_trial",
+                    f"trial {trial.trial_index}: no camera TTL timestamps",
+                )
             if trial.choice_loop_stall_count:
-                failures.append(
+                fail(
+                    "choice_loop_stalls",
                     f"trial {trial.trial_index}: {trial.choice_loop_stall_count} choice-loop stalls"
                 )
 
@@ -290,25 +306,29 @@ class HardwareSelfTestSession(HFDecisionSession):
         }
         missing_outputs = sorted(required_output_states - output_states)
         if missing_outputs:
-            failures.append(f"missing firmware output events: {missing_outputs}")
+            fail(
+                "firmware_output_events",
+                f"missing firmware output events: {missing_outputs}",
+            )
 
         noise_start_events = [event for event in events if event.event_type == "white_noise_start"]
         noise_end_events = [event for event in events if event.event_type == "white_noise_end"]
         if not noise_start_events or len(noise_start_events) != len(noise_end_events):
-            failures.append("Bpod pin-27 timeout gate did not complete")
+            fail("white_noise_gate", "Bpod pin-27 timeout gate did not complete")
 
         video_events = [event for event in events if event.event_type == "video_recording_stopped"]
         video_frames = sum(int(event.payload.get("frames_saved", 0)) for event in video_events)
         if video_frames <= 0:
-            failures.append("Spinnaker recording saved no frames")
+            fail("spinnaker_recording", "Spinnaker recording saved no frames")
         if any(event.payload.get("capture_error") for event in video_events):
-            failures.append("Spinnaker recording reported a capture error")
+            fail("spinnaker_recording", "Spinnaker recording reported a capture error")
 
         stream_camera_ttls = sum(
             1 for event in self.recorder.streamdio_events if event[0] == "camera"
         )
         if stream_camera_ttls != video_frames:
-            failures.append(
+            fail(
+                "camera_ttl_frame_alignment",
                 f"camera TTL/frame mismatch: {stream_camera_ttls} TTLs, {video_frames} frames"
             )
         first_trial_mono_s = min(
@@ -327,7 +347,10 @@ class HardwareSelfTestSession(HFDecisionSession):
             code for code, host_mono_s in diagnostic_events if host_mono_s >= first_trial_mono_s
         ]
         if trial_diagnostic_codes:
-            failures.append(f"trial-time StreamDIO diagnostic events: {trial_diagnostic_codes}")
+            fail(
+                "streamdio_diagnostics",
+                f"trial-time StreamDIO diagnostic events: {trial_diagnostic_codes}",
+            )
         wheel_edges = sum(
             1
             for event in self.recorder.streamdio_events
@@ -336,8 +359,95 @@ class HardwareSelfTestSession(HFDecisionSession):
             in (self.config.wheel.pulse_channel, self.config.wheel.direction_channel)
         )
 
+        check_specs = [
+            (
+                "bpod_state_sequences",
+                f"decoded production state sequences for {len(self.recorder.trials)} trials",
+                "Inspect exact Bpod rows and the generated FSM definition.",
+            ),
+            (
+                "reward_event_chain",
+                "choice, pump-start, and pump-end events were present",
+                "Inspect output_actual events and pump channel wiring.",
+            ),
+            (
+                "choice_to_pump_timing",
+                f"maximum observed choice-to-pump delay={max_choice_to_pump_s * 1000.0:.3f} ms",
+                "Check host load and Bpod ChoiceBlank timing.",
+            ),
+            (
+                "reward_duration_timing",
+                f"maximum pump duration error={max_reward_error_s * 1000.0:.3f} ms",
+                "Check StreamDIO output acknowledgements and host scheduling load.",
+            ),
+            (
+                "force_adc",
+                f"force samples={sum(trial.force_samples for trial in self.recorder.trials)}",
+                "Check force ADC channel 13/pin 14.",
+            ),
+            (
+                "camera_ttl_per_trial",
+                "camera TTL timestamps were present on every trial",
+                "Check StreamDIO camera triggering and event streaming.",
+            ),
+            (
+                "choice_loop_stalls",
+                "no choice-loop stalls were recorded",
+                "Reduce display/host load and inspect frame timing.",
+            ),
+            (
+                "firmware_output_events",
+                f"firmware output events={len(output_states)} distinct states",
+                "Check StreamDIO USB1 output event reporting.",
+            ),
+            (
+                "white_noise_gate",
+                f"completed white-noise gate pulses={len(noise_end_events)}",
+                "Check Bpod pin 27 and the continuous sound source.",
+            ),
+            (
+                "spinnaker_recording",
+                f"video frames={video_frames}",
+                "Check FLIR trigger mode, exposure, and recording backend.",
+            ),
+            (
+                "camera_ttl_frame_alignment",
+                f"camera TTLs={stream_camera_ttls}, video frames={video_frames}",
+                "Inspect FLIR frame timestamps and StreamDIO camera events.",
+            ),
+            (
+                "streamdio_diagnostics",
+                "no diagnostic codes occurred during trials",
+                "Decode diagnostic IDs and inspect StreamDIO firmware state.",
+            ),
+        ]
+        typed_results = []
+        for name, pass_detail, hint in check_specs:
+            details = check_failures.get(name, [])
+            typed_results.append(
+                ValidationResult(
+                    name=name,
+                    status="FAIL" if details else "PASS",
+                    detail="; ".join(details) if details else pass_detail,
+                    hint=hint,
+                )
+            )
+        typed_results.append(
+            ValidationResult(
+                name="streamdio_startup_diagnostics",
+                status="WARN" if startup_diagnostic_codes else "PASS",
+                detail=(
+                    f"startup diagnostic codes={startup_diagnostic_codes}"
+                    if startup_diagnostic_codes
+                    else "no startup diagnostic codes"
+                ),
+                hint="Startup-only codes may be benign; decode and document recurring values.",
+            )
+        )
+        typed_report = validation_report(typed_results)
+
         report = {
-            "passed": not failures,
+            **typed_report,
             "failures": failures,
             "trials": len(self.recorder.trials),
             "max_choice_to_pump_ms": max_choice_to_pump_s * 1000.0,
