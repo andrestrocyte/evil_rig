@@ -1148,8 +1148,8 @@ def _fit_affine_clock_pair(
     if len(anchors) < 2:
         return result
 
-    source = np.asarray([anchor[0] for anchor in anchors], dtype=float)
-    target = np.asarray([anchor[1] for anchor in anchors], dtype=float)
+    source: np.ndarray = np.asarray([anchor[0] for anchor in anchors], dtype=float)
+    target: np.ndarray = np.asarray([anchor[1] for anchor in anchors], dtype=float)
     source_centered = source - float(np.mean(source))
     denominator = float(np.dot(source_centered, source_centered))
     if denominator <= np.finfo(float).eps:
