@@ -1,338 +1,419 @@
-# Head-Fixed Discounting Bpod Task
+# Head-Fixed Decision-Making Bpod Task (`hf_dm`)
 
 ![Cartoon mouse choosing between low- and high-effort wheel directions](assets/hf-dm-experiment-cartoon.png)
 
-Head-fixed **decision-making with effort** (wheel + force cue), implemented on **[bpod-core](https://github.com/int-brain-lab/bpod-core)** with StreamDIO hardware.
+[![CI](https://github.com/andrestrocyte/bpod-hf-dm/actions/workflows/ci.yml/badge.svg)](https://github.com/andrestrocyte/bpod-hf-dm/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-%E2%89%A53.10-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 
-Design reference: [IBLRIG](https://int-brain-lab.github.io/iblrig/) (IBL two-alternative choice structure) plus the **force-discount wheel** paradigm from `MM_PyBpod2/examples/screen_shape_force_discount_task.py`.
+A **head-fixed, effort-based decision-making task** for mice, built on
+[**bpod-core**](https://github.com/int-brain-lab/bpod-core) with **StreamDIO** hardware. A mouse
+turns a wheel to bring one of two visual targets to screen center: a **star** (high effort / high
+reward) or a **circle** (low effort / low reward). The rig records wheel kinematics, applied force,
+licks, video, and screen-sync pulses on a common time base, with crash-safe data capture and
+post-session quality control.
 
-## Hard Rule: Rig Contract
+> **Design references:** the two-alternative choice structure and Frame2TTL screen-sync philosophy
+> of [IBLRIG](https://int-brain-lab.github.io/iblrig/), combined with the **force-discount wheel**
+> paradigm from `MM_PyBpod2/examples/screen_shape_force_discount_task.py`.
 
-All pin/channel/timing defaults are defined in this repository, mainly in `src/hf_dm/hardware/bringup_constants.py` and `configs/*.yaml`. They match the hardware brought up with the MM_PyBpod2 notebooks:
+---
 
-| Notebook | What this repo uses |
-|----------|---------------------|
-| `rotary_encoder_bringup.ipynb` | DI01 pulse, DI03 direction, AI13 force (pin 14) |
-| `screen_bringup_shape_force_discount.ipynb` | CW force ch3/pin21, CCW ch5/pin19, pump ch1/pin23 |
-| `camera_bringup_pin32_ttl.ipynb` | StreamDIO camera 30 Hz, 10 ms exposure |
-| `speaker_bringup_pin27_whitenoise.ipynb` | Continuous PC white noise, gated by Bpod serial action on pin 27 |
-| `cap_touch_bringup_pin15_power_pin14_touch.ipynb` | Cap-touch power output ch13/pin15; lick edges on input ch14/pin25 |
-| `frame2ttl_v3_bringup_di05_pin6.ipynb` | Frame2TTL v3 TTL output into StreamDIO DI05 / pin 6 |
+## Table of contents
 
-The task does not read rig parameters from a sister checkout. MM_PyBpod2 is needed as an installed
-driver package for `pybpod_streamDIO_module` unless that driver is deliberately vendored later.
+- [Why this repo](#why-this-repo)
+- [Key features](#key-features)
+- [System architecture](#system-architecture)
+- [Trial structure](#trial-structure)
+- [Hardware contract](#hardware-contract)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Configuration reference](#configuration-reference)
+- [Running a session](#running-a-session)
+- [Diagnostics & hardware validation](#diagnostics--hardware-validation)
+- [Counterbalancing, calibration & welfare](#counterbalancing-calibration--welfare)
+- [Data outputs](#data-outputs)
+- [Command reference](#command-reference)
+- [Operator monitor](#operator-monitor)
+- [Recovery & quality control](#recovery--quality-control)
+- [Testing & CI](#testing--ci)
+- [Repository layout](#repository-layout)
+- [Troubleshooting](#troubleshooting)
+- [Learning curricula](#learning-curricula)
+- [License](#license)
 
-Ports default to `AUTO` with the same discovery logic as the screen task.
-Cap-touch power is held high for the whole session. Input channel 14 is enabled in the StreamDIO
-digital stream; each configured high edge is stored both as a raw module-timestamped event and as
-an explicit `lick` session event while force remains sampled on AI13.
+---
 
-The `pybpod_rotaryencoder_module` is deliberately not used in runtime here: this rig reads wheel
-pulses through StreamDIO DI01/DI03, not the Sanworks Bpod rotary module. A legacy adapter would need
-to be mutually exclusive with the StreamDIO wheel path.
+## Why this repo
 
-## Architecture
+This is a **single-process rig application** (no web server, database, or network ports) that talks
+to hardware over USB/serial. It is deliberately split so that the right component owns each
+responsibility:
 
+- **Bpod owns trial time** — quiescence, choice timeout, reward, and timeout states run on the Bpod
+  state-machine clock, not on the host OS scheduler.
+- **Python owns the visual loop and I/O** — it renders the wheel-coupled display at 60 Hz, reads the
+  StreamDIO event stream, detects the centered choice, and drives verified reward/force outputs.
+- **StreamDIO owns the fast, timestamped data stream** — wheel pulses, force ADC, licks, camera
+  TTLs, Frame2TTL edges, and Bpod state markers are all timestamped by one module clock.
+
+The result is IBL-style rigor (multi-clock logging, screen sync, verified outputs, session bundles,
+QC) on a compact, hardware-specific stack.
+
+---
+
+## Key features
+
+| Area | What you get |
+|------|--------------|
+| **Trial control** | Bpod-core FSM owns quiescence, 20 s choice timeout, reward, and timeout; host supervises the wheel/display at 60 Hz |
+| **Effort paradigm** | Star (high-effort/high-reward) vs circle (low-effort/low-reward) with pixel-matched masks; `force`, `risk`, and `delay` modalities |
+| **Screen sync** | Frame2TTL v3 photodiode + per-trial pulse-count **barcode** + 1 ms Bpod `*_Pre` state markers |
+| **Verified outputs** | Pump/force/cap-touch over StreamDIO USB require both a USB ack and a timestamped physical `dio_output` event |
+| **Video** | Headless Spinnaker (FLIR) recording with per-frame camera + host timestamps; optional offline FFV1 preview |
+| **Multi-clock data** | Wall + monotonic `perf_counter` + StreamDIO module timestamps, with an export-time affine alignment fit |
+| **Crash safety** | Append-only `session.journal.jsonl`, fsync per completed trial, atomic NPZ/JSON writes, `recover-session` |
+| **Counterbalancing** | Opt-in blocked side balancing + consecutive-run caps (defaults preserve historical Bernoulli draw) |
+| **Calibration & welfare** | Guided valve calibration → µL annotation; per-subject weight/water log |
+| **QC** | `session-qc` PASS/WARN/FAIL on response rate, matched rate, RT, and loop stalls |
+| **Operator monitor** | Separate-process GUI: camera preview, task mirror, FSM state, force/wheel traces, lick/pump/noise rails |
+| **Validation** | Semantic config validation, no-trial preflight, and typed `name/status/detail/hint` diagnostic results |
+| **CI** | Ruff + mypy + hardware-free pytest on Windows and Linux |
+
+---
+
+## System architecture
+
+```mermaid
+flowchart TB
+    subgraph HOST["Host PC (Python, one process)"]
+        DISP["pygame display<br/>60 Hz, wheel-coupled"]
+        LOOP["Session supervisor<br/>choice detection"]
+        REC["SessionRecorder<br/>NPZ / JSON / journal"]
+        CAM["Headless Spinnaker<br/>video recorder"]
+        MON["Operator monitor<br/>(separate process)"]
+        SND["Continuous white noise<br/>(PC sound)"]
+    end
+
+    subgraph BPOD["Bpod State Machine"]
+        FSM["Trial FSM<br/>quiescence / choice / reward / timeout"]
+        GATE["Serial action<br/>pin-27 speaker gate"]
+    end
+
+    subgraph SDIO["StreamDIO module"]
+        IN["Inputs: wheel DI01/DI03,<br/>force AI13, lick ch14,<br/>Frame2TTL DI05, camera TTL"]
+        OUT["Outputs: pump ch1, force ch3/ch5,<br/>cap-touch power ch13"]
+        MARK["Bpod state markers<br/>(opcode 'S')"]
+    end
+
+    LOOP -->|"SoftCodes: movement, choice"| FSM
+    FSM -->|"state-entry SoftCodes"| LOOP
+    FSM --> GATE
+    LOOP -->|"verified USB commands"| OUT
+    IN -->|"timestamped event stream"| LOOP
+    FSM -->|"Serial1 [S, state_id]"| MARK
+    LOOP --> REC
+    LOOP --> DISP
+    CAM --> REC
+    LOOP -. "drop-safe telemetry" .-> MON
+    DISP -. "Frame2TTL patch" .-> IN
 ```
-Session supervisor (Python)
-  - pygame display coupled to wheel position at display FPS
-  - StreamDIO rotary, force, lick, and camera TTL streams
-  - verified StreamDIO USB commands for force, pump, and cap-touch power
-  - continuous PC white noise held behind the pin-27 hardware gate
-  - required headless Spinnaker recording for the whole session
-  - full raw StreamDIO NPZ stream plus JSON/NPZ trial and event records
-  - wall timestamps plus high-resolution monotonic `perf_counter` timestamps
 
-Bpod-core trial FSM
-  - installs the full firmware module/USB event allocation during bringup
-  - owns 3 s wheel quiescence, 20 s choice `Tup`, blank, reward, timeout, and exit
-  - receives host SoftCodes only for wheel movement during quiescence and committed choices
-  - triggers verified pump/force host actions with output SoftCodes
-  - directly gates timeout white noise with its Serial-module pin-27 action
+**Responsibility split**
+
+| Component | Owns | Does **not** own |
+|-----------|------|------------------|
+| **Python supervisor** | display, wheel reading, choice detection, output triggering, data | trial timing authority |
+| **Bpod FSM** | trial clock (quiescence, timeout, reward, blank, post states), speaker gate | display, wheel reading |
+| **StreamDIO** | timestamped input stream + verified outputs + state markers | decision logic |
+
+The task does **not** read rig parameters from a sister checkout — all pin/channel/timing defaults
+live in `src/hf_dm/hardware/bringup_constants.py` and `configs/*.yaml`. `MM_PyBpod2` is needed only
+as the installed driver package for `pybpod_streamDIO_module`.
+
+---
+
+## Trial structure
+
+During the `decision_making` phase, every trial runs a fresh Bpod FSM while Python supervises the
+display:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Quiescence
+    Quiescence --> Quiescence: wheel movement SoftCode (reset 3 s)
+    Quiescence --> ChoiceWindow: Tup (3 s still)
+    ChoiceWindow --> ChoiceBlankHigh: star centered (SoftCode high)
+    ChoiceWindow --> ChoiceBlankLow: circle centered (SoftCode low)
+    ChoiceWindow --> TimeoutNoise: Tup (20 s, no choice)
+    ChoiceBlankHigh --> RewardHigh: Tup (choice_blank_s)
+    ChoiceBlankLow --> RewardLow: Tup (choice_blank_s)
+    RewardHigh --> PostRewardHigh: Tup (pump on)
+    RewardLow --> PostRewardLow: Tup (pump on)
+    PostRewardHigh --> [*]: Tup (post_reward_s)
+    PostRewardLow --> [*]: Tup (post_reward_s)
+    TimeoutNoise --> PostTimeout: Tup (white noise on pin 27)
+    PostTimeout --> [*]: Tup (noise off)
 ```
 
-**Trial timeline (decision_making phase)**
+1. **Quiescence (3 s):** any streamed wheel movement sends a reset SoftCode and restarts the
+   Bpod-owned stillness timer.
+2. **Choice window (20 s):** a star and a circle start on opposite lateral sides (pixel-matched
+   masks). Python redraws at 60 Hz — turning **right** moves only the **left** option toward center;
+   turning **left** moves only the **right** option toward center. Bpod's `Tup` is the authoritative
+   timeout.
+3. **Choice:** when a shape is centered, Python sends one high/low SoftCode. Bpod enters the blank
+   state, turns force off, waits `choice_blank_s`, runs the pump state, then holds `post_reward_s`.
+4. **Timeout:** Bpod enters the timeout state, gates audible white noise on pin 27 for
+   `timeout_noise_s`, then holds `post_timeout_s`.
+5. A fresh FSM starts the next trial — there is no host-side choice wait or extra ITI.
 
-1. Bpod requires **3 s wheel quiescence**; any streamed wheel movement sends a reset SoftCode.
-2. Bpod enters a **20 s ChoiceWindow**. Its `Tup` is the authoritative timeout.
-3. A star (high effort/high reward) and circle (low effort/low reward) begin on opposite lateral sides.
-4. The live Python loop reads StreamDIO and redraws at 60 Hz. Turning right moves only the left option
-   toward center; turning left moves only the right option toward center.
-5. Star/circle side is randomized each trial. The masks contain exactly the same number of lit pixels.
-6. On a centered choice, Python sends one high/low SoftCode. Bpod immediately enters the blank state,
-   turns force off, waits `choice_blank_s`, enters the appropriate pump state, then holds a final
-   `post_reward_s` state before exiting.
-7. On timeout, Bpod enters the timeout state directly, gates audible white noise on pin 27, gates it
-   off after `timeout_noise_s`, holds `post_timeout_s`, and exits.
-8. A fresh Bpod FSM starts the next trial. There is no host-side choice wait or extra decision-task ITI.
+Pump and effort outputs use the low-latency, **verified** StreamDIO USB path: each requires a USB
+acknowledgement **and** a timestamped physical `dio_output` event. Bpod controls *when* via
+state-entry output SoftCodes.
 
-Pump and effort outputs retain the low-latency, verified StreamDIO USB path and require both a USB
-acknowledgement and a timestamped physical `dio_output` event. Bpod controls when those actions occur
-through state-entry output SoftCodes.
+**Modalities** (`task.modality`): `force` applies a physical force cue toward the star side;
+`risk` makes the star reward probabilistic (`risk_star_probability`); `delay` adds
+`delay_star_extra_s` before the star reward.
 
-## Install
+---
+
+## Hardware contract
+
+All channels/pins match the `MM_PyBpod2` bringup notebooks. **Ports default to `AUTO`** with the
+same discovery logic as the screen task.
+
+| Function | StreamDIO channel | Teensy pin | Source notebook |
+|----------|------------------|-----------|-----------------|
+| Wheel pulse | DI01 (input ch1) | pin 2 | `rotary_encoder_bringup.ipynb` |
+| Wheel direction | DI03 (input ch3) | pin 4 | `rotary_encoder_bringup.ipynb` |
+| Force ADC | AI13 (analog ch13) | pin 14 | `rotary_encoder_bringup.ipynb` |
+| Pump (reward) | output ch1 | pin 23 | `screen_bringup_shape_force_discount.ipynb` |
+| CW force | output ch3 | pin 21 | `screen_bringup_shape_force_discount.ipynb` |
+| CCW force | output ch5 | pin 19 | `screen_bringup_shape_force_discount.ipynb` |
+| Cap-touch power | output ch13 | pin 15 | `cap_touch_bringup_pin15_power_pin14_touch.ipynb` |
+| Lick (cap-touch) | input ch14 | pin 25 | `cap_touch_bringup_pin15_power_pin14_touch.ipynb` |
+| Camera TTL | StreamDIO 30 Hz, 10 ms | pin 32 | `camera_bringup_pin32_ttl.ipynb` |
+| Speaker gate | Bpod Serial1 action | pin 27 | `speaker_bringup_pin27_whitenoise.ipynb` |
+| Frame2TTL v3 | DI05 (input ch5) | pin 6 | `frame2ttl_v3_bringup_di05_pin6.ipynb` |
+
+**Notes**
+
+- Cap-touch power is held high for the whole session; lick edges on input ch14 are stored both as
+  raw module-timestamped events and as explicit `lick` session events.
+- The firmware streams **one** analog input at a time, so force stays on AI13 and the vendored
+  StreamDIO firmware (`firmware/`) digitizes cap-touch pin 25 locally into channel-14 high/low
+  events. Flash it if the detector LED changes but no lick events appear.
+- The Sanworks `pybpod_rotaryencoder_module` is intentionally **not** used — the wheel is read via
+  StreamDIO DI01/DI03.
+- Defaults: baudrate `1312500`, wheel radius `31.5 mm`, `1024` ticks/rev, gain `4.0 deg/mm`,
+  Bpod serial channel `1`.
+
+---
+
+## Installation
+
+**Requirements:** Python ≥ 3.10, a Windows rig (same as the bringups) for live hardware, Bpod State
+Machine 2+. Tests and simulation are hardware-free and cross-platform.
 
 ```bash
 cd /path/to/bpod-hf-dm
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
 pip install -e /path/to/bpod-core
 pip install -e /path/to/MM_PyBpod2_andrestrocyte   # StreamDIO + optional sound module
 pip install -e .
-# optional offline preview-video exporter:
-pip install -e .[video]
-# optional MM-style cold-path helpers used by some rigs:
-pip install -e .[mm]
 ```
 
-Requires Python >= 3.10, Windows rig (same as bringups), Bpod State Machine 2+.
-
-### Headless Spinnaker recording (no SpinView)
-
-Install the **Teledyne/FLIR Spinnaker SDK** and set `camera.backend: spinnaker`. The recorder uses
-`PySpin` when a compatible binding is installed and automatically falls back to the installed
-Spinnaker C API when it is not. Both paths configure the verified bringup trigger contract:
-`FrameStart`, `Line0`, rising edge, and `TriggerWidth` exposure.
-
-Example:
-
-```yaml
-camera:
-  frequency_hz: 30
-  exposure_us: 10000
-  record_video: true
-  required: true
-  backend: spinnaker
-  serial_number: null      # optional: choose a specific camera
-  pixel_format: Mono8
-  roi_width: null           # optional Spinnaker ROI crop; null keeps full sensor
-  roi_height: null
-  roi_offset_x: null
-  roi_offset_y: null
-  acquisition_timeout_ms: 1000
-  save_dir: data/videos
-```
-
-Optional cold-path video exports are controlled separately:
-
-```yaml
-video:
-  record_video: true              # also accepted here; camera.record_video stays compatible
-  export_spinnaker_summary: true
-  duplicate_preview_video: false  # opt-in offline FFV1 AVI from saved PGM frames
-```
-
-Optional MM-inspired integrations remain cold-path:
-
-```yaml
-integrations:
-  mm_soundcard_status: true
-  mm_alyx_register: false         # uses ALYX_API_URL/ALYX_TOKEN or alyx_* fields
-  mm_flir_roi_gui: true           # no-argument camera-roi-setup opens visual selection
-```
-
-The session writes a frame sequence, `frame_timestamps.csv`, and `recording_summary.json` under
-`data/videos/<subject>_<phase>_<timestamp>_spinnaker/`. The summary includes saved frames,
-duration, mean saved FPS, requested trigger rate, exposure, preview delivery counts,
-incomplete/timeout/save-error capture counters, and a conservative estimated missing-trigger count.
-With `required: true`, the task refuses to run if
-recording cannot start. The optional preview AVI is generated only after frames are already saved,
-through `hf-dm export-preview-video` or `video.duplicate_preview_video: true`; it is never written
-from the live camera callback.
-
-### Operator monitor GUI
-
-The official configs enable a separate lightweight monitor on the computer/main screen
-(`monitor.display_index: 0`), while the task stimulus remains on the behavior display
-(`display.display_index: 1`). The monitor runs in its own process and receives only nonblocking,
-drop-safe telemetry, so closing or slowing the GUI does not stall the Bpod/StreamDIO task loop.
-
-It shows a low-rate camera preview, a compact left-rotated task screen copy, the active Bpod FSM
-state, a one-row rolling history of the latest 10 star/circle/timeout outcome icons,
-lick-edge/pump/noise event rails, raw cap-touch
-pin status, a live force-effort ADC trace with a session-held y-axis maximum, and the wheel trace
-reset every trial.
-Use `--no-monitor` for command-line checks, or `--monitor` to force it on when a YAML file has it
-disabled. `--simulate-headless` disables the monitor automatically.
-
-When `monitor.record_path: auto`, the monitor child process writes compact JSONL telemetry to
-`exports/monitor_telemetry.jsonl` in the session bundle. Frame byte payloads are replaced by byte
-counts, and task-side publishing remains nonblocking queue insertion.
-
-Cap touch uses StreamDIO input channel 14 / physical pin 25 for the lick detector and output
-channel 13 / physical pin 15 for detector power. The GUI shows both the power output and the raw
-input channel value so detector transitions are visible even before trial-level counted licks.
-Because the firmware can stream only one configured analog input at a time, force remains on analog
-channel 13 and the vendored StreamDIO firmware in `firmware/` digitizes cap-touch pin 25 locally
-into normal channel-14 high/low input events. Flash that firmware if the detector LED changes but no
-lick events appear in the GUI. With firmware version 3 or newer, the operator monitor also polls the
-firmware digitizer status at low rate so the cap-touch ADC value/baseline is visible without moving
-force off analog channel 13. The same monitor thread records a bounded StreamDIO module-status
-snapshot every `monitor.streamdio_status_interval_s` (30 seconds in the official configs); the
-latest module and cap-touch status plus snapshot counts are retained in the StreamDIO summary.
-
-## Run
+**Optional extras**
 
 ```bash
-# Validate all semantic settings without opening Bpod, StreamDIO, camera, or displays.
+pip install -e ".[video]"   # offline FFV1 preview-video exporter (OpenCV)
+pip install -e ".[mm]"      # MM-style cold-path helpers (soundcard + OpenCV)
+pip install -e ".[sound]"   # pybpod soundcard module
+pip install -e ".[dev]"     # pytest, mypy, ruff, types-PyYAML
+```
+
+**Live-hardware drivers** (`pybpod_streamDIO_module` from `MM_PyBpod2`, the Spinnaker SDK / `PySpin`,
+and the sound module) are imported lazily — they are only needed when connecting to a real rig, not
+for tests or simulation.
+
+### Headless Spinnaker recording
+
+Install the **Teledyne/FLIR Spinnaker SDK** and set `camera.backend: spinnaker`. The recorder uses
+`PySpin` when available and falls back to the Spinnaker C API otherwise. Both configure the verified
+bringup trigger contract (`FrameStart`, `Line0`, rising edge, `TriggerWidth` exposure). With
+`camera.required: true`, the task refuses to run if recording cannot start.
+
+---
+
+## Quick start
+
+**1. Validate your config** (no hardware touched):
+
+```bash
 hf-dm validate-config configs/dm_50.yaml
+```
 
-# Append today's subject weight and optional water target.
-hf-dm log-weight mouse01 --weight 24.3 --water-target 1.2
+**2. Run a hardware-free simulation** to exercise the full task loop before touching the rig:
 
-# Guided valve calibration. WARNING: actuates the real reward pump.
-hf-dm calibrate-valve --config configs/dm_50.yaml --durations-ms 20,40,60,80,100 --repetitions 10
+```bash
+python -m hf_dm.cli --config configs/dm_50.yaml \
+  --simulate --simulate-headless --simulate-trials 3 --simulate-choice-mode alternate
+```
 
-# No-trial hardware preflight: Bpod/StreamDIO/Spinnaker streams and cleanup only.
+Drop `--simulate-headless` to open the pygame window. Choice modes: `matched`, `opposite`,
+`timeout`, `cw`, `ccw`, `alternate` (in the DM task, *matched* = star/high-effort, *opposite* =
+circle/low-effort).
+
+**3. On the rig**, preflight then run:
+
+```bash
 python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration 2
+python -m hf_dm.cli --config configs/dm_50.yaml
+```
 
-# Controlled live check. WARNING: activates real force, pump, speaker, camera, and StreamDIO.
-python -m hf_dm.cli --config configs/dm_50.yaml --hardware-self-test
+> On the Windows rig, `python -m hf_dm.cli ...` is the reliable launcher. The editable
+> `hf-dm-run.exe` may land in `%APPDATA%\Python\Python312\Scripts`, which is not always on
+> PowerShell's `PATH`.
 
-# Cap-touch input check only. Touch the lick detector during the window.
-python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-touch-duration 15
+---
 
-# Frame2TTL photodiode check only. Flashes the lower-right sync square and counts DI05 edges.
-python -m hf_dm.cli --config configs/dm_50.yaml --frame2ttl-diagnostic --frame2ttl-flips 20
+## Configuration reference
 
-# Frame2TTL barcode check only. Displays representative slow count barcodes and reports decode/match accuracy.
-python -m hf_dm.cli --config configs/dm_50.yaml --frame2ttl-barcode-diagnostic
+Configs are YAML, loaded by `SessionConfig.from_yaml`. Every field is validated semantically before
+hardware opens. Three profiles ship in `configs/`:
 
-# Bpod -> StreamDIO opcode check only. Sends state-marker serial messages without task outputs.
-python -m hf_dm.cli --config configs/dm_50.yaml --bpod-opcode-diagnostic
+| Profile | Phase | Trials | Notable settings |
+|---------|-------|--------|------------------|
+| `centering_50.yaml` | `centering` | 50 | `centering_threshold_deg: 8.0` shaping |
+| `dm_50.yaml` | `decision_making` | 50 | full task, `streamdio_memory_mode: full` |
+| `dm_100.yaml` | `decision_making` | 100 | standard volume |
+| `dm_200.yaml` | `decision_making` | 200 | `streamdio_chunk_s: 45`, `streamdio_memory_mode: bounded` |
 
-# Stage 1 - centering shaping (bring a lateral cue into the center target)
+### Top-level keys
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `subject_id` | `mouse01` | subject identifier |
+| `phase` | `decision_making` | `centering` or `decision_making` |
+| `n_trials` | `50` | total trials |
+| `random_seed` | `null` | seed for side draws / schedules |
+| `centering_threshold_deg` | `8.0` | reward radius for the centering phase |
+| `results_dir` | `data/sessions` | output root |
+
+### Section summary
+
+| Block | Purpose | Key fields |
+|-------|---------|-----------|
+| `ports` | COM ports | `bpod_port`, `dio_config_port`, `dio_stream_port`, `baudrate`, `bpod_serial_channel` (all `AUTO`) |
+| `timing` | FSM timers (s) | `quiescence_s` 3, `choice_timeout_s` 20, `choice_blank_s` 1, `post_reward_s` 1, `timeout_noise_s` 2, `post_timeout_s` 1, `inter_trial_min_s` 3, `choice_loop_stall_s` 0.1 |
+| `wheel` | kinematics | `wheel_radius_mm` 31.5, `encoder_ticks_per_rev` 1024, `gain_deg_per_mm` 4.0 |
+| `reward` | pump | `matched_pump_s` 0.08, `opposite_pump_s` 0.04, `calibration_path` (opt) |
+| `task` | design | `modality` (`force`/`risk`/`delay`), `n_free_trials`, `n_forced_trials`, `risk_star_probability` 0.66, `delay_star_extra_s` 2.0, `side_balancing`, `max_consecutive_side`, `max_consecutive_forced` |
+| `display` | stimulus | `distance_mm` 100, `pixel_size_mm` 0.114, `choice_distance_deg` 35, `choice_center_threshold_deg` 1.0, `rotated_choice_axis` true, `display_index` 1, `fps` 60, `feedback_hold_s` 0.6, colors |
+| `frame2ttl` | screen sync | `enabled`, `input_channel` 5, `input_pin` 6, `patch_size_px` 64, `patch_corner` bottom_right, barcode frame counts, `choice_flash_enabled` |
+| `licks` | cap-touch | `channels` [14], `power_output_channel` 13, `power_required`, `cap_touch_min_high_threshold`, `cap_touch_delta_high`, `cap_touch_delta_low` |
+| `speaker` | white noise | `sample_interval_us` 100, `frequency_hz` 6000, `volume` 1.0, `gate_active_high`, `required` |
+| `engagement` | auto-stop | `idle_timeout_s` 60, `max_consecutive_failures` 10 |
+| `camera` | Spinnaker | `frequency_hz` 30, `exposure_us` 10000, `record_video`, `required`, `backend`, `serial_number`, `pixel_format`, ROI fields, `save_dir` |
+| `video` | cold export | `export_spinnaker_summary`, `duplicate_preview_video`, `preview_video_codec` FFV1 |
+| `integrations` | optional | `mm_soundcard_status`, `mm_alyx_register`, `mm_flir_roi_gui`, `alyx_*` |
+| `welfare` | colony | `subjects_dir` subjects, `water_target_ml`, `append_session_water` |
+| `monitor` | operator GUI | `enabled`, `display_index` 0, sizes, sample rates, `streamdio_status_interval_s` 30, `record_path` |
+| `session_export` | data products | `layout` (`mm_hierarchy`/`flat`), `manifest`, `config_snapshot`, `export_csv_on_finalize`, `export_timeline`, `streamdio_chunk_s`, `streamdio_memory_mode`, `streamdio_recent_events` |
+
+CLI flags and the session-setup dialog can override several of these per run; every override is
+recorded in `session_export.cli_overrides` and the config snapshot.
+
+---
+
+## Running a session
+
+### Session setup dialog
+
+By default, `hf-dm.cli` opens a small Tk dialog to choose the **mouse folder**, **modality**,
+**profile**, **free/forced trial counts**, and **session name** before the task starts. Bundled
+profiles:
+
+| Profile | Free | Forced |
+|---------|------|--------|
+| `50 free` / `100 free` / `200 free` | 50 / 100 / 200 | 0 |
+| `50 forced` / `100 forced` / `200 forced` | 0 | 50 / 100 / 200 |
+| `50 50/50` / `100 50/50` / `200 50/50` | 25 / 50 / 100 | 25 / 50 / 100 |
+
+Skip the dialog with `--no-session-dialog`, or drive it non-interactively:
+
+```bash
+python -m hf_dm.cli --config configs/dm_50.yaml --no-session-dialog \
+  --session-mouse-dir data/sessions/mouse01 --session-modality force \
+  --session-profile "50 50/50" --session-name 20260629_force_5050
+```
+
+### Training stages
+
+```bash
+# Stage 1 — centering shaping (bring a lateral cue to center)
 python -m hf_dm.cli --config configs/centering_50.yaml
 
-# Stage 2-4 - full DM (50 / 100 / 200 trials)
+# Stages 2–4 — full DM (50 / 100 / 200 trials)
 python -m hf_dm.cli --config configs/dm_50.yaml
 python -m hf_dm.cli --config configs/dm_100.yaml
 python -m hf_dm.cli --config configs/dm_200.yaml
 
-# Same tasks without the operator GUI
+# Without the operator GUI
 python -m hf_dm.cli --config configs/dm_50.yaml --no-monitor
 ```
 
-Outputs: `data/sessions/<subject>_<phase>_<timestamp>.npz` and `.json`. By default the
-session also writes a cold-path bundle next to those files:
-`data/sessions/<subject>_<phase>_<timestamp>_bundle/manifest.json`,
-`config.snapshot.yaml`, `exports/`, `bpod_exports/`, and `continuous_streams/`.
-These derived files are written after the primary NPZ/JSON save; the StreamDIO,
-force, camera, and task loops never append CSV rows in the hot path.
+See [docs/CURRICULUM_TRAINING.md](docs/CURRICULUM_TRAINING.md) for stage criteria.
 
-On this Windows rig, `python -m hf_dm.cli ...` is the reliable launcher. An editable user-site
-install may place `hf-dm-run.exe` under `%APPDATA%\Python\Python312\Scripts`, which is not always on
-PowerShell's `PATH`.
+---
 
-### Hardware-free simulation
+## Diagnostics & hardware validation
 
-Use this before touching the live rig to verify the real Bpod-style state sequence, screen motion,
-reward timing, timeout gate, lick logging, camera TTL bookkeeping, and cleanup/finalization:
+Run these before trials to certify each subsystem. They are mutually exclusive and (except the
+self-test) do not start Bpod trials.
 
-```bash
-python -m hf_dm.cli --config configs/dm_50.yaml --simulate --simulate-headless --simulate-trials 3 --simulate-choice-mode alternate
-```
-
-Drop `--simulate-headless` to open the pygame task window. Choice modes are `matched`, `opposite`,
-`timeout`, `cw`, `ccw`, and `alternate`. In the decision task, matched means star/high-effort and
-opposite means circle/low-effort.
-
-### Live rig troubleshooting
-
-This task uses its own bpod-core settings namespace under `data/runtime/bpod-core`, so unrelated
-services using the global bpod-core settings lock do not block it. Override the location with
-`HF_DM_BPOD_CORE_CONFIG_DIR`. If the task-specific lock is held, close the older `hf_dm.cli` task
-process and rerun the preflight.
-
-If StreamDIO reports `Access is denied` on COM7/COM8, another process owns the StreamDIO USB port.
-Close old notebooks, serial monitors, or task processes, then unplug/replug StreamDIO if needed.
-
-`--cap-touch-diagnostic` does not start Bpod trials. It opens StreamDIO, keeps force streaming on
-analog channel 13, powers the cap-touch detector on output channel 13 / pin 15, polls the firmware
-digitizer on input channel 14 / pin 25, and prints ADC value, baseline, threshold, and high/low lick
-edge counts. If `hi_edges` increments while touching the detector, the task GUI should also show
-licks. If ADC stays near zero or `hi_edges` never increments while the detector is touched, check
-the cap-touch sensor wiring/power first, then the firmware threshold.
-Firmware v4 supports runtime threshold tuning from YAML:
-
-```yaml
-licks:
-  cap_touch_min_high_threshold: 250
-  cap_touch_delta_high: 120
-  cap_touch_delta_low: 90
-```
-
-or for one diagnostic run:
+| Command | Checks |
+|---------|--------|
+| `--preflight [--preflight-duration N]` | Connect Bpod/StreamDIO/Spinnaker streams, hold N s, clean up. Turn the wheel and touch the lick sensor; `preflight_end` reports wheel/lick edges |
+| `--hardware-self-test` | **Activates real outputs.** Runs 3 production-FSM trials with synthetic choices; asserts force/pump events, choice→pump timing, pump error < 10 ms, force ADC + camera TTLs, timeout gate, frame saves, no loop stalls |
+| `--cap-touch-diagnostic [--cap-touch-duration N]` | StreamDIO-only: powers ch13/pin15, polls digitizer on ch14/pin25, reports ADC/baseline/threshold + hi/lo lick edges |
+| `--frame2ttl-diagnostic [--frame2ttl-flips N]` | Flashes the sync square, counts DI05 edges |
+| `--frame2ttl-barcode-diagnostic` | Displays representative count barcodes, reports decode/match accuracy |
+| `--bpod-opcode-diagnostic` | Sends Bpod state-marker opcodes, reports `bpod_state` timestamps reaching StreamDIO |
 
 ```bash
-python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-touch-min-high-threshold 250 --cap-touch-delta-high 120 --cap-touch-delta-low 90
+python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration 2
+python -m hf_dm.cli --config configs/dm_50.yaml --hardware-self-test
+python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-touch-duration 15
+python -m hf_dm.cli --config configs/dm_50.yaml --frame2ttl-diagnostic --frame2ttl-flips 20
+python -m hf_dm.cli --config configs/dm_50.yaml --frame2ttl-barcode-diagnostic
+python -m hf_dm.cli --config configs/dm_50.yaml --bpod-opcode-diagnostic
 ```
 
-To reproduce the old bringup-style analog readout, temporarily stream cap-touch
-pin 25 as the single analog input:
+Cap-touch thresholds (firmware v4) can be tuned from YAML (`licks.cap_touch_*`) or per run
+(`--cap-touch-min-high-threshold`, `--cap-touch-delta-high`, `--cap-touch-delta-low`). Use
+`--cap-touch-raw-analog` to temporarily stream pin 25 as the single analog input for a bringup-style
+readout.
 
-```bash
-python -m hf_dm.cli --config configs/dm_50.yaml --cap-touch-diagnostic --cap-touch-raw-analog --cap-touch-duration 15
-```
+---
 
-That mode disables the force ADC only for the diagnostic. During the task, force
-stays on analog channel 13 and cap touch is digitized locally in firmware.
-The diagnostic report includes a `diagnosis` field such as
-`raw_adc_swing_detected`, `raw_adc_below_threshold`,
-`digitizer_edges_detected`, or `digitizer_adc_below_threshold`.
+## Counterbalancing, calibration & welfare
 
-### Frame2TTL screen sync
-
-The official configs enable Frame2TTL v3 on StreamDIO DI05 / physical pin 6. The task draws a
-64 px sync square in the lower-right corner of the behavior screen, with size, margin, corner,
-input channel, and input pin controlled by the `frame2ttl:` YAML block.
-
-At the beginning of each Bpod decision trial, the square emits a slow two-group pulse-count barcode
-during the existing quiescence period. The first group encodes modality (force/risk/delay/other) and
-the second group encodes trial kind (free left/right, forced-star left/right, forced-circle
-left/right). Pulses and short gaps are 6 frames each at 60 Hz, with 12-frame preamble/separator
-intervals, so the worst case is about 2.6 s. During the choice window the same square alternates
-black/white only when a wheel movement changes the rendered cue positions; if the cues do not move,
-the display is polled but no new frame is flipped.
-
-The production Bpod decision FSM also inserts 1 ms `*_Pre` transition states before each task state.
-Those pre-states send preloaded StreamDIO state-marker messages (`[ord("S"), state_id]`, message IDs
-50+) so the module timestamps trial-state transitions as `bpod_state` events.
-
-The operator monitor includes a Frame2TTL readout in the inputs/events panel: live DI05 edge ticks,
-last TTL state, channel/pin labels, and latest barcode decode/match status. The Bpod FSM panel also
-shows a rolling color-coded transition-opcode timeline from StreamDIO `bpod_state` events. Raw DI05
-transitions remain in the NPZ `streamdio_events` array as `dio_input` events on channel 5.
-Before running trials, use `--frame2ttl-diagnostic` to confirm the photodiode sees both black and
-white transitions at the configured lower-right patch location, `--frame2ttl-barcode-diagnostic`
-to verify barcode decode/match accuracy, and `--bpod-opcode-diagnostic` to verify Bpod state-marker
-timestamps reach StreamDIO.
-
-`--hardware-self-test` runs the production Bpod FSM with synthetic wheel choices but real rig
-outputs. It fails unless both effort directions and pump transitions have firmware output events,
-choice-to-pump timing matches the configured blank state, pump duration error is below 10 ms, force
-ADC and camera TTLs are present, the Bpod timeout gate completes, Spinnaker saves frames, and there
-are no choice-loop stalls or incorrectly decoded Bpod states. Licks and real wheel edges still
-require touching/turning the physical inputs.
-For an input check, run a longer `--preflight`, turn the wheel both ways, and touch the lick sensor;
-the saved `preflight_end` event reports wheel pulse/direction edges and cap-touch input edges.
-
-### Counterbalancing, calibration, and welfare records
-
-The defaults retain the historical Bernoulli side draw and unlimited runs. Counterbalancing is
-setup-time only and opt-in:
+All three are **opt-in**; defaults preserve historical behavior exactly.
 
 ```yaml
 task:
-  side_balancing: blocked
-  max_consecutive_side: 4
-  max_consecutive_forced: 2
+  side_balancing: blocked      # default "bernoulli" (unchanged historical draw)
+  max_consecutive_side: 4      # default 0 = unlimited
+  max_consecutive_forced: 2    # default 0 = unlimited
 
 reward:
   matched_pump_s: 0.08
   opposite_pump_s: 0.04
-  calibration_path: calibrations/valve_20260629.json
+  calibration_path: calibrations/valve_20260629.json   # annotate µL only
 
 welfare:
   subjects_dir: subjects
@@ -340,147 +421,263 @@ welfare:
   append_session_water: true
 ```
 
-Blocked sides are precomputed from the session seed in balanced truncated-geometric blocks. A
-calibration file only annotates delivered reward in microliters; pump open-time remains the control
-variable. Calibrated sessions append one idempotent water-delivery row to
-`subjects/<subject>/water_log.jsonl`. Without `reward.calibration_path`, trial behavior and records
-remain unchanged apart from the new nullable `reward_volume_ul` field.
-
-## Data logged
-
-- Per-trial: star/circle sides, chosen shape/side, force direction, choice, reward duration, optional calibrated `reward_volume_ul`, RT, pulses, force ADC stats, licks, wall/mono timestamps, camera TTL list/interval QC, Frame2TTL barcode/edge summary
-- Exact bpod-core state/event rows for every trial in JSON and NPZ `bpod_trials_json`
-- Raw NPZ `streamdio_events`: every wheel/direction edge, force sample, camera TTL, lick, module timestamp, and high-resolution host timestamp
-- Events: `session_start`, `trial_start`, `stimulus_on`, `force_on`, `choice_detected`, `feedback_on`, `frame2ttl_*`, `pump_start`, `pump_end`, `output_actual`, `lick`, `white_noise_*`, cleanup, `trial_end`, `session_end`
-- Video: every camera frame with camera and host timestamps in `frame_timestamps.csv`
-- Session summary: end reason (`completed`, `idle_timeout`, `max_consecutive_failures`)
-- Crash journal: append-only `session.journal.jsonl`; completed trials are flushed and fsynced before
-  the next trial. `session.incomplete.json` remains only when finalization did not complete.
-- Runtime provenance: the Git commit, dirty-tree flag, package version, and capture time are captured
-  before hardware startup, included in the first journal row, and retained in final metadata/manifest data.
-
-### Session export bundle
-
-The `session_export:` YAML block controls derived data products:
-
-```yaml
-session_export:
-  layout: mm_hierarchy         # production default; flat remains available
-  manifest: true
-  config_snapshot: true
-  export_csv_on_finalize: true
-  export_timeline: true
-  streamdio_chunk_s: 0         # dm_200 uses 45 seconds
-  streamdio_memory_mode: full  # dm_200 uses bounded; full suits shorter tasks
-  streamdio_recent_events: 50000
-```
-
-`layout: mm_hierarchy` is the production default and writes into
-`data/sessions/<phase>/<subject>/<YYYY-MM-DD>/<run_id>/session.npz`.
-`layout: flat` remains available for legacy primary artifact paths and creates a per-session
-`*_bundle/` directory.
-
-The bundle includes:
-
-- `manifest.json`: relative artifact paths, SHA256 hashes, source config SHA256 when available,
-  package/git info, hardware flags, StreamDIO firmware info, final counts, video summary with
-  `recording_summary.json` / `frame_timestamps.csv` artifacts when present, a StreamDIO chunk
-  index when chunking is enabled, and recorder stats including primary and derived artifact byte
-  counts
-- `session.journal.jsonl`: ordered semantic events, completed trial records, exact Bpod rows,
-  metadata, and the final summary. The manifest validator checks its schema, sequence, and counts.
-- `config.snapshot.yaml`: source config path, source YAML text and SHA256 when available,
-  recorded CLI/config overrides, plus the effective post-CLI config
-- `videos/spinnaker_video.json`: a bundle-local pointer to the Spinnaker recording directory,
-  summary JSON, frame timestamp CSV, and their hashes; frame files are not duplicated
-- `exports/streamdio_events.csv`, `force_trace.csv`, `camera_ttl.csv`, `frame2ttl_edges.csv`, `licks.csv`, `trials_summary.csv`, `events.csv`
-- `exports/synchronized_timeline.csv` and `alignment_anchors.json`, including the first
-  Spinnaker frame from `frame_timestamps.csv` when video timestamps are available
-- `bpod_exports/bpod_trials_flat.csv`
-- `bpod_data/bpod_trials.json`: exact captured bpod-core trial rows plus saved FSM definitions
-- optional `continuous_streams/streamdio_chunk_NNN.npz` files when `streamdio_chunk_s > 0`
-- `exports/soundcard_status.json` when the soundcard module reports white-noise playback status
-- `exports/monitor_telemetry.jsonl` when the operator monitor is enabled with `record_path: auto`
-- `exports/rig_preflight_report.json` after `hf-dm rig-preflight`, with the preflight summary,
-  config, session artifact paths, StreamDIO counts/status, and preflight start/end event payloads
-- `exports/alyx_registration.json` when `integrations.mm_alyx_register: true`; registration errors are recorded there and do not abort the session save
-- `exports/debug_events_recent.json` when bounded debug telemetry exists; high-volume debug samples
-  such as individual choice-loop stalls stay out of the main semantic event list, while aggregate
-  counts remain in `TrialRecord` and manifest `recorder_stats`
-
-The official `dm_200` profile sets `streamdio_chunk_s: 45` and
-`streamdio_memory_mode: bounded`. For other very long sessions, enable the same pair. The live task
-then keeps only the most recent `streamdio_recent_events` rows in memory, writes completed chunks in
-a daemon thread, and reconstructs the full primary NPZ/CSV/timeline from those chunks at finalize.
-
-For future cold-path tools, `hf_dm.data.session_bundle.SessionBundle` provides a small
-`start() / register_streamdio() / register_camera() / get_stream_summaries() / finalize()` facade over `SessionRecorder`.
-As a context manager it finalizes an otherwise-unfinalized recorder on exit, including error exits.
-It is a wrapper only; the live task continues to use the existing recorder and StreamDIO paths.
-
-Offline helpers:
+- **Counterbalancing** is computed at **setup time** (no hot-path change). Blocked sides are drawn
+  from the session seed in balanced truncated-geometric blocks; consecutive caps bound run length.
+- **Calibration** only annotates delivered reward as `reward_volume_ul` — **pump open-time remains
+  the control variable**. Build the table with `hf-dm calibrate-valve` (see below).
+- **Welfare:** calibrated sessions append one idempotent row to
+  `subjects/<subject>/water_log.jsonl`; log daily weights with `hf-dm log-weight`.
 
 ```bash
-hf-dm export-session data/sessions/<session>.json
-hf-dm validate-session data/sessions/<session>_bundle
-hf-dm validate-config configs/dm_50.yaml
-hf-dm recover-session data/sessions/<phase>/<subject>/<date>/<run>
-hf-dm session-qc data/sessions/<phase>/<subject>/<date>/<run>
-hf-dm log-weight mouse01 --weight 24.3 --water-target 1.2
-hf-dm calibrate-valve --config configs/dm_50.yaml --output calibrations/valve_20260629.json
-hf-dm export-preview-video data/videos/<session>_spinnaker
-hf-dm export-session data/sessions/<session>.json --export-preview-video
-hf-dm rig-preflight --config configs/dm_50.yaml --duration 2 --no-monitor
-hf-dm camera-roi-setup --config configs/dm_50.yaml --output configs/dm_50_roi.yaml --width 640 --height 480 --offset-x 0 --offset-y 0
-hf-dm camera-roi-setup --config configs/dm_50.yaml --output configs/dm_50_roi.yaml --interactive
-hf-dm camera-roi-setup --config configs/dm_50.yaml --output configs/dm_50_roi.yaml --visual
+# Guided valve calibration — WARNING: actuates the real pump
+hf-dm calibrate-valve --config configs/dm_50.yaml \
+  --durations-ms 20,40,60,80,100 --repetitions 10 --output calibrations/valve_20260629.json
 
-hf-dm-export-session data/sessions/<session>.json
-hf-dm-validate-session data/sessions/<session>_bundle
+# Daily weight + water target
+hf-dm log-weight mouse01 --weight 24.3 --water-target 1.2
 ```
 
-Visual ROI setup temporarily opens the configured FLIR camera in full-frame, free-running mode,
-captures a frame, and lets OpenCV select a rectangle. Width, height, and offsets are snapped to the
-camera node increments before writing YAML. Cancelling leaves the file untouched. With
-`integrations.mm_flir_roi_gui: true`, omitting ROI numbers selects visual mode automatically.
+---
 
-### Interrupted session recovery
+## Data outputs
 
-The recorder writes semantic records incrementally and performs an OS-level sync after every
-completed trial. A hard crash can therefore be recovered from the session directory, its
-`*.incomplete.json` marker, or its `*.journal.jsonl` file:
+### Layout
+
+With the production default `session_export.layout: mm_hierarchy`, the primary artifact is:
+
+```
+data/sessions/<phase>/<subject>/<YYYY-MM-DD>/<run_id>/session.npz
+```
+
+`layout: flat` instead writes `data/sessions/<subject>_<phase>_<timestamp>.npz` + `.json` and a
+sibling `*_bundle/` directory. Either way, a cold-path **bundle** is written *after* the primary
+NPZ/JSON — the StreamDIO/force/camera/task loops never append CSV rows in the hot path.
+
+```
+<run>/
+├── session.npz                 # trials, events, raw streamdio_events, bpod_trials_json
+├── session.json                # JSON sidecar
+├── session.journal.jsonl       # append-only crash journal (fsync per trial)
+├── manifest.json               # artifact paths, SHA256, provenance, counts, clock_alignment
+├── config.snapshot.yaml        # source path + text + SHA256 + CLI overrides + effective config
+├── session.qc.json             # after `hf-dm session-qc`
+├── exports/
+│   ├── streamdio_events.csv  force_trace.csv  camera_ttl.csv
+│   ├── frame2ttl_edges.csv  licks.csv  trials_summary.csv  events.csv
+│   ├── synchronized_timeline.csv  alignment_anchors.json
+│   ├── monitor_telemetry.jsonl       # when monitor record_path: auto
+│   ├── rig_preflight_report.json     # after rig-preflight
+│   └── alyx_registration.json        # when integrations.mm_alyx_register: true
+├── bpod_exports/bpod_trials_flat.csv
+├── bpod_data/bpod_trials.json        # exact bpod-core rows + saved FSM definitions
+├── continuous_streams/streamdio_chunk_NNN.npz   # when streamdio_chunk_s > 0
+└── videos/spinnaker_video.json       # pointer to the Spinnaker recording dir (no frame duplication)
+```
+
+The Spinnaker recording directory (`data/videos/<subject>_<phase>_<timestamp>_spinnaker/`) holds the
+frame sequence, `frame_timestamps.csv`, and `recording_summary.json` (saved frames, duration, mean
+FPS, requested trigger rate, exposure, incomplete/timeout/save-error counters, estimated missing
+triggers).
+
+### What is logged
+
+- **Per trial:** star/circle sides, chosen shape/side, force direction, choice, reward duration,
+  optional calibrated `reward_volume_ul`, response time, wheel pulses, force ADC stats, lick
+  count/timestamps, camera-TTL interval QC, Frame2TTL barcode/edge summary, choice-loop frame stats.
+- **Exact Bpod rows** for every trial (JSON + NPZ `bpod_trials_json`).
+- **Raw `streamdio_events`** (NPZ): every wheel/direction edge, force sample, camera TTL, lick,
+  module timestamp, and high-resolution host timestamp.
+- **Semantic events:** `session_start`, `trial_start`, `stimulus_on`, `force_on`, `choice_detected`,
+  `feedback_on`, `frame2ttl_*`, `pump_start`, `pump_end`, `output_actual`, `lick`, `white_noise_*`,
+  cleanup, `trial_end`, `session_end`.
+- **Provenance:** Git commit, dirty-tree flag, package version, and capture time are captured
+  **before hardware startup**, written into the first journal row, and retained in the manifest.
+- **Clock alignment:** the manifest's `clock_alignment` block stores affine fits
+  (`perf_counter→wall`, `streamdio→perf_counter`, `streamdio→wall`) with slope, intercept, anchor
+  count, and residuals.
+- **Session summary:** end reason (`completed`, `idle_timeout`, `max_consecutive_failures`).
+
+### Long sessions
+
+`dm_200` sets `streamdio_chunk_s: 45` and `streamdio_memory_mode: bounded`: the live task keeps only
+the most recent `streamdio_recent_events` rows in memory, writes completed chunks in a daemon thread,
+and reconstructs the full primary NPZ/CSV/timeline from those chunks at finalize.
+
+### Inspecting a session
+
+```python
+import numpy as np
+
+d = np.load("data/sessions/.../session.npz", allow_pickle=True)
+trials = d["trials"]
+matched = trials["matched"][trials["responded"]]
+print(matched.mean(), trials["response_time_s"].mean())
+```
+
+---
+
+## Command reference
+
+### `hf-dm` (operational helpers)
+
+| Subcommand | Purpose |
+|-----------|---------|
+| `validate-config <cfg>` | Semantic config validation, no hardware |
+| `session-qc <session>` | PASS/WARN/FAIL on response/matched rate, RT, stalls, frame time → `session.qc.json` |
+| `validate-session <bundle>` | Verify manifest paths, sizes, SHA256, NPZ schema, CSV/JSON sidecars, provenance |
+| `recover-session <dir>` | Rebuild NPZ/JSON/exports from the journal + chunks after a crash |
+| `export-session <json> [--export-preview-video]` | Regenerate derived exports |
+| `export-preview-video <dir>` | Offline FFV1 AVI from saved PGM frames |
+| `rig-preflight --config <cfg>` | No-trial hardware preflight, writes `rig_preflight_report.json` |
+| `calibrate-valve --config <cfg>` | Guided reward-valve calibration (actuates pump) |
+| `log-weight <subject> --weight W` | Append a subject weight/water record |
+| `camera-roi-setup --config <cfg>` | Select/write Spinnaker ROI (`--interactive`, `--visual`, `--clear`) |
+
+Console entry points `hf-dm-export-session` and `hf-dm-validate-session` mirror the subcommands.
+
+```bash
+hf-dm session-qc data/sessions/decision_making/mouse01/2026-06-28/001
+hf-dm validate-session data/sessions/<session>_bundle
+hf-dm recover-session data/sessions/decision_making/mouse01/2026-06-28/001
+hf-dm rig-preflight --config configs/dm_50.yaml --duration 2 --no-monitor
+hf-dm camera-roi-setup --config configs/dm_50.yaml --output configs/dm_50_roi.yaml --visual
+```
+
+`session-qc` exposes every threshold as a flag (`--min-responded-rate`, `--min-matched-rate`,
+`--max-mean-response-time`, `--max-stalls`, `--max-frame-time`, plus `--warn-*`); a `FAIL` returns a
+non-zero exit code.
+
+### `hf-dm.cli` / `hf-dm-run` (run the task)
+
+| Flag group | Flags |
+|------------|-------|
+| Core | `--config` (required), `-v/--verbose` |
+| Modes | `--simulate`, `--preflight`, `--hardware-self-test`, `--cap-touch-diagnostic`, `--frame2ttl-diagnostic`, `--frame2ttl-barcode-diagnostic`, `--bpod-opcode-diagnostic` |
+| Simulation | `--simulate-headless`, `--simulate-choice-mode`, `--simulate-trials` |
+| Monitor | `--monitor`, `--no-monitor` |
+| Session setup | `--no-session-dialog`, `--session-mouse-dir`, `--session-modality`, `--session-profile`, `--free-trials`, `--forced-trials`, `--session-name` |
+| Diagnostic tuning | `--preflight-duration`, `--frame2ttl-flips/-hold-s/-settle-s`, `--frame2ttl-barcode-repetitions`, `--bpod-opcode-hold-s`, `--cap-touch-duration/-poll-hz/-raw-analog`, `--cap-touch-min-high-threshold/-delta-high/-delta-low` |
+
+---
+
+## Operator monitor
+
+The official configs run a separate-process monitor on the main screen
+(`monitor.display_index: 0`) while the stimulus stays on the behavior display
+(`display.display_index: 1`). It receives only nonblocking, drop-safe telemetry, so a slow or closed
+GUI never stalls the task loop.
+
+It shows: a low-rate camera preview, a compact left-rotated task-screen mirror, the active Bpod FSM
+state, a rolling **psychometric panel** (matched/responded rate, responded-trial mean RT, signed
+side bias), a one-row history of the latest 10 outcome icons, lick/pump/noise event rails, raw
+cap-touch pin status, a live force-effort ADC trace with a session-held y-max, a Frame2TTL readout
+(DI05 edges, last state, barcode decode/match), a Bpod opcode-timeline, and the per-trial wheel
+trace.
+
+Use `--no-monitor` for CLI checks or `--monitor` to force it on; `--simulate-headless` disables it
+automatically. With `monitor.record_path: auto`, compact JSONL telemetry is written to
+`exports/monitor_telemetry.jsonl` (frame bytes replaced by counts). The monitor also records a
+bounded StreamDIO module-status snapshot every `monitor.streamdio_status_interval_s`.
+
+---
+
+## Recovery & quality control
+
+**Crash recovery.** The recorder writes records incrementally and fsyncs after every completed
+trial, leaving a `*.incomplete.json` marker while the session is open. Recover from the directory,
+the marker, or the journal:
 
 ```bash
 hf-dm recover-session data/sessions/decision_making/mouse01/2026-06-28/001
 ```
 
-Recovery preserves the original journal before repairing a truncated final line, restores completed
-trials and Bpod rows, incorporates any completed StreamDIO chunks, atomically rewrites primary
-NPZ/JSON artifacts, and runs the normal manifest validator. The incomplete marker is removed only
-after primary writes and configured exports succeed.
+Recovery preserves the original journal, repairs a truncated final line, restores completed trials +
+Bpod rows, folds in completed StreamDIO chunks, atomically rewrites NPZ/JSON, and runs the manifest
+validator. The marker is removed only after primary writes and exports succeed.
 
-`session-qc` writes `session.qc.json` next to the manifest and reports PASS/WARN/FAIL for response
-rate, matched rate, response time, choice-loop stalls, and worst frame duration. Calibrated sessions
-also require a successful subject-water log event. FAIL returns a non-zero exit code; all numeric
-thresholds are exposed as CLI options.
+**Session QC.** `hf-dm session-qc` writes `session.qc.json` with PASS/WARN/FAIL for response rate,
+matched rate, response time, choice-loop stalls, and worst frame duration. Calibrated sessions also
+require a successful subject-water log event.
 
-GitHub Actions runs the Ruff default correctness rules, stable-module mypy checks, and the
-hardware-free pytest suite on both Windows and Linux. Physical rig certification remains the job of
-`rig-preflight` and hardware diagnostics; their reports use typed `name/status/detail/hint` results.
+**Validation.** `hf-dm validate-session` checks manifest paths/sizes/SHA256, source-config
+provenance, NPZ schemas/counts, StreamDIO chunk NPZs and their index, CSV row counts (incl. Bpod
+flat rows and timeline schema/order), JSON/JSONL sidecars, derived Bpod/video summaries, Alyx
+registration, the debug-event ring, the rig-preflight report, recorder stats, hardware flags,
+timeline anchors, and stream/module/status consistency.
 
-`validate-session` checks manifest paths, byte sizes, and SHA256 hashes, verifies source-config
-provenance from `config.snapshot.yaml`, opens NPZ artifacts, verifies the primary session NPZ schema/counts,
-validates StreamDIO chunk NPZs and their manifest index, checks known CSV row counts including Bpod
-flat rows and timeline schema/order, parses JSON/JSONL sidecars including monitor telemetry, and
-checks derived Bpod/video recording summary/pointer/preview, Alyx registration, debug-event ring,
-rig-preflight report, recorder stats, hardware flags, timeline anchor, stream/module/status JSON counts and
-consistency.
+---
+
+## Testing & CI
+
+```bash
+pytest                              # hardware-free, headless
+ruff check src tests                # correctness lint
+mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_export.py
+```
+
+GitHub Actions runs Ruff, the stable-module mypy gate, and the full pytest suite on **Windows and
+Linux** (Python 3.12, dummy SDL video/audio). Tests are hardware-free: a `SimulatedHFDecisionSession`
+drives the real controller path with mocked Bpod/StreamDIO. Physical rig certification remains the
+job of `rig-preflight` and the hardware diagnostics, whose reports use typed `name/status/detail/hint`
+results.
+
+For audio/display-less environments, export `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy`.
+
+---
+
+## Repository layout
+
+```
+src/hf_dm/
+├── cli.py                  # task launcher (hf-dm-run / python -m hf_dm.cli)
+├── ops_cli.py              # operational helpers (hf-dm)
+├── config.py               # SessionConfig dataclasses + YAML + validation
+├── session/
+│   ├── controller.py       # HFDecisionSession orchestration
+│   ├── runners/            # decision + centering trial runners, simulated bpod
+│   ├── simulated.py        # hardware-free simulation
+│   ├── hardware_self_test.py, cap_touch_diagnostic.py
+├── fsm/
+│   ├── builders.py         # production host-supervised decision FSM
+│   ├── reference/          # validation-only reference FSM templates
+│   ├── runtime.py, relay.py, softcodes.py
+├── streamdio/              # client, wheel, outputs
+├── display/pygame_display.py
+├── frame2ttl.py            # barcode encode/decode
+├── camera/                 # Spinnaker recorder + ROI GUI
+├── monitor/                # operator GUI
+├── data/                   # recorder, session_export, session_bundle, video_export, alyx
+├── session_qc.py, valve_calibration.py, subject_log.py, validation.py
+└── hardware/               # bringup_constants, discovery
+configs/                    # centering_50, dm_50, dm_100, dm_200
+firmware/                   # vendored StreamDIO firmware + ArCOM
+docs/                       # training & bpod-core curricula
+tests/                      # hardware-free pytest suite
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `hf-dm-run` not found (Windows) | Use `python -m hf_dm.cli ...` |
+| bpod-core settings lock held | This task uses `data/runtime/bpod-core`; override with `HF_DM_BPOD_CORE_CONFIG_DIR`. Close the older `hf_dm.cli` process and rerun preflight |
+| StreamDIO `Access is denied` (COM7/COM8) | Another process owns the port — close notebooks/serial monitors/task processes; unplug/replug StreamDIO |
+| Detector LED changes but no licks | Flash the vendored `firmware/`; check cap-touch wiring/power, then thresholds |
+| Frame2TTL sees no transitions | Run `--frame2ttl-diagnostic`; confirm the photodiode is over the lower-right patch |
+| No `bpod_state` markers | Run `--bpod-opcode-diagnostic` to verify state markers reach StreamDIO |
+
+---
 
 ## Learning curricula
 
-- **[docs/CURRICULUM_BPOD_CORE.md](docs/CURRICULUM_BPOD_CORE.md)** - become fluent in bpod-core using this repo
-- **[docs/CURRICULUM_TRAINING.md](docs/CURRICULUM_TRAINING.md)** - mouse training stages (centering -> 50 -> 100 -> 200)
+- **[docs/CURRICULUM_BPOD_CORE.md](docs/CURRICULUM_BPOD_CORE.md)** — become fluent in bpod-core using this repo
+- **[docs/CURRICULUM_TRAINING.md](docs/CURRICULUM_TRAINING.md)** — mouse training stages (centering → 50 → 100 → 200)
+- **[docs/IMPROVEMENT_ROADMAP.md](docs/IMPROVEMENT_ROADMAP.md)** — completed/deferred engineering roadmap
+
+---
 
 ## License
 
-MIT
+[MIT](#license)
