@@ -373,15 +373,19 @@ class _SpinnakerCRecorder:
             self._check("spinCameraListCreateEmpty", ctypes.byref(self._camera_list))
             self._check("spinSystemGetCameras", self._system, self._camera_list)
             self._camera = self._select_camera()
+            device_version = self._camera_string(self._camera, "DeviceVersion")
+            firmware_version = self._camera_string(
+                self._camera,
+                "DeviceFirmwareVersion",
+            )
             self._device_info = {
                 "serial_number": self._camera_string(self._camera, "DeviceSerialNumber"),
                 "model_name": self._camera_string(self._camera, "DeviceModelName"),
                 "vendor_name": self._camera_string(self._camera, "DeviceVendorName"),
-                "device_version": self._camera_string(self._camera, "DeviceVersion"),
-                "firmware_version": self._camera_string(
-                    self._camera,
-                    "DeviceFirmwareVersion",
-                ),
+                "device_version": device_version,
+                # Blackfly S firmware is exposed as DeviceVersion on some
+                # Spinnaker/transport-layer combinations.
+                "firmware_version": firmware_version or device_version,
             }
             self._check("spinCameraInit", self._camera)
             self._camera_initialized = True
@@ -887,6 +891,14 @@ class HeadlessSpinnakerRecorder:
             return self._c_backend.error
         return self._error
 
+    @property
+    def device_info(self) -> dict[str, str | None]:
+        """Identity captured from the connected camera before acquisition starts."""
+
+        if self._c_backend is not None:
+            return dict(self._c_backend._device_info)
+        return dict(self._device_info)
+
     def _roi_summary(self) -> dict[str, int | None]:
         return {
             "width": self._roi_width,
@@ -931,12 +943,14 @@ class HeadlessSpinnakerRecorder:
                 raise RuntimeError("No Spinnaker cameras found")
 
             self._camera = self._select_camera(cam_list)
+            device_version = self._pyspin_device_value("DeviceVersion")
+            firmware_version = self._pyspin_device_value("DeviceFirmwareVersion")
             self._device_info = {
                 "serial_number": self._pyspin_device_value("DeviceSerialNumber"),
                 "model_name": self._pyspin_device_value("DeviceModelName"),
                 "vendor_name": self._pyspin_device_value("DeviceVendorName"),
-                "device_version": self._pyspin_device_value("DeviceVersion"),
-                "firmware_version": self._pyspin_device_value("DeviceFirmwareVersion"),
+                "device_version": device_version,
+                "firmware_version": firmware_version or device_version,
             }
             cam_list.Clear()
             self._camera.Init()

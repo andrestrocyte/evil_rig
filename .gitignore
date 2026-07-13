@@ -6,6 +6,12 @@ dist/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.DS_Store
+output/
+certifications/
+calibrations/
+subjects/
 data/sessions/
 data/videos/
 data/runtime/

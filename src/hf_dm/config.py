@@ -87,6 +87,7 @@ class TimingConfig:
     timeout_noise_s: float = 2.0
     post_timeout_s: float = 1.0
     choice_loop_stall_s: float = 0.1
+    output_verification_timeout_s: float = 0.15
 
 
 @dataclass
@@ -184,6 +185,27 @@ class WelfareConfig:
     subjects_dir: str = "subjects"
     water_target_ml: float | None = None
     append_session_water: bool = True
+    max_cumulative_reward_ul: float | None = None
+    require_current_weight: bool = False
+    max_weight_age_days: int = 1
+
+
+@dataclass
+class AnimalUseConfig:
+    """Fail-closed release requirements applied only to real animal sessions."""
+
+    enabled: bool = False
+    certification_path: str | None = None
+    max_certification_age_days: int = 30
+    max_calibration_age_days: int = 30
+    max_calibration_residual_ul: float = 0.5
+    require_clean_git: bool = True
+    require_local_storage: bool = True
+    require_camera: bool = True
+    require_speaker: bool = True
+    require_licks: bool = True
+    require_operator_confirmation: bool = True
+    hardware_failsafe_revision: str | None = None
 
 
 @dataclass
@@ -248,6 +270,7 @@ class SessionConfig:
     video: VideoExportConfig = field(default_factory=VideoExportConfig)
     integrations: IntegrationConfig = field(default_factory=IntegrationConfig)
     welfare: WelfareConfig = field(default_factory=WelfareConfig)
+    animal_use: AnimalUseConfig = field(default_factory=AnimalUseConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     session_export: SessionExportConfig = field(default_factory=SessionExportConfig)
     results_dir: str = "data/sessions"
@@ -276,6 +299,7 @@ class SessionConfig:
         video_raw = raw.get("video", {})
         integrations_raw = raw.get("integrations", {})
         welfare_raw = raw.get("welfare", {})
+        animal_use_raw = raw.get("animal_use", {})
         monitor_raw = raw.get("monitor", {})
         session_export_raw = raw.get("session_export", {})
         wheel_raw = raw.get("wheel", {})
@@ -409,6 +433,9 @@ class SessionConfig:
                 timeout_noise_s=float(timing_raw.get("timeout_noise_s", 2.0)),
                 post_timeout_s=float(timing_raw.get("post_timeout_s", 1.0)),
                 choice_loop_stall_s=float(timing_raw.get("choice_loop_stall_s", 0.1)),
+                output_verification_timeout_s=float(
+                    timing_raw.get("output_verification_timeout_s", 0.15)
+                ),
             ),
             reward=RewardConfig(
                 matched_pump_s=float(reward_raw.get("matched_pump_s", 0.08)),
@@ -597,6 +624,49 @@ class SessionConfig:
                 ),
                 append_session_water=bool(
                     welfare_raw.get("append_session_water", True)
+                ),
+                max_cumulative_reward_ul=(
+                    float(welfare_raw["max_cumulative_reward_ul"])
+                    if welfare_raw.get("max_cumulative_reward_ul") not in (None, "")
+                    else None
+                ),
+                require_current_weight=bool(
+                    welfare_raw.get("require_current_weight", False)
+                ),
+                max_weight_age_days=int(welfare_raw.get("max_weight_age_days", 1)),
+            ),
+            animal_use=AnimalUseConfig(
+                enabled=bool(animal_use_raw.get("enabled", False)),
+                certification_path=(
+                    str(animal_use_raw["certification_path"])
+                    if animal_use_raw.get("certification_path") not in (None, "")
+                    else None
+                ),
+                max_certification_age_days=int(
+                    animal_use_raw.get("max_certification_age_days", 30)
+                ),
+                max_calibration_age_days=int(
+                    animal_use_raw.get("max_calibration_age_days", 30)
+                ),
+                max_calibration_residual_ul=float(
+                    animal_use_raw.get("max_calibration_residual_ul", 0.5)
+                ),
+                require_clean_git=bool(
+                    animal_use_raw.get("require_clean_git", True)
+                ),
+                require_local_storage=bool(
+                    animal_use_raw.get("require_local_storage", True)
+                ),
+                require_camera=bool(animal_use_raw.get("require_camera", True)),
+                require_speaker=bool(animal_use_raw.get("require_speaker", True)),
+                require_licks=bool(animal_use_raw.get("require_licks", True)),
+                require_operator_confirmation=bool(
+                    animal_use_raw.get("require_operator_confirmation", True)
+                ),
+                hardware_failsafe_revision=(
+                    str(animal_use_raw["hardware_failsafe_revision"])
+                    if animal_use_raw.get("hardware_failsafe_revision") not in (None, "")
+                    else None
                 ),
             ),
             monitor=MonitorConfig(
@@ -812,9 +882,19 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
     ):
         value = getattr(timing, field_name)
         require(finite(value) and value >= 0, f"timing.{field_name}", "must be finite and non-negative", value)
-    for field_name in ("choice_timeout_s", "choice_loop_stall_s"):
+    for field_name in (
+        "choice_timeout_s",
+        "choice_loop_stall_s",
+        "output_verification_timeout_s",
+    ):
         value = getattr(timing, field_name)
         require(finite(value) and value > 0, f"timing.{field_name}", "must be finite and greater than zero", value)
+    require(
+        timing.output_verification_timeout_s <= 1.0,
+        "timing.output_verification_timeout_s",
+        "must be at most one second",
+        timing.output_verification_timeout_s,
+    )
 
     for field_name in ("matched_pump_s", "opposite_pump_s"):
         value = getattr(config.reward, field_name)
@@ -987,6 +1067,55 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
             "welfare.water_target_ml",
             "must be finite and non-negative",
             config.welfare.water_target_ml,
+        )
+    if config.welfare.max_cumulative_reward_ul is not None:
+        require(
+            finite(config.welfare.max_cumulative_reward_ul)
+            and config.welfare.max_cumulative_reward_ul > 0,
+            "welfare.max_cumulative_reward_ul",
+            "must be finite and greater than zero",
+            config.welfare.max_cumulative_reward_ul,
+        )
+    require(
+        config.welfare.max_weight_age_days > 0,
+        "welfare.max_weight_age_days",
+        "must be greater than zero",
+        config.welfare.max_weight_age_days,
+    )
+
+    animal = config.animal_use
+    require(
+        animal.max_certification_age_days > 0,
+        "animal_use.max_certification_age_days",
+        "must be greater than zero",
+        animal.max_certification_age_days,
+    )
+    require(
+        animal.max_calibration_age_days > 0,
+        "animal_use.max_calibration_age_days",
+        "must be greater than zero",
+        animal.max_calibration_age_days,
+    )
+    require(
+        finite(animal.max_calibration_residual_ul)
+        and animal.max_calibration_residual_ul > 0,
+        "animal_use.max_calibration_residual_ul",
+        "must be finite and greater than zero",
+        animal.max_calibration_residual_ul,
+    )
+    if animal.certification_path is not None:
+        require(
+            bool(str(animal.certification_path).strip()),
+            "animal_use.certification_path",
+            "must not be empty when configured",
+            animal.certification_path,
+        )
+    if animal.hardware_failsafe_revision is not None:
+        require(
+            bool(str(animal.hardware_failsafe_revision).strip()),
+            "animal_use.hardware_failsafe_revision",
+            "must not be empty when configured",
+            animal.hardware_failsafe_revision,
         )
     return issues
 

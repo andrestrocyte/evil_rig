@@ -22,6 +22,7 @@ from hf_dm.config import (
     validate_session_config,
 )
 from hf_dm.camera.spinnaker import HeadlessSpinnakerRecorder
+from hf_dm.certification import assert_animal_use_ready
 from hf_dm.data.session_export import resolve_session_output, session_bundle_dir
 from hf_dm.hardware.discovery import connect_bpod_core
 from hf_dm.data.recorder import (
@@ -77,9 +78,26 @@ from hf_dm.streamdio.wheel import Direction, WheelAccumulator
 logger = logging.getLogger(__name__)
 
 
+class HardwareCleanupError(RuntimeError):
+    """Raised only after every available rig cleanup stage has been attempted."""
+
+    def __init__(self, errors: list[dict[str, str]]):
+        self.errors = [dict(item) for item in errors]
+        stages = ", ".join(item["stage"] for item in self.errors)
+        super().__init__(f"Rig cleanup failed in {len(self.errors)} stage(s): {stages}")
+
+
 class HFDecisionSession:
-    def __init__(self, config: SessionConfig):
+    def __init__(
+        self,
+        config: SessionConfig,
+        *,
+        run_mode: Literal["animal", "bench", "simulation"] = "animal",
+        animal_use_confirmed: bool = False,
+    ):
         self.config = validate_session_config(config)
+        self.run_mode = run_mode
+        self.animal_use_confirmed = bool(animal_use_confirmed)
         self.rng = random.Random(config.random_seed)
         self.reward_calibration = self._load_reward_calibration()
         self.bpod: Bpod | None = None
@@ -115,6 +133,8 @@ class HFDecisionSession:
         self._safety_interlock_path = safety_interlock_path()
         self._safety_interlock_armed = False
         self.runtime_provenance: dict[str, object] = {}
+        self.animal_use_gate_report: dict[str, Any] | None = None
+        self._last_cleanup_error: HardwareCleanupError | None = None
         self._trial_schedule = self._build_trial_schedule()
 
     def _require_live_barcode_capacity(self) -> None:
@@ -154,6 +174,13 @@ class HFDecisionSession:
     def connect(self) -> None:
         self._closed = False
         self._require_live_barcode_capacity()
+        self.runtime_provenance = capture_runtime_provenance()
+        if self.run_mode == "animal" and self.config.animal_use.enabled:
+            self.animal_use_gate_report = assert_animal_use_ready(
+                self.config,
+                operator_confirmed=self.animal_use_confirmed,
+                provenance=self.runtime_provenance,
+            )
         assert_safety_interlock_clear(self._safety_interlock_path)
         arm_safety_interlock(
             {
@@ -164,7 +191,6 @@ class HFDecisionSession:
             self._safety_interlock_path,
         )
         self._safety_interlock_armed = True
-        self.runtime_provenance = capture_runtime_provenance()
         ports = self.config.ports
         self.bpod = connect_bpod_core(None if ports.bpod_port == "AUTO" else ports.bpod_port)
         self.bpod.reset_session_clock()
@@ -177,6 +203,13 @@ class HFDecisionSession:
         )
         excluded = self._bpod_serial_ports()
         self.dio.open(excluded_bpod_ports=excluded)
+        # Install the emergency output path immediately after USB1 is open so a
+        # later configuration/display/camera failure can still attempt all-off.
+        self.relay = StreamDIOOutputs(
+            self.dio,
+            cap_touch_power_channel=self.config.licks.power_output_channel,
+            speaker_sample_interval_us=self.config.speaker.sample_interval_us,
+        )
         self.dio.configure_rotary_and_force(
             lick_channels=self.config.licks.channels,
             extra_input_channels=self._frame2ttl_input_channels(),
@@ -213,14 +246,28 @@ class HFDecisionSession:
         self._configure_cap_touch_digitizer_from_config()
         self._start_operator_monitor()
         self._start_optional_video_recording()
+        if self.run_mode == "animal" and self.config.animal_use.enabled:
+            self.animal_use_gate_report = assert_animal_use_ready(
+                self.config,
+                operator_confirmed=self.animal_use_confirmed,
+                provenance=self.runtime_provenance,
+                actual_hardware=self._connected_hardware_identity(),
+            )
+            self.recorder.set_metadata(self._session_metadata())
+            self.recorder.log_event(
+                "animal_use_gate_passed",
+                {
+                    "certification_path": self.animal_use_gate_report.get(
+                        "certification_path"
+                    ),
+                    "release_identity": self.animal_use_gate_report.get(
+                        "release_identity"
+                    ),
+                },
+            )
         self.dio.start_streaming(callback=self._handle_streamdio_event)
         self._start_output_verifier()
         self.recorder.log_event("streamdio_streaming_started", {})
-        self.relay = StreamDIOOutputs(
-            self.dio,
-            cap_touch_power_channel=self.config.licks.power_output_channel,
-            speaker_sample_interval_us=self.config.speaker.sample_interval_us,
-        )
         baseline = self._run_all_off()
         self.recorder.log_event("all_off_startup_verified", baseline)
         self.speaker_relay = SerialRelay(
@@ -311,9 +358,15 @@ class HFDecisionSession:
             },
         )
 
-    def close(self, *, stop_monitor: bool = True) -> None:
+    def close(
+        self,
+        *,
+        stop_monitor: bool = True,
+        raise_on_error: bool = True,
+    ) -> None:
         if self._closed:
             return
+        self._last_cleanup_error = None
         cleanup_result: dict = {}
         cleanup_errors: list[dict[str, str]] = []
 
@@ -323,26 +376,31 @@ class HFDecisionSession:
             logger.critical("Hardware cleanup failed at %s: %s", stage, error)
 
         try:
-            if self.bpod is not None and self.bpod.is_running:
+            bpod_running = False
+            if self.bpod is not None:
+                try:
+                    bpod_running = bool(self.bpod.is_running)
+                except BaseException as exc:
+                    logger.exception("Failed to determine whether Bpod is running")
+                    cleanup_failed("bpod_running_state", exc)
+            if self.bpod is not None and bpod_running:
                 try:
                     self.bpod.send_softcode(sc.SESSION_ABORT)
                     self._wait_for_bpod_trial_threads()
-                except Exception as exc:
+                except BaseException as exc:
                     logger.exception("Failed to abort active Bpod trial during cleanup")
                     cleanup_failed("bpod_abort", exc)
-            if self._active_trial_runtime is not None:
-                self._drain_output_verifications(self._active_trial_runtime)
-            self._shutdown_output_verifier()
             try:
                 self._stop_streamdio_status_poll()
-            except Exception:
+            except BaseException as exc:
                 logger.exception("Failed to stop StreamDIO status polling")
+                cleanup_failed("streamdio_status_poll_stop", exc)
             if self.relay is not None:
                 try:
                     result = self.relay.task_outputs_off()
                     cleanup_result.update(result)
                     self._safe_log_event("task_outputs_cleanup_verified", result)
-                except Exception as exc:
+                except BaseException as exc:
                     logger.exception("Failed to make task outputs safe")
                     cleanup_failed("task_outputs_off", exc)
                     self._safe_log_event(
@@ -354,7 +412,7 @@ class HFDecisionSession:
                     self.speaker_relay.speaker_gate(False)
                     cleanup_result["speaker_gate"] = "off"
                     self._safe_log_event("speaker_gate_cleanup", {"state": "off"})
-                except Exception as exc:
+                except BaseException as exc:
                     logger.exception("Failed to turn off Bpod speaker gate")
                     cleanup_failed("speaker_gate_off", exc)
                     self._safe_log_event(
@@ -368,7 +426,7 @@ class HFDecisionSession:
                         {"status": self._sound_status()},
                     )
                     self.white_noise_player.stop()
-                except Exception as exc:
+                except BaseException as exc:
                     logger.exception("Failed to stop white-noise playback")
                     cleanup_failed("white_noise_stop", exc)
                 finally:
@@ -377,7 +435,7 @@ class HFDecisionSession:
                 try:
                     self.dio.stop_camera()
                     self._safe_log_event("streamdio_camera_triggers_stopped", {})
-                except Exception as exc:
+                except BaseException as exc:
                     logger.exception("Failed to stop StreamDIO camera triggers")
                     cleanup_failed("camera_triggers_stop", exc)
                     self._safe_log_event(
@@ -388,7 +446,7 @@ class HFDecisionSession:
                 video_error = self._stop_optional_video_recording()
                 if video_error is not None:
                     cleanup_failed("camera_recording_stop", RuntimeError(video_error))
-            except Exception as exc:
+            except BaseException as exc:
                 logger.exception("Failed to finish optional video cleanup")
                 cleanup_failed("camera_recording_stop", exc)
             if self.relay is not None:
@@ -412,7 +470,7 @@ class HFDecisionSession:
                     )
                     cleanup_result["cap_touch_power"] = cap_touch_off
                     self._safe_log_event("all_off_cleanup_verified", cleanup_result)
-                except Exception as exc:
+                except BaseException as exc:
                     logger.exception("Failed to turn off cap-touch power")
                     cleanup_failed("cap_touch_power_off", exc)
                     self._safe_log_event(
@@ -423,7 +481,7 @@ class HFDecisionSession:
                 try:
                     self.dio.close()
                     self._update_streamdio_buffer_summary()
-                except Exception as exc:
+                except BaseException as exc:
                     logger.exception("Failed to close StreamDIO")
                     cleanup_failed("streamdio_close", exc)
                     self._safe_log_event(
@@ -433,20 +491,36 @@ class HFDecisionSession:
             if self.bpod is not None:
                 try:
                     self.bpod.set_softcode_handler(None)
+                except BaseException as exc:
+                    logger.exception("Failed to detach Bpod softcode handler")
+                    cleanup_failed("bpod_softcode_handler_detach", exc)
+                try:
                     self.bpod.close()
-                except Exception as exc:
+                except BaseException as exc:
                     logger.exception("Failed to close Bpod")
                     cleanup_failed("bpod_close", exc)
                     self._safe_log_event(
                         "bpod_close_error",
                         {"error": f"{type(exc).__name__}: {exc}"},
                     )
+            if self._active_trial_runtime is not None:
+                try:
+                    self._drain_output_verifications(self._active_trial_runtime)
+                except BaseException as exc:
+                    logger.exception("Failed to drain output verification jobs")
+                    cleanup_failed("output_verifier_drain", exc)
+            try:
+                self._shutdown_output_verifier()
+            except BaseException as exc:
+                logger.exception("Failed to shut down output verifier")
+                cleanup_failed("output_verifier_shutdown", exc)
         finally:
             try:
                 if stop_monitor:
                     self._stop_operator_monitor()
-            except Exception:
+            except BaseException as exc:
                 logger.exception("Failed to stop operator monitor during cleanup")
+                cleanup_failed("operator_monitor_stop", exc)
             finally:
                 if self._safety_interlock_armed:
                     if cleanup_errors:
@@ -460,7 +534,7 @@ class HFDecisionSession:
                                 "new live sessions are blocked",
                                 path,
                             )
-                        except Exception:
+                        except BaseException:
                             logger.exception(
                                 "Could not update the hardware safety interlock; "
                                 "the armed marker is intentionally retained"
@@ -468,13 +542,18 @@ class HFDecisionSession:
                     else:
                         try:
                             clear_safety_interlock(self._safety_interlock_path)
-                        except Exception as exc:
+                            self._safety_interlock_armed = False
+                        except BaseException as exc:
                             cleanup_failed("safety_interlock_clear", exc)
                             logger.exception(
                                 "Verified cleanup completed but the safety interlock "
                                 "could not be cleared; new sessions remain blocked"
                             )
                 self._closed = True
+        if cleanup_errors:
+            self._last_cleanup_error = HardwareCleanupError(cleanup_errors)
+            if raise_on_error:
+                raise self._last_cleanup_error
 
     def _safe_log_event(self, event_type: str, payload: dict | None = None) -> None:
         """Keep recorder failures from interrupting hardware cleanup."""
@@ -482,7 +561,7 @@ class HFDecisionSession:
             return
         try:
             self.recorder.log_event(event_type, payload)
-        except Exception:
+        except BaseException:
             logger.exception("Failed to record cleanup event %s", event_type)
 
     def _check_recorder_health(self) -> None:
@@ -642,6 +721,8 @@ class HFDecisionSession:
             "bpod": self._bpod_descriptor(),
             "streamdio_module_info": self._streamdio_module_info(),
             "runtime_provenance": dict(self.runtime_provenance),
+            "run_mode": self.run_mode,
+            "animal_use_gate": self.animal_use_gate_report,
             "reward_calibration": (
                 self.reward_calibration.metadata()
                 if self.reward_calibration is not None
@@ -709,6 +790,16 @@ class HFDecisionSession:
         return {
             str(key): value.item() if hasattr(value, "item") else value
             for key, value in module_info.items()
+        }
+
+    def _connected_hardware_identity(self) -> dict[str, Any]:
+        camera: dict[str, Any] = {}
+        if self.camera_recorder is not None:
+            camera = dict(self.camera_recorder.device_info)
+        return {
+            "bpod": self._bpod_descriptor() or {},
+            "streamdio": self._streamdio_module_info(),
+            "camera": camera,
         }
 
     def _configure_monitor_record_path(self) -> None:
@@ -1774,7 +1865,7 @@ class HFDecisionSession:
             )
             raise
         finally:
-            self.close(stop_monitor=False)
+            self.close(stop_monitor=False, raise_on_error=False)
             if self.display is not None:
                 self.display.close()
             summary = SessionSummary(
@@ -1791,6 +1882,8 @@ class HFDecisionSession:
             self._stop_operator_monitor(summary)
             path = self.recorder.finalize(summary)
             logger.info("Session data saved to %s", path)
+        if self._last_cleanup_error is not None:
+            raise self._last_cleanup_error
         return summary
 
     def preflight(self, duration_s: float = 2.0) -> SessionSummary:
@@ -1864,7 +1957,7 @@ class HFDecisionSession:
             )
             raise
         finally:
-            self.close(stop_monitor=False)
+            self.close(stop_monitor=False, raise_on_error=False)
             if self.display is not None:
                 self.display.close()
             summary = SessionSummary(
@@ -1881,6 +1974,8 @@ class HFDecisionSession:
             self._stop_operator_monitor(summary)
             path = self.recorder.finalize(summary)
             logger.info("Preflight data saved to %s", path)
+        if self._last_cleanup_error is not None:
+            raise self._last_cleanup_error
         return summary
 
     def frame2ttl_diagnostic(
@@ -1984,7 +2079,7 @@ class HFDecisionSession:
             )
             raise
         finally:
-            self.close(stop_monitor=False)
+            self.close(stop_monitor=False, raise_on_error=False)
             if self.display is not None:
                 self.display.close()
             summary = SessionSummary(
@@ -2001,6 +2096,8 @@ class HFDecisionSession:
             self._stop_operator_monitor(summary)
             path = self.recorder.finalize(summary)
             logger.info("Frame2TTL diagnostic data saved to %s", path)
+        if self._last_cleanup_error is not None:
+            raise self._last_cleanup_error
         return summary
 
     def frame2ttl_barcode_diagnostic(
@@ -2152,7 +2249,7 @@ class HFDecisionSession:
             )
             raise
         finally:
-            self.close(stop_monitor=False)
+            self.close(stop_monitor=False, raise_on_error=False)
             if self.display is not None:
                 self.display.close()
             summary = SessionSummary(
@@ -2169,6 +2266,8 @@ class HFDecisionSession:
             self._stop_operator_monitor(summary)
             path = self.recorder.finalize(summary)
             logger.info("Frame2TTL barcode diagnostic data saved to %s", path)
+        if self._last_cleanup_error is not None:
+            raise self._last_cleanup_error
         return summary
 
     def bpod_opcode_diagnostic(self, *, hold_s: float = 0.01) -> SessionSummary:
@@ -2245,7 +2344,7 @@ class HFDecisionSession:
             )
             raise
         finally:
-            self.close(stop_monitor=False)
+            self.close(stop_monitor=False, raise_on_error=False)
             if self.display is not None:
                 self.display.close()
             summary = SessionSummary(
@@ -2262,6 +2361,8 @@ class HFDecisionSession:
             self._stop_operator_monitor(summary)
             path = self.recorder.finalize(summary)
             logger.info("Bpod opcode diagnostic data saved to %s", path)
+        if self._last_cleanup_error is not None:
+            raise self._last_cleanup_error
         return summary
 
     @staticmethod
@@ -2499,7 +2600,7 @@ class HFDecisionSession:
                 int(channel),
                 bool(state),
                 after_sequence=int(after_sequence),
-                timeout_s=0.15,
+                timeout_s=self.config.timing.output_verification_timeout_s,
             )
             actual_mono_s = float(transition["event_host_perf_counter_s"])
             event_payload = {

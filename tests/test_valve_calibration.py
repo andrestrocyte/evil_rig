@@ -27,6 +27,8 @@ def test_valve_calibration_fits_synthetic_masses_and_round_trips(tmp_path):
     assert math.isclose(payload["linear_fit"]["slope_ul_per_s"], 50.0)
     assert math.isclose(payload["linear_fit"]["intercept_ul"], 0.0, abs_tol=1e-12)
     assert math.isclose(payload["linear_fit"]["r_squared"], 1.0)
+    assert math.isclose(payload["linear_fit"]["max_abs_residual_ul"], 0.0, abs_tol=1e-12)
+    assert math.isclose(payload["linear_fit"]["rmse_ul"], 0.0, abs_tol=1e-12)
     assert math.isclose(calibration.volume_for_duration(0.06), 3.0)
     assert loaded.sha256 == calibration.sha256
     assert [point.volume_ul for point in loaded.points] == [2.0, 4.0, 6.0]

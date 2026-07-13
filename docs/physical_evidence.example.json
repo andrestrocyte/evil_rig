@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "kind": "hf_dm_physical_certification_evidence",
+  "created_wall_time_s": 0.0,
+  "rig_id": "REPLACE_WITH_RIG_ID",
+  "checks": [
+    {"name": "valve_timing_40ms", "status": "PASS", "evidence": {"operator": "REPLACE", "recorded_wall_time_s": 0.0, "artifact_sha256": "REPLACE_WITH_64_HEX_SHA256", "instrument_id": "REPLACE_SCOPE_ID", "measured_ms": 40.0, "tolerance_ms": 1.0}},
+    {"name": "valve_timing_80ms", "status": "PASS", "evidence": {"operator": "REPLACE", "recorded_wall_time_s": 0.0, "artifact_sha256": "REPLACE_WITH_64_HEX_SHA256", "instrument_id": "REPLACE_SCOPE_ID", "measured_ms": 80.0, "tolerance_ms": 1.0}},
+    {"name": "speaker_spl", "status": "PASS", "evidence": {"operator": "REPLACE", "recorded_wall_time_s": 0.0, "artifact_sha256": "REPLACE_WITH_64_HEX_SHA256", "instrument_id": "REPLACE_SPL_METER_ID", "measured_db_spl": 0.0, "approved_max_db_spl": 0.0}},
+    {"name": "force_direction_magnitude", "status": "PASS", "evidence": {"operator": "REPLACE", "recorded_wall_time_s": 0.0, "artifact_sha256": "REPLACE_WITH_64_HEX_SHA256", "instrument_id": "REPLACE_FORCE_GAUGE_ID", "cw_direction_verified": true, "ccw_direction_verified": true, "cw_magnitude": 0.0, "ccw_magnitude": 0.0, "approved_max_magnitude": 0.0}},
+    {"name": "wheel_sign_geometry", "status": "PASS", "evidence": {"operator": "REPLACE", "recorded_wall_time_s": 0.0, "artifact_sha256": "REPLACE_WITH_64_HEX_SHA256", "cw_sign_verified": true, "ccw_sign_verified": true, "wheel_radius_mm": 0.0, "gain_deg_per_mm": 0.0}},
+    {"name": "hardware_failsafe", "status": "PASS", "evidence": {"operator": "REPLACE", "recorded_wall_time_s": 0.0, "artifact_sha256": "REPLACE_WITH_64_HEX_SHA256", "revision": "REPLACE_FAILSAFE_REVISION", "independent_of": ["python", "usb", "bpod", "streamdio"], "cases": [
+      {"name": "stuck_high", "status": "PASS", "safe_deenergization_ms": 0.0, "approved_limit_ms": 0.0},
+      {"name": "unplugged_usb", "status": "PASS", "safe_deenergization_ms": 0.0, "approved_limit_ms": 0.0},
+      {"name": "frozen_host", "status": "PASS", "safe_deenergization_ms": 0.0, "approved_limit_ms": 0.0},
+      {"name": "bpod_reset", "status": "PASS", "safe_deenergization_ms": 0.0, "approved_limit_ms": 0.0},
+      {"name": "streamdio_reset", "status": "PASS", "safe_deenergization_ms": 0.0, "approved_limit_ms": 0.0},
+      {"name": "emergency_stop", "status": "PASS", "safe_deenergization_ms": 0.0, "approved_limit_ms": 0.0}
+    ]}},
+    {"name": "all_off_failure_injection", "status": "PASS", "evidence": {"operator": "REPLACE", "recorded_wall_time_s": 0.0, "artifact_sha256": "REPLACE_WITH_64_HEX_SHA256", "cases": [
+      {"name": "stuck_high", "status": "PASS", "safe_deenergization_ms": 0.0, "approved_limit_ms": 0.0},
+      {"name": "unplugged_usb", "status": "PASS", "safe_deenergization_ms": 0.0, "approved_limit_ms": 0.0},
+      {"name": "frozen_host", "status": "PASS", "safe_deenergization_ms": 0.0, "approved_limit_ms": 0.0},
+      {"name": "bpod_reset", "status": "PASS", "safe_deenergization_ms": 0.0, "approved_limit_ms": 0.0},
+      {"name": "streamdio_reset", "status": "PASS", "safe_deenergization_ms": 0.0, "approved_limit_ms": 0.0},
+      {"name": "emergency_stop", "status": "PASS", "safe_deenergization_ms": 0.0, "approved_limit_ms": 0.0}
+    ]}},
+    {"name": "soak", "status": "PASS", "evidence": {"operator": "REPLACE", "recorded_wall_time_s": 0.0, "artifact_sha256": "REPLACE_WITH_64_HEX_SHA256", "duration_s": 0.0, "streamdio_overruns": 0, "dropped_packets": 0, "session_validation_pass": true, "qc_pass": true}},
+    {"name": "welfare_limits", "status": "PASS", "evidence": {"operator": "REPLACE", "recorded_wall_time_s": 0.0, "artifact_sha256": "REPLACE_WITH_64_HEX_SHA256", "protocol_id": "REPLACE", "trial_limit_verified": true, "iti_verified": true, "engagement_stop_rules_verified": true, "max_cumulative_reward_ul": 0.0}}
+  ],
+  "human_approvals": {
+    "calibration": {"approved": true, "operator": "REPLACE", "signature": "REPLACE", "signed_wall_time_s": 0.0},
+    "emergency_stop": {"approved": true, "operator": "REPLACE", "signature": "REPLACE", "signed_wall_time_s": 0.0},
+    "physical_safety": {"approved": true, "operator": "REPLACE", "signature": "REPLACE", "signed_wall_time_s": 0.0},
+    "welfare_protocol": {"approved": true, "operator": "REPLACE", "signature": "REPLACE", "signed_wall_time_s": 0.0}
+  }
+}

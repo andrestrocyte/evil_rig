@@ -12,7 +12,7 @@ from hf_dm.hardware.bringup_constants import (
     LICK_INPUT_CHANNEL,
     PUMP_OUTPUT_CHANNEL,
 )
-from hf_dm.session.controller import HFDecisionSession
+from hf_dm.session.controller import HFDecisionSession, HardwareCleanupError
 from hf_dm.session.hardware_self_test import (
     HardwareSelfTestSession,
     shorten_for_hardware_self_test,
@@ -101,16 +101,46 @@ class FakeDIO:
         self.ops.append("close")
 
 
+class PartialConnectDIO(FakeDIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self.raw = SimpleNamespace(module_info={"firmware_version": 0})
+
+    def open(self, **_kwargs) -> None:
+        self.ops.append("open")
+
+    def configure_rotary_and_force(self, **_kwargs) -> None:
+        self.ops.append("configure")
+
+
 class FailingCleanupRelay(FakeRelay):
     def task_outputs_off(self) -> dict:
         self.ops.append("task_outputs_off")
         raise OSError("StreamDIO output USB disconnected")
 
 
+class InterruptingCleanupRelay(FakeRelay):
+    def task_outputs_off(self) -> dict:
+        self.ops.append("task_outputs_off")
+        raise KeyboardInterrupt("operator interrupted cleanup")
+
+
 class FailingCameraDIO(FakeDIO):
     def stop_camera(self) -> None:
         self.ops.append("stop_camera")
         raise OSError("StreamDIO camera USB disconnected")
+
+
+class FailingStateBpod:
+    @property
+    def is_running(self) -> bool:
+        raise OSError("Bpod state unavailable")
+
+    def set_softcode_handler(self, _handler) -> None:
+        raise OSError("Bpod handler detach failed")
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeDisplay:
@@ -127,6 +157,11 @@ class FakeDisplay:
 class FakeVideoRecorder:
     def stop(self) -> dict:
         return {"backend": "spinnaker", "frames_saved": 3, "capture_error": None}
+
+
+class FailingVideoRecorder:
+    def stop(self) -> dict:
+        raise OSError("camera disappeared during shutdown")
 
 
 class OneTrialSession(HFDecisionSession):
@@ -156,6 +191,11 @@ class OneTrialSession(HFDecisionSession):
             )
         )
         return True
+
+
+class FailingTrialSession(HFDecisionSession):
+    def _run_bpod_dm_trial(self, trial_index: int) -> bool:
+        raise RuntimeError(f"trial {trial_index} failed")
 
 
 def test_streamdio_lick_events_are_recorded_on_configured_high_channel():
@@ -230,6 +270,7 @@ def test_run_finalizes_after_video_and_hardware_cleanup(tmp_path):
     session = OneTrialSession(cfg)
     session.bpod = MagicMock()
     session.bpod.port = "COM5"
+    session.bpod.is_running = False
     session.relay = FakeRelay()
     session.dio = FakeDIO()
     session.display = FakeDisplay()
@@ -254,6 +295,41 @@ def test_run_finalizes_after_video_and_hardware_cleanup(tmp_path):
     assert session.relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
 
 
+def test_run_finalizes_evidence_before_surfacing_cleanup_failure(tmp_path):
+    cfg = SessionConfig(n_trials=1, results_dir=str(tmp_path))
+    session = OneTrialSession(cfg)
+    session.bpod = MagicMock(port="COM5", is_running=False)
+    session.relay = FailingCleanupRelay()
+    session.dio = FakeDIO()
+    session.display = FakeDisplay()
+    session.recorder = SessionRecorder(tmp_path, "S1", "dm")
+
+    with pytest.raises(HardwareCleanupError, match="task_outputs_off"):
+        session.run()
+
+    assert session.display.closed
+    assert "session_end" in [event.event_type for event in session.recorder.events]
+    assert list(tmp_path.glob("*.npz"))
+
+
+def test_run_preserves_trial_failure_after_cleanup_and_finalization(tmp_path):
+    cfg = SessionConfig(n_trials=1, results_dir=str(tmp_path))
+    session = FailingTrialSession(cfg)
+    session.bpod = MagicMock(port="COM5", is_running=False)
+    session.relay = FailingCleanupRelay()
+    session.dio = FakeDIO()
+    session.display = FakeDisplay()
+    session.recorder = SessionRecorder(tmp_path, "S1", "dm")
+
+    with pytest.raises(RuntimeError, match="trial 1 failed"):
+        session.run()
+
+    assert isinstance(session._last_cleanup_error, HardwareCleanupError)
+    assert session.display.closed
+    assert "session_end" in [event.event_type for event in session.recorder.events]
+    assert list(tmp_path.glob("*.npz"))
+
+
 def test_cleanup_continues_when_logging_and_audio_shutdown_fail():
     session = HFDecisionSession(SessionConfig())
     session.bpod = MagicMock()
@@ -266,8 +342,10 @@ def test_cleanup_continues_when_logging_and_audio_shutdown_fail():
     session.recorder = MagicMock()
     session.recorder.log_event.side_effect = OSError("disk unavailable")
 
-    session.close()
+    with pytest.raises(HardwareCleanupError) as caught:
+        session.close()
 
+    assert {item["stage"] for item in caught.value.errors} == {"white_noise_stop"}
     assert session.relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
     assert session.speaker_relay.ops == [("speaker_gate", False)]
     assert session.dio.ops == ["stop_camera", "close"]
@@ -301,7 +379,8 @@ def test_usb_cleanup_failures_latch_interlock_and_continue_all_off_attempts(tmp_
     session.speaker_relay = FakeRelay()
     session.dio = FailingCameraDIO()
 
-    session.close()
+    with pytest.raises(HardwareCleanupError):
+        session.close()
 
     payload = json.loads(marker.read_text(encoding="utf-8"))
     assert payload["state"] == "cleanup_failed"
@@ -327,7 +406,8 @@ def test_operator_abort_failure_latches_interlock_but_runs_fallback_cleanup(tmp_
     session.relay = FakeRelay()
     session.dio = FakeDIO()
 
-    session.close()
+    with pytest.raises(HardwareCleanupError):
+        session.close()
 
     payload = json.loads(marker.read_text(encoding="utf-8"))
     assert [item["stage"] for item in payload["cleanup_errors"]] == ["bpod_abort"]
@@ -349,6 +429,156 @@ def test_verified_hardware_cleanup_clears_armed_interlock(tmp_path):
     session.close()
 
     assert not marker.exists()
+    status = json.loads(marker.with_name(f"{marker.name}.status").read_text(encoding="utf-8"))
+    assert status["state"] == "verified_safe"
+
+
+def test_verifier_cleanup_failure_cannot_skip_all_off_or_clear_interlock(tmp_path):
+    marker = tmp_path / "rig-interlock.json"
+    session = HFDecisionSession(SessionConfig())
+    session._safety_interlock_path = marker
+    arm_safety_interlock({"subject_id": "S1"}, marker)
+    session._safety_interlock_armed = True
+    session.bpod = MagicMock()
+    session.bpod.is_running = False
+    session.relay = FakeRelay()
+    session.speaker_relay = FakeRelay()
+    session.dio = FakeDIO()
+    session._active_trial_runtime = MagicMock()
+    session._drain_output_verifications = MagicMock(side_effect=RuntimeError("drain failed"))
+    session._shutdown_output_verifier = MagicMock(side_effect=RuntimeError("shutdown failed"))
+
+    with pytest.raises(HardwareCleanupError) as caught:
+        session.close()
+
+    assert session.relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
+    assert session.speaker_relay.ops == [("speaker_gate", False)]
+    assert session.dio.ops == ["stop_camera", "close"]
+    session.bpod.close.assert_called_once_with()
+    assert session._closed is True
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["state"] == "cleanup_failed"
+    assert {item["stage"] for item in payload["cleanup_errors"]} == {
+        "output_verifier_drain",
+        "output_verifier_shutdown",
+    }
+    assert caught.value.errors == payload["cleanup_errors"]
+
+
+def test_bpod_state_handler_and_monitor_failures_still_run_every_all_off_stage(tmp_path):
+    marker = tmp_path / "rig-interlock.json"
+    session = HFDecisionSession(SessionConfig())
+    session._safety_interlock_path = marker
+    arm_safety_interlock({"subject_id": "S1"}, marker)
+    session._safety_interlock_armed = True
+    session.bpod = FailingStateBpod()
+    session.relay = FakeRelay()
+    session.speaker_relay = FakeRelay()
+    session.dio = FakeDIO()
+    session._stop_operator_monitor = MagicMock(side_effect=RuntimeError("monitor stuck"))
+
+    with pytest.raises(HardwareCleanupError) as caught:
+        session.close()
+
+    assert session.relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
+    assert session.speaker_relay.ops == [("speaker_gate", False)]
+    assert session.dio.ops == ["stop_camera", "close"]
+    assert session.bpod.closed is True
+    assert session._closed is True
+    assert {item["stage"] for item in caught.value.errors} == {
+        "bpod_running_state",
+        "bpod_softcode_handler_detach",
+        "operator_monitor_stop",
+    }
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["state"] == "cleanup_failed"
+
+
+def test_partial_connect_camera_failure_retains_emergency_all_off_path(tmp_path, monkeypatch):
+    config = SessionConfig(results_dir=str(tmp_path / "sessions"))
+    session = HFDecisionSession(config, run_mode="bench")
+    marker = tmp_path / "rig-interlock.json"
+    session._safety_interlock_path = marker
+    bpod = MagicMock()
+    bpod.is_running = False
+    bpod.port = "COM5"
+    dio = PartialConnectDIO()
+    relay = FakeRelay()
+    monkeypatch.setattr("hf_dm.session.controller.connect_bpod_core", lambda _port: bpod)
+    monkeypatch.setattr("hf_dm.session.controller.StreamDIOClient", lambda **_kwargs: dio)
+    monkeypatch.setattr("hf_dm.session.controller.StreamDIOOutputs", lambda *_args, **_kwargs: relay)
+    monkeypatch.setattr("hf_dm.session.controller.TaskDisplay", lambda *_args: FakeDisplay())
+    monkeypatch.setattr(
+        session,
+        "_start_optional_video_recording",
+        MagicMock(side_effect=RuntimeError("camera initialization failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="camera initialization failed"):
+        session.connect()
+    session.close()
+
+    assert relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
+    assert dio.ops == ["open", "configure", "stop_camera", "close"]
+    bpod.close.assert_called_once_with()
+    assert session._closed is True
+    assert not marker.exists()
+    status = json.loads(marker.with_name(f"{marker.name}.status").read_text(encoding="utf-8"))
+    assert status["state"] == "verified_safe"
+
+
+def test_operator_interrupt_during_cleanup_is_deferred_until_all_off_attempts_finish(tmp_path):
+    marker = tmp_path / "rig-interlock.json"
+    session = HFDecisionSession(SessionConfig())
+    session._safety_interlock_path = marker
+    arm_safety_interlock({"subject_id": "S1"}, marker)
+    session._safety_interlock_armed = True
+    session.bpod = MagicMock()
+    session.bpod.is_running = False
+    session.relay = InterruptingCleanupRelay()
+    session.speaker_relay = FakeRelay()
+    session.dio = FakeDIO()
+
+    with pytest.raises(HardwareCleanupError) as caught:
+        session.close()
+
+    assert [item["stage"] for item in caught.value.errors] == ["task_outputs_off"]
+    assert session.relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
+    assert session.speaker_relay.ops == [("speaker_gate", False)]
+    assert session.dio.ops == ["stop_camera", "close"]
+    session.bpod.close.assert_called_once_with()
+    assert session._closed is True
+    assert json.loads(marker.read_text(encoding="utf-8"))["state"] == "cleanup_failed"
+
+
+def test_bpod_read_hang_and_camera_shutdown_failure_are_aggregated_after_all_off(tmp_path):
+    marker = tmp_path / "rig-interlock.json"
+    session = HFDecisionSession(SessionConfig())
+    session._safety_interlock_path = marker
+    arm_safety_interlock({"subject_id": "S1"}, marker)
+    session._safety_interlock_armed = True
+    session.bpod = MagicMock()
+    session.bpod.is_running = True
+    session._wait_for_bpod_trial_threads = MagicMock(
+        side_effect=TimeoutError("Bpod read thread hung")
+    )
+    session.relay = FakeRelay()
+    session.speaker_relay = FakeRelay()
+    session.dio = FakeDIO()
+    session.camera_recorder = FailingVideoRecorder()
+
+    with pytest.raises(HardwareCleanupError) as caught:
+        session.close()
+
+    assert {item["stage"] for item in caught.value.errors} == {
+        "bpod_abort",
+        "camera_recording_stop",
+    }
+    assert session.relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
+    assert session.speaker_relay.ops == [("speaker_gate", False)]
+    assert session.dio.ops == ["stop_camera", "close"]
+    session.bpod.close.assert_called_once_with()
+    assert session._closed is True
 
 
 def test_preflight_saves_stream_camera_and_cleanup_events(tmp_path):
@@ -356,6 +586,7 @@ def test_preflight_saves_stream_camera_and_cleanup_events(tmp_path):
     session = HFDecisionSession(cfg)
     session.bpod = MagicMock()
     session.bpod.port = "COM5"
+    session.bpod.is_running = False
     session.relay = FakeRelay()
     session.dio = FakeDIO()
     session.display = FakeDisplay()

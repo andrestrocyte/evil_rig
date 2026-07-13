@@ -2,6 +2,7 @@ import json
 import os
 import time
 from itertools import groupby
+from pathlib import Path
 
 import numpy as np
 
@@ -65,10 +66,8 @@ def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
     # A stationary timeout trial redraws once, but the choice-loop cadence must
     # still be measured on every host iteration rather than between redraws.
     assert session.recorder.trials[2].choice_loop_frames > 1
-    assert (
-        session.recorder.trials[2].choice_loop_max_frame_s
-        < config.timing.choice_loop_stall_s
-    )
+    assert session.recorder.trials[2].choice_loop_stall_count == 0
+    assert session.recorder.trials[2].choice_loop_max_frame_s >= 0.0
     assert session.recorder.trials[2].frame2ttl_choice_edge_count <= 2
     assert any(
         event[0] == "dio_input" and int(event[1]) == FRAME2TTL_INPUT_CHANNEL
@@ -229,7 +228,12 @@ def test_default_balancing_preserves_seeded_trial_record_snapshot(tmp_path):
     assert "git_commit" in provenance
     assert provenance["git_dirty"] in {True, False, None}
     assert provenance["package_version"] == "0.1.0"
-    assert provenance["package_versions"]["bpod-core"] == "0.1.0a12"
+    installed_bpod_core = provenance["package_versions"]["bpod-core"]
+    lock_text = (Path(__file__).resolve().parents[1] / "requirements.lock").read_text(
+        encoding="utf-8"
+    )
+    assert installed_bpod_core
+    assert f"bpod-core=={installed_bpod_core}" in lock_text
     assert provenance["package_versions"]["numpy"]
     assert provenance["python_version"]
     assert provenance["python_executable"]
@@ -294,8 +298,6 @@ def test_extracted_runners_preserve_trial_records_and_event_stream(tmp_path):
         "fsm_definition_added",
         "bpod_state_marker",
         "bpod_state_marker",
-        "lick_edge",
-        "lick",
         "stimulus_on",
         "bpod_state_marker",
         "choice_detected",
@@ -313,8 +315,6 @@ def test_extracted_runners_preserve_trial_records_and_event_stream(tmp_path):
         "fsm_definition_added",
         "bpod_state_marker",
         "bpod_state_marker",
-        "lick_edge",
-        "lick",
         "stimulus_on",
         "bpod_state_marker",
         "white_noise_start",
@@ -341,6 +341,11 @@ def test_extracted_runners_preserve_trial_records_and_event_stream(tmp_path):
         "force_off",
         "pump_start",
         "pump_end",
+        # Simulated StreamDIO inputs arrive on the same callback thread as live
+        # inputs. Their order relative to host-render/log events is deliberately
+        # not a scheduler contract.
+        "lick_edge",
+        "lick",
     }
     stable_event_stream = [
         event.event_type
@@ -354,6 +359,9 @@ def test_extracted_runners_preserve_trial_records_and_event_stream(tmp_path):
         + timeout_trial
         + session_end
     )
+    event_types = [event.event_type for event in session.recorder.events]
+    assert event_types.count("lick_edge") == 3
+    assert event_types.count("lick") == 3
     bpod_outputs = [
         operation[1:4]
         for operation in session.relay.ops

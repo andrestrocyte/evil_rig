@@ -41,6 +41,7 @@ def _git_identity(candidate: Path) -> dict[str, str | bool | None]:
         "git_commit": None,
         "git_dirty": None,
         "git_root": None,
+        "git_exact_tag": None,
     }
     try:
         root_result = subprocess.run(
@@ -65,6 +66,16 @@ def _git_identity(candidate: Path) -> dict[str, str | bool | None]:
         )
         if commit_result.returncode == 0:
             identity["git_commit"] = commit_result.stdout.strip() or None
+        tag_result = subprocess.run(
+            ["git", "describe", "--tags", "--exact-match", "HEAD"],
+            cwd=str(root),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if tag_result.returncode == 0:
+            identity["git_exact_tag"] = tag_result.stdout.strip() or None
         dirty_result = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=normal"],
             cwd=str(root),
@@ -96,6 +107,7 @@ def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
         "git_commit": None,
         "git_dirty": None,
         "git_root": None,
+        "git_exact_tag": None,
     }
     for candidate in candidates:
         task_git = _git_identity(candidate)
