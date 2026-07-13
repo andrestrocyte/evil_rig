@@ -104,6 +104,28 @@ certificate failures non-interactive for automation and exits fail-closed. The c
 to one process invocation. The gate is evaluated once before hardware is opened and again against
 connected device identities before streaming or output actuation.
 
+## Optional no-animal operation
+
+Certification is not required to check the complete task with no animal present. Run the normal
+task in explicitly labeled bench mode with both flags:
+
+```powershell
+python -m hf_dm.cli --config configs/dm_50.yaml --allow-uncertified --confirm-no-animal
+```
+
+Both flags are mandatory and cannot be combined with simulation, preflight, hardware self-test, or
+diagnostic modes. The session metadata and config snapshot record `run_mode: bench`,
+`animal_present: false`, and `certification_required: false`. This mode still uses the cleanup
+interlock and normal hardware shutdown, but it is not an animal-acquisition authorization.
+
+Open calibration and certification independently of session startup with:
+
+```powershell
+hf-dm certification-gui --config configs/dm_50.yaml
+```
+
+The existing non-GUI `hf-dm certify-rig` command remains available for automation.
+
 ## Failure response
 
 Any crash or cleanup failure leaves `~/.hf_dm/hardware_cleanup_interlock.json` latched. Do not remove

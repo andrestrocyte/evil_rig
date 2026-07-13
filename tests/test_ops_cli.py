@@ -4,6 +4,7 @@ import types
 from pathlib import Path
 
 from hf_dm.config import SessionConfig, config_to_dict
+from hf_dm.certification_gui import CertificationDialogResult
 from hf_dm.data.recorder import SessionRecorder, SessionSummary, TrialRecord
 from hf_dm.data.session_export import sha256_file, validate_session
 from hf_dm.ops_cli import _streamdio_module_status, main
@@ -88,6 +89,59 @@ def test_ops_cli_validate_config_rejects_semantic_errors(tmp_path, monkeypatch, 
         "n_trials",
         "camera.exposure_us",
     }
+
+
+def test_ops_cli_certification_gui_opens_standalone_workflow(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config_path = tmp_path / "config.yaml"
+    certificate_path = tmp_path / "certifications" / "rig.json"
+    config_path.write_text(
+        "\n".join(
+            [
+                f"results_dir: {tmp_path.as_posix()}/sessions",
+                "camera:",
+                f"  save_dir: {tmp_path.as_posix()}/videos",
+                "animal_use:",
+                "  enabled: true",
+                f"  certification_path: {certificate_path.as_posix()}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    opened = {}
+
+    def fake_dialog(config, report, *, session_start=True):
+        opened["config"] = config
+        opened["report"] = report
+        opened["session_start"] = session_start
+        return CertificationDialogResult(False, False)
+
+    monkeypatch.setattr("hf_dm.ops_cli.run_certification_dialog", fake_dialog)
+    monkeypatch.setattr(
+        "hf_dm.ops_cli.evaluate_animal_use_gate",
+        lambda config, **_kwargs: {
+            "status": "FAIL",
+            "certification_path": str(certificate_path),
+            "checks": [],
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hf-dm", "certification-gui", "--config", str(config_path)],
+    )
+
+    main()
+
+    result = json.loads(capsys.readouterr().out)
+    assert opened["session_start"] is False
+    assert opened["config"].session_export.source_config_path == str(config_path.resolve())
+    assert opened["report"]["status"] == "FAIL"
+    assert result["ready"] is False
+    assert result["closed_ready"] is False
 
 
 def test_preflight_report_uses_cached_streamdio_status_after_disconnect():

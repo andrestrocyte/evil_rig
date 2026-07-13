@@ -286,6 +286,28 @@ def _remediate_animal_use_gate(
     return True
 
 
+def _validate_uncertified_bench_request(
+    *,
+    allow_uncertified: bool,
+    confirm_no_animal: bool,
+    conflicting_mode: bool,
+) -> bool:
+    """Validate and identify an explicitly labeled no-animal full-task run."""
+
+    if confirm_no_animal and not allow_uncertified:
+        raise ValueError("--confirm-no-animal requires --allow-uncertified")
+    if not allow_uncertified:
+        return False
+    if not confirm_no_animal:
+        raise ValueError("--allow-uncertified requires --confirm-no-animal")
+    if conflicting_mode:
+        raise ValueError(
+            "--allow-uncertified is only valid for a normal full-task run, not another "
+            "simulation, preflight, self-test, or diagnostic mode"
+        )
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run HF decision-making session (bpod-core + StreamDIO)")
     parser.add_argument(
@@ -302,6 +324,19 @@ def main() -> None:
             "One-run confirmation that the operator completed the animal safety and "
             "welfare checklist. Required when animal_use.enabled is true."
         ),
+    )
+    parser.add_argument(
+        "--allow-uncertified",
+        action="store_true",
+        help=(
+            "Run the complete task in explicitly labeled bench mode without a rig certificate. "
+            "Requires --confirm-no-animal and must never be used for animal acquisition."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-no-animal",
+        action="store_true",
+        help="Confirm no animal is present for --allow-uncertified bench operation.",
     )
     parser.add_argument(
         "--simulate",
@@ -539,6 +574,20 @@ def main() -> None:
             "sync diagnostics cannot be combined with --preflight or "
             "--hardware-self-test"
         )
+    try:
+        uncertified_bench = _validate_uncertified_bench_request(
+            allow_uncertified=args.allow_uncertified,
+            confirm_no_animal=args.confirm_no_animal,
+            conflicting_mode=bool(
+                args.simulate
+                or args.preflight
+                or args.hardware_self_test
+                or args.cap_touch_diagnostic
+                or any(frame2ttl_modes)
+            ),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -658,6 +707,19 @@ def main() -> None:
                 source="hf-dm-run session arguments",
                 values=session_arg_overrides,
             )
+    if uncertified_bench:
+        logging.warning(
+            "UNCERTIFIED BENCH RUN: no animal confirmed; certification gate is not applied"
+        )
+        _record_cli_override(
+            config,
+            source="hf-dm-run --allow-uncertified --confirm-no-animal",
+            values={
+                "run_mode": "bench",
+                "animal_present": False,
+                "certification_required": False,
+            },
+        )
     _load_saved_operator_state(config)
     validate_session_config(config)
     if args.cap_touch_diagnostic:
@@ -718,7 +780,7 @@ def main() -> None:
         )
         session = HardwareSelfTestSession(config)
     else:
-        bench_mode = bool(args.preflight or any(frame2ttl_modes))
+        bench_mode = bool(args.preflight or any(frame2ttl_modes) or uncertified_bench)
         animal_use_confirmed = args.confirm_animal_use
         if not bench_mode and config.animal_use.enabled:
             animal_use_confirmed = _remediate_animal_use_gate(
@@ -743,6 +805,7 @@ def main() -> None:
                 not args.simulate
                 and not args.hardware_self_test
                 and not args.preflight
+                and not uncertified_bench
                 and not any(frame2ttl_modes)
                 and config.animal_use.enabled
             )

@@ -454,6 +454,22 @@ output are logged beside the ignored certificate. **Start session** stays disabl
 production gate returns PASS; the GUI never fabricates physical evidence or overrides a failed test.
 Use `--no-certification-dialog` only for deliberately non-interactive automation.
 
+To run the complete task for hardware/behavior checking without a certificate, explicitly declare a
+no-animal bench run:
+
+```powershell
+python -m hf_dm.cli --config configs/dm_50.yaml `
+  --allow-uncertified --confirm-no-animal
+```
+
+The two flags are inseparable, the run is stored as `run_mode: bench`, and the config snapshot records
+the certification bypass. It must not be used for animal acquisition. To open the same calibration
+and certification GUI without starting a session, run:
+
+```powershell
+hf-dm certification-gui --config configs/dm_50.yaml
+```
+
 ---
 
 ## Counterbalancing, calibration & welfare
@@ -587,6 +603,7 @@ print(matched.mean(), trials["response_time_s"].mean())
 | `export-preview-video <dir>` | Offline FFV1 AVI from saved PGM frames |
 | `rig-preflight --config <cfg>` | No-trial hardware preflight, writes `rig_preflight_report.json` |
 | `certify-rig --config <cfg>` | Unified no-animal, real-output certification; requires five explicit safety confirmations and signed physical evidence |
+| `certification-gui --config <cfg>` | Open the desktop calibration/evidence/certification workflow without starting a session |
 | `calibrate-valve --config <cfg>` | Guided reward-valve calibration (actuates pump) |
 | `log-weight <subject> --weight W` | Append a subject weight/water record |
 | `camera-roi-setup --config <cfg>` | Select/write Spinnaker ROI (`--interactive`, `--visual`, `--clear`) |
