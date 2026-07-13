@@ -9,6 +9,7 @@ from hf_dm.data.recorder import (
     SessionSummary,
     TrialRecord,
     load_session_journal,
+    load_streamdio_wal,
     recover_session_journal,
 )
 from hf_dm.data.session_export import session_bundle_dir, validate_session
@@ -191,6 +192,8 @@ recorder = SessionRecorder(root, "S1", "decision_making", base_name="crashed")
 recorder.set_export_options(config_to_dict(config)["session_export"])
 recorder.set_metadata({"config": config_to_dict(config)})
 recorder.log_bpod_trial(1, [{"type": "StateStart", "state": "ChoiceWindow"}])
+recorder.log_streamdio_event("analog_input", 13, 1234, 1000, 0.001)
+recorder.log_streamdio_event("camera", None, None, 2000, 0.002)
 recorder.add_trial(TrialRecord(
     trial_index=1, phase="decision_making", force_direction="cw", choice="cw",
     matched=True, reward_duration_s=0.08, responded=True, response_time_s=0.2,
@@ -213,5 +216,20 @@ os._exit(23)
 
     assert result["recovered_trials"] == 1
     assert result["recovered_bpod_trials"] == 1
+    assert result["recovered_streamdio_events"] == 2
     assert result["validation"]["valid"]
     assert not marker.exists()
+    assert not (tmp_path / "crashed.streamdio.wal").exists()
+
+
+def test_streamdio_wal_loader_ignores_only_a_truncated_final_record(tmp_path):
+    recorder = _recorder(tmp_path)
+    recorder.log_streamdio_event("analog_input", 13, 42, 1000, 0.001)
+    recorder._close_streamdio_wal()
+    with recorder.streamdio_wal_path.open("ab") as handle:
+        handle.write(b"partial")
+
+    rows, trailing_bytes = load_streamdio_wal(recorder.streamdio_wal_path)
+
+    assert rows == [("analog_input", 13, 42, 1000, 0.001, rows[0][5])]
+    assert trailing_bytes == len(b"partial")

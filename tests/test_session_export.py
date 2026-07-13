@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+import hf_dm.data.recorder as recorder_module
 from hf_dm.config import SessionConfig, config_to_dict
 from hf_dm.data.recorder import SessionRecorder, SessionSummary, TrialRecord
 from hf_dm.data.session_bundle import SessionBundle
@@ -1193,6 +1194,113 @@ def test_streamdio_bounded_memory_reconstructs_full_npz_from_chunks(tmp_path):
     assert manifest["recorder_stats"]["streamdio_recent_in_memory_count"] <= 2
     assert manifest["recorder_stats"]["max_streamdio_events_in_memory"] <= 2
     assert validate_session(bundle)["valid"]
+
+
+def test_streamdio_chunk_write_retries_transient_failure(tmp_path, monkeypatch):
+    cfg = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(tmp_path))
+    cfg.session_export.streamdio_chunk_s = 0.001
+    cfg.session_export.streamdio_memory_mode = "bounded"
+    recorder = SessionRecorder(tmp_path, cfg.subject_id, cfg.phase.value)
+    recorder.set_export_options(config_to_dict(cfg)["session_export"])
+    recorder.set_metadata({"config": config_to_dict(cfg)})
+    original = recorder_module._atomic_write_npz
+    attempts = 0
+
+    def transient(path, **arrays):
+        nonlocal attempts
+        if "streamdio_chunk_" in str(path):
+            attempts += 1
+            if attempts == 1:
+                raise OSError("temporary write failure")
+        return original(path, **arrays)
+
+    monkeypatch.setattr(recorder_module, "_atomic_write_npz", transient)
+    recorder.log_streamdio_event("analog_input", 13, 1, 1000, 0.000)
+    recorder.log_streamdio_event("analog_input", 13, 2, 2000, 0.002)
+    recorder.add_trial(_trial())
+
+    recorder.finalize(_summary())
+
+    assert attempts >= 2
+    assert recorder._streamdio_chunk_error is None
+    with np.load(recorder.base_path.with_suffix(".npz"), allow_pickle=True) as data:
+        assert len(data["streamdio_events"]) == 2
+
+
+def test_streamdio_failed_chunk_rows_fall_back_to_primary_npz(tmp_path, monkeypatch):
+    cfg = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(tmp_path))
+    cfg.session_export.streamdio_chunk_s = 0.001
+    cfg.session_export.streamdio_memory_mode = "bounded"
+    cfg.session_export.streamdio_recent_events = 1
+    recorder = SessionRecorder(tmp_path, cfg.subject_id, cfg.phase.value)
+    recorder.set_export_options(config_to_dict(cfg)["session_export"])
+    recorder.set_metadata({"config": config_to_dict(cfg)})
+    original = recorder_module._atomic_write_npz
+
+    def fail_chunks(path, **arrays):
+        if "streamdio_chunk_" in str(path):
+            raise OSError("persistent chunk failure")
+        return original(path, **arrays)
+
+    monkeypatch.setattr(recorder_module, "_atomic_write_npz", fail_chunks)
+    for index in range(4):
+        recorder.log_streamdio_event(
+            "analog_input", 13, index, 1000 + index, index * 0.002
+        )
+    recorder.add_trial(_trial())
+
+    recorder.finalize(_summary())
+
+    assert "persistent chunk failure" in str(recorder._streamdio_chunk_error)
+    with np.load(recorder.base_path.with_suffix(".npz"), allow_pickle=True) as data:
+        assert len(data["streamdio_events"]) == 4
+    bundle = recorder.base_path.with_name(f"{recorder.base_path.name}_bundle")
+    assert validate_session(bundle)["valid"]
+
+
+def test_bounded_finalize_prefers_complete_wal_over_incomplete_chunks(
+    tmp_path,
+    monkeypatch,
+):
+    recorder = SessionRecorder(tmp_path, "S1", "decision_making")
+    recorder.set_export_options(
+        {
+            "streamdio_chunk_s": 0.001,
+            "streamdio_memory_mode": "bounded",
+            "streamdio_recent_events": 1,
+            "manifest": False,
+            "config_snapshot": False,
+            "export_csv_on_finalize": False,
+            "export_timeline": False,
+        }
+    )
+    for index in range(10):
+        recorder.log_streamdio_event(
+            "analog_input",
+            13,
+            index,
+            index * 1_000,
+            index * 0.002,
+        )
+    recorder._close_streamdio_wal(durable=True)
+    recorder._finalize_streamdio_chunks()
+    monkeypatch.setattr(recorder, "_load_streamdio_chunk_rows", lambda: [])
+
+    rows = recorder._streamdio_rows_for_finalize()
+
+    assert len(rows) == 10
+    assert [row[2] for row in rows] == list(range(10))
+
+
+def test_structured_event_payload_is_not_truncated(tmp_path):
+    recorder = SessionRecorder(tmp_path, "S1", "decision_making")
+    payload = {"long_value": "x" * 5000}
+    recorder.log_event("long_payload", payload)
+
+    events = recorder._events_to_structured()
+
+    row = next(item for item in events if item["event_type"] == "long_payload")
+    assert json.loads(str(row["payload_json"])) == payload
 
 
 def test_debug_event_ring_exports_recent_events_without_polluting_semantic_events(tmp_path):

@@ -235,6 +235,8 @@ class HardwareSelfTestSession(HFDecisionSession):
                     "PostTimeout_Pre",
                     "PostTimeout",
                 ]
+                if trial.force_output_direction is not None:
+                    expected_states.insert(4, "TimeoutForceOff")
             actual_states = bpod_states_by_trial.get(trial.trial_index, [])
             if actual_states != expected_states:
                 fail(
@@ -485,6 +487,9 @@ def shorten_for_hardware_self_test(config: SessionConfig) -> None:
     config.timing.post_timeout_s = 0.05
     config.display.pre_trial_black_s = 0.10
     config.display.feedback_hold_s = 0.20
+    # Barcode integrity has its own live diagnostic. The shortened 50 ms
+    # quiescence used here cannot carry a production Frame2TTL barcode.
+    config.frame2ttl.barcode_enabled = False
     config.engagement.idle_timeout_s = 60.0
     config.engagement.max_consecutive_failures = 10
     config.camera.record_video = True

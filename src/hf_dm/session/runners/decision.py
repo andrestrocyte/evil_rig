@@ -68,11 +68,14 @@ class BpodDecisionEpochRunner:
         self._prepare_decision_trial(runtime)
         fsm = build_host_supervised_decision_fsm(
             self.speaker_relay,
+            force_direction=force_output_direction,
             quiescence_s=self.config.timing.quiescence_s,
             choice_timeout_s=self.config.timing.choice_timeout_s,
             choice_blank_s=self.config.timing.choice_blank_s,
             high_reward_s=self._reward_state_timer(runtime.high_reward_s),
             low_reward_s=self._reward_state_timer(runtime.low_reward_s),
+            high_reward_enabled=runtime.high_reward_s > 0.0,
+            low_reward_enabled=runtime.low_reward_s > 0.0,
             post_reward_s=self.config.timing.post_reward_s,
             timeout_noise_s=self.config.timing.timeout_noise_s,
             post_timeout_s=self.config.timing.post_timeout_s,
@@ -91,10 +94,13 @@ class BpodDecisionEpochRunner:
         frame_interval_max_s = 0.0
         stall_count = 0
         previous_frame_mono_s: float | None = None
+        previous_choice_loop_mono_s: float | None = None
         stimulus_visible = False
         last_drawn_choice_signature: tuple[float, float, str | None] | None = None
         choice_sync_square_state = False
         timeout_logged = False
+        choice_candidate_payload: dict[str, Any] | None = None
+        choice_confirmed_logged = False
         abort_sent = False
         last_phase = "starting"
         last_quiescence_edges = 0
@@ -204,6 +210,21 @@ class BpodDecisionEpochRunner:
                     self._publish_wheel_snapshot(phase=phase, trial_index=trial_index)
 
                 elif phase == "choice":
+                    loop_mono_s = time.perf_counter()
+                    if previous_choice_loop_mono_s is not None:
+                        loop_interval_s = loop_mono_s - previous_choice_loop_mono_s
+                        if loop_interval_s >= stall_threshold_s:
+                            stall_count += 1
+                            self.recorder.log_debug_event(
+                                "choice_loop_stall",
+                                {
+                                    "trial_index": trial_index,
+                                    "interval_s": loop_interval_s,
+                                    "stall_threshold_s": stall_threshold_s,
+                                    "frame": frame_count,
+                                },
+                            )
+                    previous_choice_loop_mono_s = loop_mono_s
                     if (
                         frame2ttl_barcode_states
                         and frame2ttl_barcode_index < len(frame2ttl_barcode_states)
@@ -243,17 +264,6 @@ class BpodDecisionEpochRunner:
                             interval_s = frame_mono_s - previous_frame_mono_s
                             frame_interval_sum_s += interval_s
                             frame_interval_max_s = max(frame_interval_max_s, interval_s)
-                            if interval_s >= stall_threshold_s:
-                                stall_count += 1
-                                self.recorder.log_debug_event(
-                                    "choice_loop_stall",
-                                    {
-                                        "trial_index": trial_index,
-                                        "interval_s": interval_s,
-                                        "stall_threshold_s": stall_threshold_s,
-                                        "frame": frame_count + 1,
-                                    },
-                                )
                         previous_frame_mono_s = frame_mono_s
                         frame_count += 1
                         sync_square_state = None
@@ -365,40 +375,42 @@ class BpodDecisionEpochRunner:
                             )
                             reward_s = self._runtime_reward_duration(runtime, chosen_shape)
                             reward_delay_s = self._runtime_reward_delay(runtime, chosen_shape)
-                            self.recorder.log_event(
-                                "choice_detected",
-                                {
-                                    "trial_index": trial_index,
-                                    "choice": wheel_choice,
-                                    "choice_side": selected_side,
-                                    "chosen_shape": chosen_shape,
-                                    "trial_mode": trial_mode,
-                                    "forced_shape": forced_shape,
-                                    "modality": runtime.modality,
-                                    "force_direction": force_output_direction,
-                                    "force_output_direction": force_output_direction,
-                                    "force_output_active": force_output_direction is not None,
-                                    "choice_target_direction": choice_target_direction,
-                                    "star_direction": star_direction,
-                                    "circle_direction": circle_direction,
-                                    "matched": chosen_shape == "star",
-                                    "response_time_s": response_time_s,
-                                    "reward_duration_s": reward_s,
-                                    "reward_delay_s": reward_delay_s,
-                                    "reward_delivered": reward_s > 0.0,
-                                    "risk_star_probability": runtime.risk_star_probability,
-                                    "host_to_bpod_softcode": (
-                                        sc.CHOICE_HIGH
-                                        if chosen_shape == "star"
-                                        else sc.CHOICE_LOW
-                                    ),
-                                },
+                            choice_candidate_payload = {
+                                "trial_index": trial_index,
+                                "choice": wheel_choice,
+                                "choice_side": selected_side,
+                                "chosen_shape": chosen_shape,
+                                "trial_mode": trial_mode,
+                                "forced_shape": forced_shape,
+                                "modality": runtime.modality,
+                                "force_direction": force_output_direction,
+                                "force_output_direction": force_output_direction,
+                                "force_output_active": force_output_direction is not None,
+                                "choice_target_direction": choice_target_direction,
+                                "star_direction": star_direction,
+                                "circle_direction": circle_direction,
+                                "matched": chosen_shape == "star",
+                                "response_time_s": response_time_s,
+                                "reward_duration_s": reward_s,
+                                "reward_delay_s": reward_delay_s,
+                                "reward_delivered": reward_s > 0.0,
+                                "risk_star_probability": runtime.risk_star_probability,
+                                "host_to_bpod_softcode": (
+                                    sc.CHOICE_HIGH
+                                    if chosen_shape == "star"
+                                    else sc.CHOICE_LOW
+                                ),
+                                "detected_mono_s": detected_mono_s,
+                            }
+                            self.recorder.log_debug_event(
+                                "choice_candidate",
+                                choice_candidate_payload,
                             )
                             self._publish_monitor(
                                 "task_state",
                                 {
                                     "trial_index": trial_index,
-                                    "phase": "choice_detected",
+                                    "phase": "choice_candidate",
                                     "choice": wheel_choice,
                                     "choice_side": selected_side,
                                     "chosen_shape": chosen_shape,
@@ -417,6 +429,32 @@ class BpodDecisionEpochRunner:
                             )
 
                 else:
+                    if (
+                        choice_candidate_payload is not None
+                        and not choice_confirmed_logged
+                        and state["chosen_shape"] in {"star", "circle"}
+                        and phase in {"blank", "reward", "post_reward"}
+                    ):
+                        confirmed_payload = {
+                            **choice_candidate_payload,
+                            "bpod_confirmed": True,
+                            "bpod_confirmed_phase": phase,
+                            "confirmed_mono_s": time.perf_counter(),
+                        }
+                        self.recorder.log_event("choice_detected", confirmed_payload)
+                        self._publish_monitor(
+                            "task_state",
+                            {
+                                "trial_index": trial_index,
+                                "phase": "choice_detected",
+                                "choice": confirmed_payload["choice"],
+                                "choice_side": confirmed_payload["choice_side"],
+                                "chosen_shape": confirmed_payload["chosen_shape"],
+                                "matched": confirmed_payload["matched"],
+                                "response_time_s": confirmed_payload["response_time_s"],
+                            },
+                        )
+                        choice_confirmed_logged = True
                     if stimulus_visible:
                         blank_flip_mono_s = self.display.fill_black()
                         self._notify_frame2ttl_display_state(
@@ -482,6 +520,28 @@ class BpodDecisionEpochRunner:
         self._active_trial_runtime = None
         if state["error"]:
             raise RuntimeError(f"Bpod trial output failed: {state['error']}")
+
+        if state["chosen_shape"] in {"star", "circle"} and not choice_confirmed_logged:
+            assert choice_candidate_payload is not None
+            self.recorder.log_event(
+                "choice_detected",
+                {
+                    **choice_candidate_payload,
+                    "bpod_confirmed": True,
+                    "bpod_confirmed_phase": str(state["phase"]),
+                    "confirmed_mono_s": time.perf_counter(),
+                },
+            )
+            choice_confirmed_logged = True
+        elif choice_candidate_payload is not None and state["chosen_shape"] is None:
+            self.recorder.log_event(
+                "choice_candidate_rejected",
+                {
+                    **choice_candidate_payload,
+                    "reason": "bpod_timeout_won_boundary_race",
+                    "final_bpod_phase": str(state["phase"]),
+                },
+            )
 
         chosen_shape = state["chosen_shape"]
         choice_side = state["choice_side"]
@@ -707,4 +767,5 @@ class BpodDecisionTrialRunner:
                 ),
             )
         )
+        self._run_iti()
         return bool(result["responded"])

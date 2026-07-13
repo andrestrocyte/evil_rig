@@ -38,9 +38,6 @@ def fsync_best_effort(handle: IO[Any], *, path: Path | str | None = None) -> boo
     if file_descriptor < 0:
         raise OSError(errno.EBADF, "invalid file descriptor")
     location = str(Path(path).resolve().anchor if path is not None else "unknown filesystem")
-    with _warning_lock:
-        if location in _warned_locations:
-            return False
     try:
         os.fsync(file_descriptor)
     except OSError as exc:

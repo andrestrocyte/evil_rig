@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock
 
+import pytest
+
 from hf_dm.config import SessionConfig
 from hf_dm.data.recorder import SessionEvent, SessionRecorder, TrialRecord
 from hf_dm.hardware.bringup_constants import (
@@ -9,7 +11,29 @@ from hf_dm.hardware.bringup_constants import (
     PUMP_OUTPUT_CHANNEL,
 )
 from hf_dm.session.controller import HFDecisionSession
-from hf_dm.session.hardware_self_test import HardwareSelfTestSession
+from hf_dm.session.hardware_self_test import (
+    HardwareSelfTestSession,
+    shorten_for_hardware_self_test,
+)
+
+
+def test_live_session_rejects_quiescence_shorter_than_barcode():
+    config = SessionConfig()
+    config.timing.quiescence_s = 0.5
+    session = HFDecisionSession(config)
+
+    with pytest.raises(RuntimeError, match="cannot display the longest enabled Frame2TTL"):
+        session._require_live_barcode_capacity()
+
+
+def test_hardware_self_test_disables_barcode_for_shortened_quiescence():
+    config = SessionConfig()
+
+    shorten_for_hardware_self_test(config)
+
+    assert config.timing.quiescence_s == 0.05
+    assert config.frame2ttl.barcode_enabled is False
+    HardwareSelfTestSession(config)._require_live_barcode_capacity()
 
 
 class FakeRelay:
@@ -253,7 +277,8 @@ def test_hardware_self_test_returns_typed_validation_results(tmp_path):
         ],
         None: [
             "Quiescence_Pre", "Quiescence", "ChoiceWindow_Pre", "ChoiceWindow",
-            "TimeoutNoise_Pre", "TimeoutNoise", "PostTimeout_Pre", "PostTimeout",
+            "TimeoutForceOff", "TimeoutNoise_Pre", "TimeoutNoise",
+            "PostTimeout_Pre", "PostTimeout",
         ],
     }
     for index, (shape, choice, reward) in enumerate(zip(shapes, choices, rewards), start=1):
@@ -279,6 +304,7 @@ def test_hardware_self_test_returns_typed_validation_results(tmp_path):
                 trial_start_wall_s=float(index),
                 trial_start_mono_s=100.0 + index,
                 chosen_shape=shape,
+                force_output_direction="cw",
                 camera_ttl_timestamps_us=[index * 1000, index * 1000 + 100],
             )
         )
