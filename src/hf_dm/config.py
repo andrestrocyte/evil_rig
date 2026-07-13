@@ -780,6 +780,20 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
     require(bool(str(config.subject_id).strip()), "subject_id", "must not be empty", config.subject_id)
     require(config.n_trials > 0, "n_trials", "must be greater than zero", config.n_trials)
     require(bool(str(config.results_dir).strip()), "results_dir", "must not be empty", config.results_dir)
+    require(
+        config.random_seed is None
+        or (isinstance(config.random_seed, int) and not isinstance(config.random_seed, bool)),
+        "random_seed",
+        "must be an integer or null",
+        config.random_seed,
+    )
+    require(
+        finite(config.centering_threshold_deg)
+        and 0 <= config.centering_threshold_deg < config.display.choice_distance_deg,
+        "centering_threshold_deg",
+        "must be finite, non-negative, and below display.choice_distance_deg",
+        config.centering_threshold_deg,
+    )
 
     require(config.ports.baudrate > 0, "ports.baudrate", "must be greater than zero", config.ports.baudrate)
     require(
@@ -898,7 +912,12 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
 
     for field_name in ("matched_pump_s", "opposite_pump_s"):
         value = getattr(config.reward, field_name)
-        require(finite(value) and value >= 0, f"reward.{field_name}", "must be finite and non-negative", value)
+        require(
+            finite(value) and 0 <= value <= 1.0,
+            f"reward.{field_name}",
+            "must be finite and between zero and one second",
+            value,
+        )
     if config.reward.calibration_path is not None:
         require(
             bool(str(config.reward.calibration_path).strip()),
@@ -935,6 +954,13 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
             "task.n_free_trials/task.n_forced_trials",
             "must sum to n_trials when n_free_trials is explicit",
             [task.n_free_trials, task.n_forced_trials, config.n_trials],
+        )
+    else:
+        require(
+            task.n_forced_trials <= config.n_trials,
+            "task.n_forced_trials",
+            "cannot exceed n_trials when n_free_trials is implicit",
+            task.n_forced_trials,
         )
     effective_free = (
         max(0, config.n_trials - task.n_forced_trials)

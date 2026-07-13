@@ -2,7 +2,13 @@ import threading
 import sys
 import types
 
-from hf_dm.camera.spinnaker import _PreviewDispatcher, _downsample_pgm_file_preview
+import pytest
+
+from hf_dm.camera.spinnaker import (
+    HeadlessSpinnakerRecorder,
+    _PreviewDispatcher,
+    _downsample_pgm_file_preview,
+)
 from hf_dm.camera.spinnaker import _capture_stats
 from hf_dm.data.video_export import export_preview_video
 
@@ -111,3 +117,26 @@ def test_capture_stats_counts_saved_skipped_and_observed_frames():
         "frames_skipped": 5,
         "frames_observed": 15,
     }
+
+
+def test_spinnaker_does_not_teardown_sdk_while_capture_thread_is_alive():
+    class HungThread:
+        def join(self, timeout):
+            self.timeout = timeout
+
+        def is_alive(self):
+            return True
+
+    recorder = object.__new__(HeadlessSpinnakerRecorder)
+    recorder._c_backend = None
+    recorder._running = True
+    recorder._thread = HungThread()
+    recorder._acquisition_timeout_ms = 10
+    recorder._preview_dispatcher = types.SimpleNamespace(stop=lambda: None)
+    recorder._error = None
+    recorder._cleanup_pyspin = lambda: (_ for _ in ()).throw(
+        AssertionError("SDK teardown must not run")
+    )
+
+    with pytest.raises(TimeoutError, match="capture thread did not stop"):
+        recorder.stop()

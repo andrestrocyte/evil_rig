@@ -99,6 +99,23 @@ def test_session_qc_distinguishes_warn_and_fail(tmp_path):
     assert failing["overall_status"] == "FAIL"
 
 
+def test_mean_response_time_excludes_timeouts(tmp_path):
+    recorder = _finalized_session(
+        tmp_path,
+        [
+            _trial(1, responded=True, response_time_s=2.0),
+            _trial(2, responded=False, matched=False, response_time_s=20.0),
+        ],
+    )
+
+    report = evaluate_session_qc(recorder.base_path.with_suffix(".json"), write=False)
+    mean_rt = next(
+        metric for metric in report["metrics"] if metric["name"] == "mean_response_time_s"
+    )
+
+    assert mean_rt["value"] == 2.0
+
+
 def test_session_qc_cli_exits_nonzero_only_on_fail(tmp_path, monkeypatch, capsys):
     recorder = _finalized_session(
         tmp_path,

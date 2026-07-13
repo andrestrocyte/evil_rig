@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+import hf_dm.data.recorder as recorder_module
+
 from hf_dm.config import SessionConfig, config_to_dict
 from hf_dm.data.recorder import (
     SessionRecorder,
@@ -154,6 +156,36 @@ def test_recover_session_rebuilds_incomplete_stream_chunks_from_wal(tmp_path):
     )
     assert manifest["continuous_streams"]["event_count"] == 3
     assert manifest["counts"]["streamdio_events"] == 3
+
+
+def test_recovery_uses_longer_chunks_when_wal_tail_is_truncated(tmp_path):
+    config = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(tmp_path))
+    config.session_export.layout = "flat"
+    config.session_export.streamdio_chunk_s = 0.001
+    config.session_export.streamdio_memory_mode = "bounded"
+    recorder = SessionRecorder(tmp_path, "S1", "decision_making")
+    recorder.set_export_options(config_to_dict(config)["session_export"])
+    recorder.set_metadata({"config": config_to_dict(config)})
+    for index in range(3):
+        recorder.log_streamdio_event(
+            "analog_input", 13, index, 1000 + index, index * 0.002
+        )
+    recorder._finalize_streamdio_chunks()
+    recorder._close_streamdio_wal(durable=True)
+    recorder.close_journal()
+
+    wal = recorder.streamdio_wal_path.read_bytes()
+    record_size = recorder_module._STREAMDIO_WAL_RECORD.size
+    recorder.streamdio_wal_path.write_bytes(wal[: -record_size // 2])
+    wal_rows, trailing = load_streamdio_wal(recorder.streamdio_wal_path)
+    assert len(wal_rows) == 2
+    assert trailing > 0
+
+    result = recover_session_journal(recorder.incomplete_marker_path)
+
+    assert result["recovered_streamdio_events"] == 3
+    assert result["streamdio_recovery_source"] == "chunks_extend_wal"
+    assert result["validation"]["valid"]
 
 
 def test_session_journal_sequences_concurrent_event_writers(tmp_path):

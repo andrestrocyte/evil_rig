@@ -87,7 +87,7 @@ def evaluate_session_qc(
     matched = [trial for trial in responded if bool(trial.get("matched"))]
     response_times = [
         float(trial["response_time_s"])
-        for trial in trials
+        for trial in responded
         if _finite_number(trial.get("response_time_s"))
     ]
     stall_values = [
@@ -124,10 +124,14 @@ def evaluate_session_qc(
         ),
         _lower_metric(
             "mean_response_time_s",
-            sum(response_times) / len(response_times) if response_times else None,
+            (
+                sum(response_times) / len(response_times)
+                if response_times and len(response_times) == len(responded)
+                else None
+            ),
             pass_threshold=limits.max_mean_response_time_s,
             warn_threshold=limits.warn_mean_response_time_s,
-            detail="Mean recorded response_time_s across completed trials",
+            detail="Mean recorded response_time_s across responded trials",
             strict_pass=True,
         ),
         _lower_metric(
@@ -136,7 +140,6 @@ def evaluate_session_qc(
             pass_threshold=limits.max_choice_loop_stalls,
             warn_threshold=limits.warn_choice_loop_stalls,
             detail="Total frames exceeding the configured choice-loop stall threshold",
-            missing_status="WARN",
         ),
         _lower_metric(
             "choice_loop_max_frame_s",
@@ -144,7 +147,6 @@ def evaluate_session_qc(
             pass_threshold=limits.max_choice_loop_frame_s,
             warn_threshold=limits.warn_choice_loop_frame_s,
             detail="Worst recorded choice-loop frame duration",
-            missing_status="WARN",
         ),
     ]
     metadata = session.get("metadata") or {}

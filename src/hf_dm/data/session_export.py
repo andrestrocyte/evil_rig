@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -19,6 +20,7 @@ import numpy as np
 import yaml
 
 from hf_dm.hardware.bringup_constants import FORCE_ANALOG_CHANNEL, FRAME2TTL_INPUT_CHANNEL
+from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
 
 
 SEMANTIC_TIMELINE_EVENTS = {
@@ -69,6 +71,30 @@ SEMANTIC_TIMELINE_EVENTS = {
 _CSV_VALIDATION_FIELD_LIMIT = 64 * 1024 * 1024
 
 
+@contextmanager
+def _atomic_text_handle(path: Path, *, newline: str | None = None):
+    """Yield a same-directory temporary text file and atomically publish it."""
+
+    target = Path(path)
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        with temporary.open("w", encoding="utf-8", newline=newline) as handle:
+            yield handle
+            handle.flush()
+            fsync_best_effort(handle, path=temporary)
+        os.replace(temporary, target)
+        fsync_directory_best_effort(target.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    with _atomic_text_handle(path, newline="\n") as handle:
+        handle.write(text)
+
+
 STREAMDIO_COLUMNS = [
     "event_type",
     "channel",
@@ -103,23 +129,40 @@ def resolve_session_output(
     stamp = now or datetime.now()
     day_dir = Path(results_dir) / str(phase) / str(subject_id) / stamp.strftime("%Y-%m-%d")
     day_dir.mkdir(parents=True, exist_ok=True)
-    existing = [
-        int(path.name)
-        for path in day_dir.iterdir()
-        if path.is_dir() and path.name.isdigit()
-    ]
-    run_id = (max(existing) + 1) if existing else 1
-    return day_dir / f"{run_id:03d}", "session"
+    run_id = 1
+    while True:
+        candidate = day_dir / f"{run_id:03d}"
+        try:
+            candidate.mkdir()
+            return candidate, "session"
+        except FileExistsError:
+            run_id += 1
 
 
 def export_existing_session(path: Path | str) -> dict[str, Any]:
     """Regenerate cold exports for an already finalized JSON/NPZ session."""
     session_path = Path(path)
     if session_path.is_dir():
-        candidates = sorted(session_path.glob("*.json"))
-        candidates = [candidate for candidate in candidates if candidate.name != "manifest.json"]
+        candidates: list[Path] = []
+        for candidate in sorted(session_path.glob("*.json")):
+            if candidate.name == "manifest.json":
+                continue
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(payload, dict)
+                and isinstance(payload.get("summary"), dict)
+                and isinstance(payload.get("trials"), list)
+                and isinstance(payload.get("events"), list)
+            ):
+                candidates.append(candidate)
         if not candidates:
             raise FileNotFoundError(f"No session JSON found in {session_path}")
+        if len(candidates) > 1:
+            names = ", ".join(candidate.name for candidate in candidates)
+            raise RuntimeError(f"Ambiguous session JSON files in {session_path}: {names}")
         json_path = candidates[0]
     elif session_path.suffix == ".npz":
         json_path = session_path.with_suffix(".json")
@@ -290,21 +333,21 @@ def make_session_bundle(
         module_info = _streamdio_module_info(metadata, event_dicts)
         if module_info:
             path = exports_dir / "streamdio_module_info.json"
-            path.write_text(json.dumps(module_info, indent=2), encoding="utf-8")
+            _atomic_write_text(path, json.dumps(module_info, indent=2))
             written.append(path)
         stream_summaries = metadata.get("stream_summaries")
         if isinstance(stream_summaries, dict) and stream_summaries:
             path = exports_dir / "stream_summaries.json"
-            path.write_text(json.dumps(stream_summaries, indent=2), encoding="utf-8")
+            _atomic_write_text(path, json.dumps(stream_summaries, indent=2))
             written.append(path)
         soundcard_status = _soundcard_status(event_dicts)
         if soundcard_status:
             path = exports_dir / "soundcard_status.json"
-            path.write_text(json.dumps(soundcard_status, indent=2), encoding="utf-8")
+            _atomic_write_text(path, json.dumps(soundcard_status, indent=2))
             written.append(path)
         if debug_event_dicts:
             path = exports_dir / "debug_events_recent.json"
-            path.write_text(json.dumps(debug_event_dicts, indent=2), encoding="utf-8")
+            _atomic_write_text(path, json.dumps(debug_event_dicts, indent=2))
             written.append(path)
 
     bpod_data_path = _write_bpod_data_json(
@@ -327,12 +370,12 @@ def make_session_bundle(
         timeline_path = exports_dir / "synchronized_timeline.csv"
         written.append(_write_dict_csv(timeline_path, timeline))
         anchors_path = exports_dir / "alignment_anchors.json"
-        anchors_path.write_text(
+        _atomic_write_text(
+            anchors_path,
             json.dumps(
                 _alignment_anchors(event_dicts, streamdio_rows, bundle_dir=bundle_dir),
                 indent=2,
             ),
-            encoding="utf-8",
         )
         written.append(anchors_path)
 
@@ -387,7 +430,7 @@ def make_session_bundle(
         },
     )
     if bool(options.get("manifest", True)):
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        _atomic_write_text(manifest_path, json.dumps(manifest, indent=2))
     alyx_path = _maybe_write_alyx_registration(
         exports_dir=exports_dir,
         manifest_path=manifest_path,
@@ -419,7 +462,7 @@ def make_session_bundle(
             },
         )
         if bool(options.get("manifest", True)):
-            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            _atomic_write_text(manifest_path, json.dumps(manifest, indent=2))
     return {
         "bundle_dir": str(bundle_dir),
         "manifest": str(manifest_path) if bool(options.get("manifest", True)) else None,
@@ -535,7 +578,7 @@ def _write_config_snapshot(path: Path, metadata: dict[str, Any]) -> None:
             snapshot["source_config_yaml"] = source_bytes.decode("utf-8", errors="replace")
         except OSError as exc:
             snapshot["source_config_error"] = f"{type(exc).__name__}: {exc}"
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
+    with _atomic_text_handle(path, newline="\n") as handle:
         handle.write(yaml.safe_dump(snapshot, sort_keys=False))
 
 
@@ -583,7 +626,7 @@ def _write_dict_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
                 fieldnames.append(key)
     if not fieldnames:
         fieldnames = ["empty"]
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    with _atomic_text_handle(path, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
@@ -592,7 +635,7 @@ def _write_dict_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
 
 
 def _write_streamdio_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    with _atomic_text_handle(path, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=STREAMDIO_COLUMNS)
         writer.writeheader()
         for row in rows:
@@ -676,7 +719,7 @@ def _write_bpod_data_json(
         "bpod_trials": bpod_trials,
         "fsm_definitions": fsm_rows,
     }
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _atomic_write_text(path, json.dumps(payload, indent=2))
     return path
 
 
@@ -693,11 +736,17 @@ def _timeline_rows(
         if event_type not in SEMANTIC_TIMELINE_EVENTS:
             continue
         payload = event.get("payload") or {}
+        event_mono_s = payload.get(
+            "host_perf_counter_s",
+            payload.get("monotonic_s", event.get("monotonic_s")),
+        )
         rows.append(
             {
-                "session_mono_s": _relative(event.get("monotonic_s"), event_start),
-                "wall_time_s": event.get("wall_time_s"),
-                "module_timestamp_us": payload.get("timestamp_us"),
+                "session_mono_s": _relative(event_mono_s, event_start),
+                "wall_time_s": payload.get("wall_time_s", event.get("wall_time_s")),
+                "module_timestamp_us": payload.get(
+                    "module_timestamp_us", payload.get("timestamp_us")
+                ),
                 "source": _event_source(event_type),
                 "event_type": event_type,
                 "trial_index": payload.get("trial_index"),
@@ -710,7 +759,12 @@ def _timeline_rows(
             continue
         rows.append(
             {
-                "session_mono_s": row.get("relative_time_s"),
+                # StreamDIO relative_time_s is firmware-relative and does not
+                # share an origin with session event monotonic_s.  Co-sort only
+                # on the captured host perf-counter clock.
+                "session_mono_s": _relative(
+                    row.get("host_perf_counter_s"), event_start
+                ),
                 "wall_time_s": "",
                 "module_timestamp_us": row.get("module_timestamp_us"),
                 "source": "streamdio",
@@ -867,9 +921,9 @@ def _maybe_export_preview_video(
     session_dir = video.get("session_dir")
     if not session_dir:
         path = exports_dir / "preview_video_error.json"
-        path.write_text(
+        _atomic_write_text(
+            path,
             json.dumps({"error": "no video session_dir found"}, indent=2),
-            encoding="utf-8",
         )
         return path
     try:
@@ -881,13 +935,13 @@ def _maybe_export_preview_video(
             codec=str(video_config.get("preview_video_codec") or "FFV1"),
         )
         path = exports_dir / "preview_video_export.json"
-        path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        _atomic_write_text(path, json.dumps(result, indent=2))
         return path
     except Exception as exc:
         path = exports_dir / "preview_video_error.json"
-        path.write_text(
+        _atomic_write_text(
+            path,
             json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2),
-            encoding="utf-8",
         )
         return path
 
@@ -919,7 +973,7 @@ def _write_video_pointer(
         "artifacts": artifacts,
     }
     path = videos_dir / "spinnaker_video.json"
-    path.write_text(json.dumps(pointer, indent=2), encoding="utf-8")
+    _atomic_write_text(path, json.dumps(pointer, indent=2))
     return path
 
 
@@ -945,9 +999,9 @@ def _maybe_write_alyx_registration(
         )
     except Exception as exc:
         path = exports_dir / "alyx_registration.json"
-        path.write_text(
+        _atomic_write_text(
+            path,
             json.dumps({"status": "error", "error": f"{type(exc).__name__}: {exc}"}, indent=2),
-            encoding="utf-8",
         )
         return path
 

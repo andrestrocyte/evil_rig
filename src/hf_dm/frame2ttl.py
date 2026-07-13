@@ -231,27 +231,11 @@ def _decode_with_polarity(
     pulses = _high_pulses(events, inverted=inverted)
     pulse_frames: list[float] = []
     preamble_index: int | None = None
-    preamble_fallback = False
     for index, pulse in enumerate(pulses):
         frames = pulse["duration_s"] / frame_period_s
-        if abs(frames - preamble_high_frames) <= tolerance_frames or (
-            frames >= (float(preamble_high_frames) + float(one_high_frames)) / 2.0
-        ):
+        if abs(frames - preamble_high_frames) <= tolerance_frames:
             preamble_index = index
             break
-    if preamble_index is None:
-        if pulses:
-            preamble_index = 0
-            preamble_fallback = True
-        else:
-            return {
-                "decoded": False,
-                "reason": "preamble_not_found",
-                "inverted": inverted,
-                "edge_count": len(events),
-                "bits": "",
-                "pulse_frames": [],
-            }
     if preamble_index is None:
         return {
             "decoded": False,
@@ -296,7 +280,7 @@ def _decode_with_polarity(
             "pulse_groups": groups,
             "pulse_frames": pulse_frames,
             "preamble_pulse": pulses[preamble_index],
-            "preamble_fallback": preamble_fallback,
+            "preamble_fallback": False,
         }
     modality_count, kind_count = int(groups[0]), int(groups[1])
     word = (modality_count << 4) | kind_count
@@ -311,7 +295,7 @@ def _decode_with_polarity(
         "pulse_groups": [modality_count, kind_count],
         "pulse_frames": pulse_frames,
         "preamble_pulse": pulses[preamble_index],
-        "preamble_fallback": preamble_fallback,
+        "preamble_fallback": False,
         "first_event": first_edge,
         **parsed,
     }

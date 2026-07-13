@@ -107,6 +107,21 @@ class TrialRuntime:
             self.error = f"{type(exc).__name__}: {exc}"
             self._condition.notify_all()
 
+    def record_pump_on(self, monotonic_s: float) -> None:
+        """Record the verified pump-on edge under the runtime lock."""
+
+        with self._condition:
+            self.pump_actual_on_mono_s = float(monotonic_s)
+            self._condition.notify_all()
+
+    def pump_open_duration(self, off_monotonic_s: float) -> float | None:
+        """Return verified pump-open time from a coherent runtime snapshot."""
+
+        with self._condition:
+            if self.pump_actual_on_mono_s is None:
+                return None
+            return float(off_monotonic_s) - self.pump_actual_on_mono_s
+
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
             return {

@@ -271,3 +271,65 @@ def test_uncertified_full_task_is_labeled_bench_and_audited(
         "certification_required": False,
     }
     assert "Session finished: completed" in capsys.readouterr().out
+
+
+def test_disabled_gate_is_bench_labeled_and_session_name_selects_output_folder(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "task.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "subject_id: bench",
+                "n_trials: 1",
+                f"results_dir: {tmp_path.as_posix()}/sessions",
+                "camera:",
+                "  record_video: false",
+                "  required: false",
+                f"  save_dir: {tmp_path.as_posix()}/videos",
+                "monitor:",
+                "  enabled: false",
+                "animal_use:",
+                "  enabled: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class FakeSession:
+        def __init__(self, config, *, run_mode, animal_use_confirmed):
+            captured.update(config=config, run_mode=run_mode)
+
+        def connect(self):
+            pass
+
+        def run(self):
+            return types.SimpleNamespace(
+                end_reason="completed", n_trials_completed=1, n_trials_planned=1
+            )
+
+        def close(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr("hf_dm.cli.HFDecisionSession", FakeSession)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hf-dm-run",
+            "--config",
+            str(config_path),
+            "--no-session-dialog",
+            "--session-name",
+            "named-run",
+        ],
+    )
+
+    cli_main()
+
+    expected = tmp_path / "sessions" / "named-run"
+    assert captured["run_mode"] == "bench"
+    assert Path(captured["config"].results_dir) == expected
+    assert captured["config"].task.session_name == "named-run"
+    assert captured["config"].task.session_dir == str(expected)
