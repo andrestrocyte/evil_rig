@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -399,8 +400,16 @@ class SimulatedVideoRecorder:
         preview_height: int = 240,
         fps: int = 10,
     ) -> None:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.session_dir = Path(save_dir) / f"{subject_id}_{phase}_{stamp}_spinnaker_sim"
+        del subject_id, phase
+        # Some removable/virtual Windows volumes reject new path components
+        # longer than roughly 22 characters even when older long names exist.
+        # Simulation metadata carries subject and phase separately, so keep this
+        # storage component compact and collision-resistant.
+        stamp = datetime.now().strftime("%y%m%d_%H%M%S")
+        self.session_dir = (
+            Path(save_dir).expanduser().resolve()
+            / f"s{stamp}_{uuid.uuid4().hex[:6]}"
+        )
         self._start_wall_s = time.time()
         self._preview_callback = preview_callback
         self._preview_width = max(64, int(preview_width))

@@ -646,6 +646,7 @@ class SessionRecorder:
         trials_arr = self._trials_to_structured()
         events_arr = self._events_to_structured()
         final_streamdio_events = self._streamdio_rows_for_finalize()
+        self._discard_partial_streamdio_chunks()
         streamdio_arr = self._streamdio_rows_to_structured(final_streamdio_events)
 
         npz_error: str | None = None
@@ -836,7 +837,12 @@ class SessionRecorder:
                 water_delivered_ul=sum(volumes),
                 water_target_ml=welfare.get("water_target_ml"),
                 session_id=str(self.base_path),
-                entry_date=datetime.fromtimestamp(summary.session_end_wall_s).date().isoformat(),
+                # Attribute all water to the behavioral session date.  A run
+                # crossing midnight must not move its rewards into the next
+                # day's welfare ledger.
+                entry_date=datetime.fromtimestamp(
+                    summary.session_start_wall_s
+                ).date().isoformat(),
             )
             self.log_event(
                 "subject_water_logged",
@@ -1106,6 +1112,25 @@ class SessionRecorder:
         if rows or self._streamdio_failed_chunk_rows:
             return [*rows, *self._streamdio_failed_chunk_rows]
         return list(self.streamdio_events)
+
+    def _discard_partial_streamdio_chunks(self) -> None:
+        """Remove a misleading partial chunk set after a terminal writer error.
+
+        The complete WAL/primary NPZ remains authoritative.  Publishing only the
+        chunks that happened to succeed would make the continuous-stream index
+        disagree with the complete primary stream.
+        """
+
+        if self._streamdio_chunk_error is None:
+            return
+        for value in list(self._streamdio_chunk_files):
+            try:
+                Path(value).unlink(missing_ok=True)
+            except OSError as exc:
+                self._streamdio_chunk_error += (
+                    f"; partial chunk cleanup: {type(exc).__name__}: {exc}"
+                )
+        self._streamdio_chunk_files.clear()
 
     def _load_streamdio_chunk_rows(self) -> list[tuple[str, int, int, int, float, float]]:
         rows: list[tuple[str, int, int, int, float, float]] = []
@@ -1461,6 +1486,45 @@ def _remove_prior_journal_summaries(
     return filtered, True
 
 
+def _reconcile_streamdio_recovery_rows(
+    wal_rows: list[tuple[str, int, int, int, float, float]],
+    chunk_rows: list[tuple[str, int, int, int, float, float]],
+) -> tuple[list[tuple[str, int, int, int, float, float]], str]:
+    """Choose the complete prefix-compatible StreamDIO recovery source.
+
+    Both stores originate from the same ordered callback stream.  A crash may
+    leave either one with a shorter durable tail, but they must agree for their
+    common prefix.  Divergence is treated as corruption rather than silently
+    publishing a plausible-looking merged stream.
+    """
+
+    if not wal_rows and not chunk_rows:
+        return [], "none"
+    if not wal_rows:
+        return list(chunk_rows), "chunks_only"
+    if not chunk_rows:
+        return list(wal_rows), "wal_only"
+    common_length = min(len(wal_rows), len(chunk_rows))
+    mismatch = next(
+        (
+            index
+            for index in range(common_length)
+            if wal_rows[index] != chunk_rows[index]
+        ),
+        None,
+    )
+    if mismatch is not None:
+        raise RuntimeError(
+            "StreamDIO recovery sources diverge at event "
+            f"{mismatch}; refusing silent WAL/chunk data reconciliation"
+        )
+    if len(wal_rows) > len(chunk_rows):
+        return list(wal_rows), "wal_extends_chunks"
+    if len(chunk_rows) > len(wal_rows):
+        return list(chunk_rows), "chunks_extend_wal"
+    return list(wal_rows), "wal_chunks_identical"
+
+
 def recover_session_journal(
     path: Path | str,
     *,
@@ -1554,7 +1618,10 @@ def recover_session_journal(
     chunk_dir = session_bundle_dir(recorder.base_path, layout=layout) / "continuous_streams"
     recorder._streamdio_chunk_files = [str(item) for item in sorted(chunk_dir.glob("streamdio_chunk_*.npz"))]
     chunk_streamdio = recorder._load_streamdio_chunk_rows()
-    recovered_streamdio = wal_rows if wal_rows else chunk_streamdio
+    recovered_streamdio, streamdio_recovery_source = _reconcile_streamdio_recovery_rows(
+        wal_rows,
+        chunk_streamdio,
+    )
     recorder.streamdio_events = recovered_streamdio
     recorder._streamdio_total_count = len(recovered_streamdio)
     recorder._streamdio_counts = Counter(row[0] for row in recovered_streamdio)
@@ -1563,12 +1630,11 @@ def recover_session_journal(
     recorder._streamdio_memory_mode = str(
         recorder.export_options.get("streamdio_memory_mode", "full")
     )
-    recorder._streamdio_memory_bounded = bool(recorder._streamdio_chunk_files) and not wal_rows
+    recorder._streamdio_memory_bounded = bool(recorder._streamdio_chunk_files)
 
-    # A hard exit can leave the last time chunk only in the WAL.  The WAL is the
-    # authoritative complete stream, so rebuild every chunk from it instead of
-    # publishing a manifest whose continuous-stream count omits the tail.
-    if wal_rows and recorder._streamdio_chunk_s > 0.0:
+    # Either durable store can contain the longer crash-safe tail.  Rebuild every
+    # chunk from the reconciled stream instead of publishing a partial index.
+    if recovered_streamdio and recorder._streamdio_chunk_s > 0.0:
         for prior_chunk in chunk_dir.glob("streamdio_chunk_*.npz"):
             prior_chunk.unlink()
         recorder._streamdio_chunk_files.clear()
@@ -1586,6 +1652,9 @@ def recover_session_journal(
             "recovered_trials": len(recorder.trials),
             "recovered_bpod_trials": len(recorder.bpod_trials),
             "recovered_streamdio_events": len(recovered_streamdio),
+            "streamdio_wal_events": len(wal_rows),
+            "streamdio_chunk_events": len(chunk_streamdio),
+            "streamdio_recovery_source": streamdio_recovery_source,
             "streamdio_wal_trailing_bytes": wal_trailing_bytes,
         },
     )
@@ -1621,5 +1690,8 @@ def recover_session_journal(
         "recovered_trials": len(recorder.trials),
         "recovered_bpod_trials": len(recorder.bpod_trials),
         "recovered_streamdio_events": len(recovered_streamdio),
+        "streamdio_wal_events": len(wal_rows),
+        "streamdio_chunk_events": len(chunk_streamdio),
+        "streamdio_recovery_source": streamdio_recovery_source,
         "streamdio_wal_trailing_bytes": wal_trailing_bytes,
     }

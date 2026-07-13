@@ -1,6 +1,8 @@
 import threading
 from collections import defaultdict, deque
 
+import pytest
+
 from hf_dm.hardware.bringup_constants import (
     CAP_TOUCH_INPUT_PIN,
     FRAME2TTL_INPUT_CHANNEL,
@@ -154,6 +156,37 @@ def test_passive_output_observer_accepts_event_that_arrived_before_wait():
     assert transition["actuator"] == "bpod_fsm_serial"
     assert transition["sequence"] == 1
     assert transition["module_timestamp_us"] == 4321
+
+
+def test_passive_output_observer_uses_latest_event_after_history_rollover():
+    client = _client()
+    for sequence in range(70):
+        client._dispatch_event("dio_output", 1, sequence % 2, 1000 + sequence, sequence / 1000)
+    client._output_event_history[1].clear()
+
+    transition = client.wait_for_output_event(
+        1,
+        True,
+        after_sequence=1,
+        timeout_s=0.0,
+    )
+
+    assert transition["event_verified"]
+    assert transition["sequence"] > 64
+
+
+def test_streamdio_close_surfaces_errors_after_attempting_every_stage():
+    client = _client()
+    calls = []
+    client.stop_streaming = lambda: (_ for _ in ()).throw(OSError("stream stop"))
+    client.stop_camera = lambda: calls.append("camera")
+    client.raw.close = lambda: calls.append("driver")
+
+    with pytest.raises(RuntimeError, match="stream stop"):
+        client.close()
+
+    assert calls == ["camera", "driver"]
+    assert client.raw is None
 
 
 def test_rotary_force_config_requires_cap_touch_digitizer_firmware():

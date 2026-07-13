@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -463,6 +464,56 @@ def test_verifier_cleanup_failure_cannot_skip_all_off_or_clear_interlock(tmp_pat
         "output_verifier_shutdown",
     }
     assert caught.value.errors == payload["cleanup_errors"]
+
+
+def test_verifier_drain_timeout_latches_interlock(tmp_path, monkeypatch):
+    marker = tmp_path / "rig-interlock.json"
+    session = HFDecisionSession(SessionConfig())
+    session._safety_interlock_path = marker
+    arm_safety_interlock({"subject_id": "S1"}, marker)
+    session._safety_interlock_armed = True
+    session.bpod = MagicMock()
+    session.bpod.is_running = False
+    session.relay = FakeRelay()
+    session.dio = FakeDIO()
+    runtime = MagicMock()
+    pending = Future()
+    session._active_trial_runtime = runtime
+    session._output_verification_futures = [(runtime, pending)]
+    monkeypatch.setattr(
+        "hf_dm.session.controller.wait",
+        lambda *_args, **_kwargs: (set(), {pending}),
+    )
+
+    with pytest.raises(HardwareCleanupError) as caught:
+        session.close()
+
+    assert "output_verifier_drain" in {
+        item["stage"] for item in caught.value.errors
+    }
+    assert json.loads(marker.read_text(encoding="utf-8"))["state"] == "cleanup_failed"
+
+
+def test_connect_failure_before_relay_keeps_interlock_latched(tmp_path, monkeypatch):
+    marker = tmp_path / "rig-interlock.json"
+    config = SessionConfig(results_dir=str(tmp_path / "sessions"))
+    session = HFDecisionSession(config, run_mode="bench")
+    session._safety_interlock_path = marker
+    monkeypatch.setattr(
+        "hf_dm.session.controller.connect_bpod_core",
+        MagicMock(side_effect=OSError("Bpod unavailable")),
+    )
+
+    with pytest.raises(OSError, match="Bpod unavailable"):
+        session.connect()
+    with pytest.raises(HardwareCleanupError) as caught:
+        session.close()
+
+    assert {item["stage"] for item in caught.value.errors} == {
+        "task_outputs_off_unavailable"
+    }
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["state"] == "cleanup_failed"
 
 
 def test_bpod_state_handler_and_monitor_failures_still_run_every_all_off_stage(tmp_path):

@@ -418,6 +418,10 @@ class _SpinnakerCRecorder:
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=max(5.0, self._acquisition_timeout_ms / 1000.0 + 2.0))
+            if self._thread.is_alive():
+                self._error = "capture thread did not stop before SDK teardown"
+                self._preview_dispatcher.stop()
+                raise TimeoutError(self._error)
         self._preview_dispatcher.stop()
         self._stop_wall_s = time.time()
         cleanup_errors = self._cleanup()
@@ -980,6 +984,10 @@ class HeadlessSpinnakerRecorder:
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=max(5.0, self._acquisition_timeout_ms / 1000.0 + 2.0))
+            if self._thread.is_alive():
+                self._error = "capture thread did not stop before SDK teardown"
+                self._preview_dispatcher.stop()
+                raise TimeoutError(self._error)
         self._preview_dispatcher.stop()
         self._stop_wall_s = time.time()
         cleanup_error = self._cleanup_pyspin()

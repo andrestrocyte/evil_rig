@@ -231,6 +231,21 @@ def test_task_balancing_validation_rejects_impossible_forced_cap():
     assert "task.max_consecutive_forced" in fields
 
 
+def test_config_rejects_unbounded_reward_and_implicit_forced_overflow():
+    config = SessionConfig(n_trials=5)
+    config.reward.matched_pump_s = 2.0
+    config.task.n_forced_trials = 6
+    config.random_seed = "not-an-integer"  # type: ignore[assignment]
+    config.centering_threshold_deg = float("nan")
+
+    fields = {issue.field for issue in config_validation_issues(config)}
+
+    assert "reward.matched_pump_s" in fields
+    assert "task.n_forced_trials" in fields
+    assert "random_seed" in fields
+    assert "centering_threshold_deg" in fields
+
+
 def test_monitor_record_path_loads_from_yaml():
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "config.yaml"

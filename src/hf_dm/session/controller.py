@@ -96,7 +96,14 @@ class HFDecisionSession:
         animal_use_confirmed: bool = False,
     ):
         self.config = validate_session_config(config)
-        self.run_mode = run_mode
+        # A disabled animal-use gate is an explicit bench configuration.  Keep
+        # the task runnable as requested, but never label that acquisition as an
+        # animal-certified run.
+        self.run_mode = (
+            "bench"
+            if run_mode == "animal" and not self.config.animal_use.enabled
+            else run_mode
+        )
         self.animal_use_confirmed = bool(animal_use_confirmed)
         self.rng = random.Random(config.random_seed)
         self.reward_calibration = self._load_reward_calibration()
@@ -123,6 +130,7 @@ class HFDecisionSession:
         self._output_verification_lock = threading.Lock()
         self._output_verification_futures: list[tuple[TrialRuntime, Future[dict[str, Any]]]] = []
         self._output_verification_sequences: dict[int, int] = {}
+        self._output_verifier_drain_timed_out = False
         self._streamdio_status_poll_stop = threading.Event()
         self._streamdio_status_poll_thread: threading.Thread | None = None
         self._streamdio_module_status_snapshot_count = 0
@@ -407,6 +415,14 @@ class HFDecisionSession:
                         "task_outputs_cleanup_error",
                         {"error": f"{type(exc).__name__}: {exc}"},
                     )
+            elif self._safety_interlock_armed:
+                cleanup_failed(
+                    "task_outputs_off_unavailable",
+                    RuntimeError(
+                        "Live connection ended before a verified all-off relay path "
+                        "was available"
+                    ),
+                )
             if self.speaker_relay is not None:
                 try:
                     self.speaker_relay.speaker_gate(False)
@@ -1370,6 +1386,7 @@ class HFDecisionSession:
         normalized_channel = -1 if channel is None else int(channel)
         normalized_value = -1 if value is None else int(value)
         event_host_mono_s = time.perf_counter()
+        event_host_wall_s = time.time()
         if self._is_frame2ttl_edge(event_type, normalized_channel):
             self._record_frame2ttl_edge(
                 normalized_value,
@@ -1392,6 +1409,7 @@ class HFDecisionSession:
                 "module_timestamp_us": int(timestamp_us),
                 "relative_time_s": float(relative_time),
                 "host_perf_counter_s": float(event_host_mono_s),
+                "wall_time_s": float(event_host_wall_s),
             }
             self.recorder.log_event("bpod_state_marker", payload)
             self._publish_monitor("bpod_state_marker", payload)
@@ -1548,6 +1566,8 @@ class HFDecisionSession:
         }
         with self._frame2ttl_lock:
             self._frame2ttl_events.append(event)
+        if self.recorder is not None:
+            self.recorder.log_event("frame2ttl_edge", event)
         self._publish_monitor("frame2ttl_edge", event)
 
     def _frame2ttl_events_between(self, start_mono_s: float, end_mono_s: float) -> list[dict]:
@@ -2565,7 +2585,6 @@ class HFDecisionSession:
         channel_i = int(channel)
         with self._output_verification_lock:
             after_sequence = int(self._output_verification_sequences.get(channel_i, 0))
-            self._output_verification_sequences[channel_i] = after_sequence + 1
             future = self._output_verifier.submit(
                 self._verify_bpod_output,
                 runtime,
@@ -2596,6 +2615,13 @@ class HFDecisionSession:
     ) -> dict[str, Any]:
         assert self.dio is not None and self.recorder is not None
         try:
+            # The verifier has one worker.  Read the cursor when the job actually
+            # begins so an unexpected extra physical edge cannot desynchronize
+            # every later verification queued for this channel.
+            with self._output_verification_lock:
+                after_sequence = int(
+                    self._output_verification_sequences.get(int(channel), after_sequence)
+                )
             transition = self.dio.wait_for_output_event(
                 int(channel),
                 bool(state),
@@ -2603,6 +2629,11 @@ class HFDecisionSession:
                 timeout_s=self.config.timing.output_verification_timeout_s,
             )
             actual_mono_s = float(transition["event_host_perf_counter_s"])
+            with self._output_verification_lock:
+                self._output_verification_sequences[int(channel)] = max(
+                    int(after_sequence),
+                    int(transition.get("sequence", after_sequence)),
+                )
             event_payload = {
                 **payload,
                 "transition": transition,
@@ -2618,15 +2649,11 @@ class HFDecisionSession:
                 event_payload["actual_off_mono_s"] = actual_mono_s
                 self.recorder.log_event("force_off", event_payload)
             elif kind == "pump_on":
-                runtime.pump_actual_on_mono_s = actual_mono_s
+                runtime.record_pump_on(actual_mono_s)
                 event_payload["actual_on_mono_s"] = actual_mono_s
                 self.recorder.log_event("pump_start", event_payload)
             elif kind == "pump_off":
-                actual_open_s = (
-                    None
-                    if runtime.pump_actual_on_mono_s is None
-                    else actual_mono_s - runtime.pump_actual_on_mono_s
-                )
+                actual_open_s = runtime.pump_open_duration(actual_mono_s)
                 event_payload["actual_off_mono_s"] = actual_mono_s
                 event_payload["actual_open_s"] = actual_open_s
                 self.recorder.log_event("pump_end", event_payload)
@@ -2671,12 +2698,13 @@ class HFDecisionSession:
             ]
         if selected:
             done, pending = wait(selected, timeout=max(0.0, float(timeout_s)))
+            timeout_error: TimeoutError | None = None
             if pending:
-                runtime.fail(
-                    RuntimeError(
-                        f"Timed out draining {len(pending)} output verification jobs"
-                    )
+                timeout_error = TimeoutError(
+                    f"Timed out draining {len(pending)} output verification jobs"
                 )
+                self._output_verifier_drain_timed_out = True
+                runtime.fail(timeout_error)
             for future in done:
                 future.result()
         with self._output_verification_lock:
@@ -2685,15 +2713,21 @@ class HFDecisionSession:
                 for owner, future in self._output_verification_futures
                 if owner is not runtime
             ]
+        if selected and timeout_error is not None:
+            raise timeout_error
 
     def _shutdown_output_verifier(self) -> None:
         verifier = self._output_verifier
         self._output_verifier = None
         if verifier is not None:
-            verifier.shutdown(wait=True, cancel_futures=False)
+            verifier.shutdown(
+                wait=not self._output_verifier_drain_timed_out,
+                cancel_futures=self._output_verifier_drain_timed_out,
+            )
         with self._output_verification_lock:
             self._output_verification_futures.clear()
             self._output_verification_sequences.clear()
+        self._output_verifier_drain_timed_out = False
 
     def _prepare_bpod_run(self, trial_number: int) -> None:
         self._reset_output_verification_sequences()

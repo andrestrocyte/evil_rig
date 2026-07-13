@@ -25,7 +25,7 @@ def list_com_ports() -> list[dict[str, str]]:
     ports: list[dict[str, str]] = []
     for port in list_ports.comports():
         device = port.device or ""
-        if device.upper().startswith("COM"):
+        if device:
             ports.append(
                 {
                     "device": device,
@@ -117,7 +117,9 @@ def _infer_streamdio_pair(probes: dict[str, dict[str, Any]]) -> tuple[str, str] 
     candidates: list[tuple[str, str]] = []
     for ports in grouped.values():
         unique = sorted(set(ports))
-        if len(unique) < 2:
+        # A StreamDIO device has exactly two USB serial interfaces.  Guessing
+        # first/last in a larger composite group can select an unrelated port.
+        if len(unique) != 2:
             continue
         config_port = unique[0][1]
         stream_port = unique[-1][1]

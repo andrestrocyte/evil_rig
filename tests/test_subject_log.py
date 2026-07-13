@@ -1,5 +1,6 @@
 import json
 import sys
+from datetime import datetime, timedelta
 
 from hf_dm.config import SessionConfig, config_to_dict
 from hf_dm.data.recorder import (
@@ -135,6 +136,37 @@ def test_session_finalize_appends_total_calibrated_water(tmp_path):
         metric for metric in qc["metrics"] if metric["name"] == "subject_water_log"
     )
     assert water_metric["status"] == "PASS"
+
+
+def test_session_crossing_midnight_logs_water_on_start_date(tmp_path):
+    subjects_dir = tmp_path / "subjects"
+    config = SessionConfig(subject_id="mouse01", n_trials=1, results_dir=str(tmp_path))
+    config.welfare.subjects_dir = str(subjects_dir)
+    recorder = SessionRecorder(tmp_path, "mouse01", "decision_making")
+    recorder.set_export_options(config_to_dict(config)["session_export"])
+    recorder.set_metadata(
+        {
+            "config": config_to_dict(config),
+            "reward_calibration": {"sha256": "abc"},
+        }
+    )
+    recorder.add_trial(_trial(1, 4.0))
+    start = datetime(2026, 7, 13, 23, 59, 30)
+
+    recorder.finalize(
+        SessionSummary(
+            subject_id="mouse01",
+            phase="decision_making",
+            n_trials_planned=1,
+            n_trials_completed=1,
+            end_reason="completed",
+            consecutive_failures=0,
+            session_start_wall_s=start.timestamp(),
+            session_end_wall_s=(start + timedelta(minutes=2)).timestamp(),
+        )
+    )
+
+    assert load_subject_log(subjects_dir, "mouse01")[0]["date"] == "2026-07-13"
 
 
 def test_log_weight_cli_appends_entry(tmp_path, monkeypatch, capsys):

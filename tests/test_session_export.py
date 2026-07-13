@@ -12,6 +12,7 @@ from hf_dm.data.recorder import SessionRecorder, SessionSummary, TrialRecord
 from hf_dm.data.session_bundle import SessionBundle
 from hf_dm.data.session_export import (
     _clock_alignment,
+    _timeline_rows,
     export_existing_session,
     resolve_session_output,
     sha256_file,
@@ -1272,6 +1273,39 @@ def test_streamdio_failed_chunk_rows_fall_back_to_primary_npz(tmp_path, monkeypa
     assert validate_session(bundle)["valid"]
 
 
+def test_partial_chunk_failure_does_not_publish_incomplete_chunk_index(
+    tmp_path, monkeypatch
+):
+    cfg = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(tmp_path))
+    cfg.session_export.streamdio_chunk_s = 0.001
+    cfg.session_export.streamdio_memory_mode = "bounded"
+    recorder = SessionRecorder(tmp_path, cfg.subject_id, cfg.phase.value)
+    recorder.set_export_options(config_to_dict(cfg)["session_export"])
+    recorder.set_metadata({"config": config_to_dict(cfg)})
+    original = recorder_module._atomic_write_npz
+
+    def fail_middle_chunk(path, **arrays):
+        if "streamdio_chunk_001" in str(path):
+            raise OSError("one persistent chunk failure")
+        return original(path, **arrays)
+
+    monkeypatch.setattr(recorder_module, "_atomic_write_npz", fail_middle_chunk)
+    for index in range(6):
+        recorder.log_streamdio_event(
+            "analog_input", 13, index, 1000 + index, index * 0.002
+        )
+    recorder.add_trial(_trial())
+
+    recorder.finalize(_summary())
+
+    bundle = recorder.base_path.with_name(f"{recorder.base_path.name}_bundle")
+    assert not list((bundle / "continuous_streams").glob("streamdio_chunk_*.npz"))
+    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    assert "continuous_streams" not in manifest
+    assert manifest["counts"]["streamdio_events"] == 6
+    assert validate_session(bundle)["valid"]
+
+
 def test_bounded_finalize_prefers_complete_wal_over_incomplete_chunks(
     tmp_path,
     monkeypatch,
@@ -1387,6 +1421,42 @@ def test_optional_alyx_registration_writes_skipped_result_without_credentials(tm
     assert any("alyx registration invalid status" in error for error in result["errors"])
 
 
+def test_alyx_registration_is_idempotent_on_reexport(tmp_path, monkeypatch):
+    class Response:
+        status = 201
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return b'{"id":"session-1"}'
+
+    posts = []
+
+    def urlopen(request, timeout):
+        posts.append((request, timeout))
+        return Response()
+
+    monkeypatch.setattr("hf_dm.data.alyx_registration.urllib.request.urlopen", urlopen)
+    cfg = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(tmp_path))
+    cfg.integrations.mm_alyx_register = True
+    cfg.integrations.alyx_api_url = "https://alyx.example.test/api"
+    cfg.integrations.alyx_token = "token"
+    recorder = SessionRecorder(tmp_path, cfg.subject_id, cfg.phase.value)
+    recorder.set_export_options(config_to_dict(cfg)["session_export"])
+    recorder.set_metadata({"config": config_to_dict(cfg), "subject_id": "S1"})
+    recorder.add_trial(_trial())
+    recorder.finalize(_summary())
+
+    export_existing_session(recorder.base_path.with_suffix(".json"))
+
+    assert len(posts) == 1
+    assert posts[0][0].get_header("Idempotency-key")
+
+
 def test_mm_hierarchy_output_uses_date_and_run_folder(tmp_path):
     first, base_name = resolve_session_output(
         tmp_path,
@@ -1395,7 +1465,6 @@ def test_mm_hierarchy_output_uses_date_and_run_folder(tmp_path):
         layout="mm_hierarchy",
         now=datetime(2026, 6, 26, 12, 0, 0),
     )
-    first.mkdir(parents=True)
     second, second_base_name = resolve_session_output(
         tmp_path,
         subject_id="S1",
@@ -1406,8 +1475,37 @@ def test_mm_hierarchy_output_uses_date_and_run_folder(tmp_path):
 
     assert first == tmp_path / "decision_making" / "S1" / "2026-06-26" / "001"
     assert second == tmp_path / "decision_making" / "S1" / "2026-06-26" / "002"
+    assert first.is_dir()
+    assert second.is_dir()
     assert base_name == "session"
     assert second_base_name == "session"
+
+
+def test_timeline_uses_one_host_monotonic_clock_for_streamdio_rows():
+    events = [
+        {
+            "event_type": "session_start",
+            "monotonic_s": 100.0,
+            "wall_time_s": 1_000.0,
+            "payload": {},
+        }
+    ]
+    streamdio = [
+        {
+            "event_type": "camera",
+            "channel": -1,
+            "value": -1,
+            "module_timestamp_us": 999_000_000,
+            "relative_time_s": 999.0,
+            "host_perf_counter_s": 101.25,
+        }
+    ]
+
+    rows = _timeline_rows(events, streamdio)
+    camera = next(row for row in rows if row["source"] == "streamdio")
+
+    assert camera["session_mono_s"] == 1.25
+    assert camera["session_mono_s"] != streamdio[0]["relative_time_s"]
 
 
 def test_session_bundle_facade_wraps_recorder_and_stream_registration(tmp_path):

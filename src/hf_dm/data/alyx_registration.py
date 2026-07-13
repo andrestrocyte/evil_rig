@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -9,6 +10,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
 
 
 def maybe_write_alyx_registration(
@@ -23,6 +26,18 @@ def maybe_write_alyx_registration(
     config = (metadata.get("config") or {}).get("integrations") or {}
     if not bool(config.get("mm_alyx_register", False)):
         return None
+    path = exports_dir / "alyx_registration.json"
+    if path.exists():
+        try:
+            prior = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            prior = None
+        if (
+            isinstance(prior, dict)
+            and prior.get("status") == "registered"
+            and _same_session(prior.get("request_payload"), metadata, summary)
+        ):
+            return path
     result = register_alyx_session(
         manifest_path=manifest_path,
         bundle_dir=bundle_dir,
@@ -31,8 +46,7 @@ def maybe_write_alyx_registration(
         artifacts=artifacts,
         config=config,
     )
-    path = exports_dir / "alyx_registration.json"
-    path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    _atomic_write_json(path, result)
     return path
 
 
@@ -78,12 +92,24 @@ def register_alyx_session(
         },
     }
     body = json.dumps(payload).encode("utf-8")
+    idempotency_key = hashlib.sha256(
+        json.dumps(
+            {
+                "subject": payload["subject"],
+                "phase": payload["phase"],
+                "session_start_wall_s": payload["session_start_wall_s"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     request = urllib.request.Request(
         endpoint,
         data=body,
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Token {token}",
+            "Idempotency-Key": idempotency_key,
         },
         method="POST",
     )
@@ -102,6 +128,7 @@ def register_alyx_session(
                 "status_code": int(getattr(response, "status", 200)),
                 "response": parsed_body,
                 "request_payload": payload,
+                "idempotency_key": idempotency_key,
                 "duration_s": time.perf_counter() - started,
                 "created_wall_time_s": time.time(),
             }
@@ -111,6 +138,7 @@ def register_alyx_session(
             "endpoint": endpoint,
             "error": f"{type(exc).__name__}: {exc}",
             "request_payload": payload,
+            "idempotency_key": idempotency_key,
             "duration_s": time.perf_counter() - started,
             "created_wall_time_s": time.time(),
         }
@@ -119,6 +147,36 @@ def register_alyx_session(
 def _sessions_endpoint(api_url: str) -> str:
     base = api_url.rstrip("/")
     return base if base.endswith("/sessions") else f"{base}/sessions"
+
+
+def _same_session(
+    request_payload: Any,
+    metadata: dict[str, Any],
+    summary: dict[str, Any],
+) -> bool:
+    if not isinstance(request_payload, dict):
+        return False
+    return (
+        request_payload.get("subject")
+        == (metadata.get("subject_id") or summary.get("subject_id"))
+        and request_payload.get("phase")
+        == (metadata.get("phase") or summary.get("phase"))
+        and request_payload.get("session_start_wall_s")
+        == summary.get("session_start_wall_s")
+    )
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(payload, indent=2))
+            handle.flush()
+            fsync_best_effort(handle, path=temporary)
+        os.replace(temporary, path)
+        fsync_directory_best_effort(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _relative(path: Path, start: Path) -> str:

@@ -65,6 +65,13 @@ def _default_session_name(modality: str, profile_name: str) -> str:
     return f"{stamp}_{modality}_{safe_profile}"
 
 
+def _validated_session_name(value: str) -> str:
+    name = str(value).strip()
+    if not name or name in {".", ".."} or Path(name).name != name:
+        raise ValueError("session name must be a non-empty folder name, not a path")
+    return name
+
+
 def _setup_from_values(
     *,
     mouse_dir: Path,
@@ -79,7 +86,9 @@ def _setup_from_values(
     profile_free, profile_forced = PROFILE_COUNTS[profile_name]
     free = profile_free if n_free_trials is None else max(0, int(n_free_trials))
     forced = profile_forced if n_forced_trials is None else max(0, int(n_forced_trials))
-    name = session_name or _default_session_name(modality, profile_name)
+    name = _validated_session_name(
+        session_name or _default_session_name(modality, profile_name)
+    )
     selected_mouse_dir = Path(mouse_dir)
     return SessionSetup(
         selected_mouse_dir=str(selected_mouse_dir),
@@ -702,6 +711,23 @@ def main() -> None:
                 )
                 config.n_trials = int(free) + int(config.task.n_forced_trials)
                 session_arg_overrides["n_trials"] = config.n_trials
+            if args.session_name is not None:
+                session_name = _validated_session_name(args.session_name)
+                session_dir = Path(config.results_dir) / session_name
+                session_dir.mkdir(parents=True, exist_ok=True)
+                (session_dir / "videos").mkdir(parents=True, exist_ok=True)
+                config.task.session_name = session_name
+                config.task.session_dir = str(session_dir)
+                config.results_dir = str(session_dir)
+                config.camera.save_dir = str(session_dir / "videos")
+                session_arg_overrides.update(
+                    {
+                        "task.session_name": session_name,
+                        "task.session_dir": str(session_dir),
+                        "results_dir": str(session_dir),
+                        "camera.save_dir": str(session_dir / "videos"),
+                    }
+                )
             _record_cli_override(
                 config,
                 source="hf-dm-run session arguments",
@@ -719,6 +745,22 @@ def main() -> None:
                 "animal_present": False,
                 "certification_required": False,
             },
+        )
+    elif (
+        not config.animal_use.enabled
+        and not args.simulate
+        and not args.hardware_self_test
+        and not args.preflight
+        and not args.cap_touch_diagnostic
+        and not any(frame2ttl_modes)
+    ):
+        logging.warning(
+            "ANIMAL-USE CERTIFICATION IS DISABLED: this acquisition is labeled bench mode"
+        )
+        _record_cli_override(
+            config,
+            source="animal_use.enabled=false",
+            values={"run_mode": "bench", "certification_required": False},
         )
     _load_saved_operator_state(config)
     validate_session_config(config)
@@ -780,7 +822,12 @@ def main() -> None:
         )
         session = HardwareSelfTestSession(config)
     else:
-        bench_mode = bool(args.preflight or any(frame2ttl_modes) or uncertified_bench)
+        bench_mode = bool(
+            args.preflight
+            or any(frame2ttl_modes)
+            or uncertified_bench
+            or not config.animal_use.enabled
+        )
         animal_use_confirmed = args.confirm_animal_use
         if not bench_mode and config.animal_use.enabled:
             animal_use_confirmed = _remediate_animal_use_gate(

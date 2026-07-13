@@ -539,6 +539,21 @@ def test_simulated_frame2ttl_barcode_decodes_when_quiescence_allows_full_code(tm
     assert trial.frame2ttl_barcode_match
     assert trial.frame2ttl_first_ttl_timestamp_us is not None
     assert trial.frame2ttl_first_ttl_latency_from_bpod_s is not None
+    assert any(
+        event.event_type == "frame2ttl_edge" for event in session.recorder.events
+    )
+
+
+def test_simulated_video_normalizes_relative_output_path(tmp_path, monkeypatch):
+    from hf_dm.session.simulated import SimulatedVideoRecorder
+
+    monkeypatch.chdir(tmp_path)
+    recorder = SimulatedVideoRecorder(
+        Path("relative-videos"), "mouse", "decision_making"
+    )
+
+    assert recorder.session_dir.is_absolute()
+    assert recorder.start().is_dir()
 
 
 def test_simulated_frame2ttl_diagnostic_counts_sync_square_edges(tmp_path):

@@ -373,6 +373,27 @@ class StreamDIOClient:
                             "relative_time_s": float(relative_s),
                             "event_host_perf_counter_s": float(host_mono_s),
                         }
+                # A busy or faulting channel can advance beyond the bounded
+                # history ring.  The latest physical event remains a valid
+                # observation of the requested post-cursor state.
+                latest_sequence = int(self._output_sequences[channel_i])
+                latest = self._output_events.get(channel_i)
+                if (
+                    latest is not None
+                    and latest_sequence > int(after_sequence)
+                    and int(latest[0]) == state_i
+                ):
+                    return {
+                        "channel": channel_i,
+                        "state": state_i,
+                        "event_verified": True,
+                        "actuator": "bpod_fsm_serial",
+                        "sequence": latest_sequence,
+                        "module_timestamp_us": int(latest[1]),
+                        "relative_time_s": float(latest[2]),
+                        "event_host_perf_counter_s": float(latest[3]),
+                        "verification_reason": "latest_physical_event",
+                    }
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0.0:
                     break
@@ -546,14 +567,21 @@ class StreamDIOClient:
     def close(self) -> None:
         if self._dio is None:
             return
-        try:
-            self.stop_streaming()
-            self.stop_camera()
-            self._dio.close()
-        except Exception:
-            pass
+        errors: list[str] = []
+        dio = self._dio
+        for stage, operation in (
+            ("stop_streaming", self.stop_streaming),
+            ("stop_camera", self.stop_camera),
+            ("driver_close", dio.close),
+        ):
+            try:
+                operation()
+            except BaseException as exc:
+                errors.append(f"{stage}: {type(exc).__name__}: {exc}")
         self._dio = None
         self._callback = None
+        if errors:
+            raise RuntimeError("StreamDIO close failed: " + "; ".join(errors))
 
     @property
     def raw(self) -> Any:

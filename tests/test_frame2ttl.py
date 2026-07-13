@@ -105,3 +105,22 @@ def test_frame2ttl_count_barcode_stays_short_and_covers_trial_kinds():
         assert decoded["decoded"]
         assert decoded["pulse_groups"] == expected_groups
         assert decoded["word"] == code.word
+
+
+def test_frame2ttl_decoder_rejects_data_pulses_without_preamble():
+    frame_period_s = 1 / 60
+    # Two otherwise valid-looking pulse groups, but no 12-frame preamble.
+    states = (
+        [True] * 6
+        + [False] * 9
+        + [True] * 6
+        + [False] * 6
+        + [True] * 6
+        + [False] * 9
+    )
+    events = _events_from_states(states, frame_period_s=frame_period_s)
+
+    decoded = decode_frame2ttl_barcode_events(events, frame_period_s=frame_period_s)
+
+    assert not decoded["decoded"]
+    assert decoded["reason"] == "preamble_not_found"
