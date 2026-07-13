@@ -52,8 +52,9 @@ responsibility:
 
 - **Bpod owns trial time** — quiescence, choice timeout, reward, and timeout states run on the Bpod
   state-machine clock, not on the host OS scheduler.
-- **Python owns the visual loop and I/O** — it renders the wheel-coupled display at 60 Hz, reads the
-  StreamDIO event stream, detects the centered choice, and drives verified reward/force outputs.
+- **Python owns the visual loop and supervision** — it renders the wheel-coupled display at 60 Hz,
+  reads the StreamDIO event stream, detects the centered choice, and verifies pump/force outputs
+  from timestamped `dio_output` events (Bpod FSM actuates via Serial1).
 - **StreamDIO owns the fast, timestamped data stream** — wheel pulses, force ADC, licks, camera
   TTLs, Frame2TTL edges, and Bpod state markers are all timestamped by one module clock.
 
@@ -69,7 +70,7 @@ QC) on a compact, hardware-specific stack.
 | **Trial control** | Bpod-core FSM owns quiescence, 20 s choice timeout, reward, and timeout; host supervises the wheel/display at 60 Hz |
 | **Effort paradigm** | Star (high-effort/high-reward) vs circle (low-effort/low-reward) with pixel-matched masks; `force`, `risk`, and `delay` modalities |
 | **Screen sync** | Frame2TTL v3 photodiode + per-trial pulse-count **barcode** + 1 ms Bpod `*_Pre` state markers |
-| **Verified outputs** | Pump/force/cap-touch over StreamDIO USB require both a USB ack and a timestamped physical `dio_output` event |
+| **Verified outputs** | Bpod FSM actuates pump/force via Serial1; each transition must produce a timestamped physical `dio_output` event on StreamDIO |
 | **Video** | Headless Spinnaker (FLIR) recording with per-frame camera + host timestamps; optional offline FFV1 preview |
 | **Multi-clock data** | Wall + monotonic `perf_counter` + StreamDIO module timestamps, with an export-time affine alignment fit |
 | **Crash safety** | Append-only `session.journal.jsonl`, fsync per completed trial, atomic NPZ/JSON writes, `recover-session` |
@@ -92,7 +93,7 @@ flowchart TB
         REC["SessionRecorder<br/>NPZ / JSON / journal"]
         CAM["Headless Spinnaker<br/>video recorder"]
         MON["Operator monitor<br/>(separate process)"]
-        SND["Continuous white noise<br/>(PC sound)"]
+        SND["PC white noise +<br/>pin-27 gate (timeout)"]
     end
 
     subgraph BPOD["Bpod State Machine"]
@@ -109,8 +110,9 @@ flowchart TB
     LOOP -->|"SoftCodes: movement, choice"| FSM
     FSM -->|"state-entry SoftCodes"| LOOP
     FSM --> GATE
-    LOOP -->|"verified USB commands"| OUT
+    FSM -->|"Serial1 pump/force"| OUT
     IN -->|"timestamped event stream"| LOOP
+    OUT -.->|"dio_output verification"| LOOP
     FSM -->|"Serial1 [S, state_id]"| MARK
     LOOP --> REC
     LOOP --> DISP
@@ -123,9 +125,9 @@ flowchart TB
 
 | Component | Owns | Does **not** own |
 |-----------|------|------------------|
-| **Python supervisor** | display, wheel reading, choice detection, output triggering, data | trial timing authority |
-| **Bpod FSM** | trial clock (quiescence, timeout, reward, blank, post states), speaker gate | display, wheel reading |
-| **StreamDIO** | timestamped input stream + verified outputs + state markers | decision logic |
+| **Python supervisor** | display, wheel reading, choice SoftCodes, output verification, cleanup all-off, data | trial timing authority, pump/force actuation during trials |
+| **Bpod FSM** | trial clock (quiescence, timeout, reward, blank, post states), pump/force timing, speaker gate | display, wheel reading |
+| **StreamDIO** | timestamped input stream, physical outputs, state markers | decision logic |
 
 The task does **not** read rig parameters from a sister checkout — all pin/channel/timing defaults
 live in `src/hf_dm/hardware/bringup_constants.py` and `configs/*.yaml`. `MM_PyBpod2` is needed only
@@ -166,11 +168,12 @@ stateDiagram-v2
    state, turns force off, waits `choice_blank_s`, runs the pump state, then holds `post_reward_s`.
 4. **Timeout:** Bpod enters the timeout state, gates audible white noise on pin 27 for
    `timeout_noise_s`, then holds `post_timeout_s`.
-5. A fresh FSM starts the next trial — there is no host-side choice wait or extra ITI.
+5. After the FSM completes, the host holds a black screen for `inter_trial_min_s` (default 3 s,
+   logged as `iti_start`/`iti_end`), then a fresh FSM starts the next trial.
 
-Pump and effort outputs use the low-latency, **verified** StreamDIO USB path: each requires a USB
-acknowledgement **and** a timestamped physical `dio_output` event. Bpod controls *when* via
-state-entry output SoftCodes.
+Pump and effort outputs are actuated by the Bpod FSM over Serial1 and **verified** on StreamDIO:
+each transition must produce a timestamped physical `dio_output` event. The host observes those
+events asynchronously and does not re-actuate during normal trials.
 
 **Modalities** (`task.modality`): `force` applies a physical force cue toward the star side;
 `risk` makes the star reward probabilistic (`risk_star_probability`); `delay` adds
@@ -213,8 +216,9 @@ same discovery logic as the screen task.
 
 ## Installation
 
-**Requirements:** Python ≥ 3.10, a Windows rig (same as the bringups) for live hardware, Bpod State
-Machine 2+. Tests and simulation are hardware-free and cross-platform.
+**Requirements:** Python ≥ 3.10 (CI and `requirements.lock` use **3.12**), a Windows rig (same as the
+bringups) for live hardware, Bpod State Machine 2+. Tests and simulation are hardware-free and
+cross-platform.
 
 ```bash
 cd /path/to/bpod-hf-dm
@@ -343,6 +347,7 @@ hardware opens. Three profiles ship in `configs/`:
 | `video` | cold export | `export_spinnaker_summary`, `duplicate_preview_video`, `preview_video_codec` FFV1 |
 | `integrations` | optional | `mm_soundcard_status`, `mm_alyx_register`, `mm_flir_roi_gui`, `alyx_*` |
 | `welfare` | colony | `subjects_dir` subjects, `water_target_ml`, `append_session_water` |
+| `animal_use` | release gate | `enabled`, `certification_path`, age/residual limits, `require_clean_git`, `require_local_storage`, peripheral requirements, `hardware_failsafe_revision` |
 | `monitor` | operator GUI | `enabled`, `display_index` 0, sizes, sample rates, `streamdio_status_interval_s` 30, `record_path` |
 | `session_export` | data products | `layout` (`mm_hierarchy`/`flat`), `manifest`, `config_snapshot`, `export_csv_on_finalize`, `export_timeline`, `streamdio_chunk_s`, `streamdio_memory_mode`, `streamdio_recent_events`, `streamdio_wal_fsync_s` |
 
@@ -627,6 +632,7 @@ non-zero exit code.
 | Flag group | Flags |
 |------------|-------|
 | Core | `--config` (required), `--confirm-animal-use` for one certified animal run, `-v/--verbose` |
+| Animal / bench | `--allow-uncertified` + `--confirm-no-animal` for explicit bench runs; `--no-certification-dialog` to skip the readiness GUI |
 | Modes | `--simulate`, `--preflight`, `--hardware-self-test`, `--cap-touch-diagnostic`, `--frame2ttl-diagnostic`, `--frame2ttl-barcode-diagnostic`, `--bpod-opcode-diagnostic` |
 | Simulation | `--simulate-headless`, `--simulate-choice-mode`, `--simulate-trials` |
 | Monitor | `--monitor`, `--no-monitor` |
@@ -723,7 +729,8 @@ src/hf_dm/
 ├── camera/                 # Spinnaker recorder + ROI GUI
 ├── monitor/                # operator GUI
 ├── data/                   # recorder, session_export, session_bundle, video_export, alyx
-├── session_qc.py, valve_calibration.py, subject_log.py, validation.py
+├── certification.py, rig_certification.py, certification_gui.py, safety_interlock.py
+├── session_qc.py, valve_calibration.py, subject_log.py, validation.py, durable_io.py
 └── hardware/               # bringup_constants, discovery
 configs/                    # centering_50, dm_50, dm_100, dm_200
 firmware/                   # vendored StreamDIO firmware + ArCOM
