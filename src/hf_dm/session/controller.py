@@ -261,54 +261,57 @@ class HFDecisionSession:
                     self._wait_for_bpod_trial_threads()
                 except Exception:
                     logger.exception("Failed to abort active Bpod trial during cleanup")
-            self._stop_streamdio_status_poll()
+            try:
+                self._stop_streamdio_status_poll()
+            except Exception:
+                logger.exception("Failed to stop StreamDIO status polling")
             if self.relay is not None:
                 try:
                     result = self.relay.task_outputs_off()
                     cleanup_result.update(result)
-                    if self.recorder is not None:
-                        self.recorder.log_event("task_outputs_cleanup_verified", result)
+                    self._safe_log_event("task_outputs_cleanup_verified", result)
                 except Exception as exc:
                     logger.exception("Failed to make task outputs safe")
-                    if self.recorder is not None:
-                        self.recorder.log_event(
-                            "task_outputs_cleanup_error",
-                            {"error": f"{type(exc).__name__}: {exc}"},
-                        )
+                    self._safe_log_event(
+                        "task_outputs_cleanup_error",
+                        {"error": f"{type(exc).__name__}: {exc}"},
+                    )
             if self.speaker_relay is not None:
                 try:
                     self.speaker_relay.speaker_gate(False)
                     cleanup_result["speaker_gate"] = "off"
-                    if self.recorder is not None:
-                        self.recorder.log_event("speaker_gate_cleanup", {"state": "off"})
+                    self._safe_log_event("speaker_gate_cleanup", {"state": "off"})
                 except Exception as exc:
                     logger.exception("Failed to turn off Bpod speaker gate")
-                    if self.recorder is not None:
-                        self.recorder.log_event(
-                            "speaker_gate_cleanup_error",
-                            {"error": f"{type(exc).__name__}: {exc}"},
-                        )
+                    self._safe_log_event(
+                        "speaker_gate_cleanup_error",
+                        {"error": f"{type(exc).__name__}: {exc}"},
+                    )
             if self.white_noise_player is not None:
-                if self.recorder is not None:
-                    self.recorder.log_event(
+                try:
+                    self._safe_log_event(
                         "white_noise_shutdown",
                         {"status": self._sound_status()},
                     )
-                self.white_noise_player.stop()
-                self.white_noise_player = None
+                    self.white_noise_player.stop()
+                except Exception:
+                    logger.exception("Failed to stop white-noise playback")
+                finally:
+                    self.white_noise_player = None
             if self.dio is not None:
                 try:
                     self.dio.stop_camera()
-                    if self.recorder is not None:
-                        self.recorder.log_event("streamdio_camera_triggers_stopped", {})
+                    self._safe_log_event("streamdio_camera_triggers_stopped", {})
                 except Exception as exc:
                     logger.exception("Failed to stop StreamDIO camera triggers")
-                    if self.recorder is not None:
-                        self.recorder.log_event(
-                            "streamdio_camera_stop_error",
-                            {"error": f"{type(exc).__name__}: {exc}"},
-                        )
-            self._stop_optional_video_recording()
+                    self._safe_log_event(
+                        "streamdio_camera_stop_error",
+                        {"error": f"{type(exc).__name__}: {exc}"},
+                    )
+            try:
+                self._stop_optional_video_recording()
+            except Exception:
+                logger.exception("Failed to finish optional video cleanup")
             if self.relay is not None:
                 try:
                     cap_touch_off = self.relay.cap_touch_power(False)
@@ -329,41 +332,50 @@ class HFDecisionSession:
                         },
                     )
                     cleanup_result["cap_touch_power"] = cap_touch_off
-                    if self.recorder is not None:
-                        self.recorder.log_event("all_off_cleanup_verified", cleanup_result)
+                    self._safe_log_event("all_off_cleanup_verified", cleanup_result)
                 except Exception as exc:
                     logger.exception("Failed to turn off cap-touch power")
-                    if self.recorder is not None:
-                        self.recorder.log_event(
-                            "cap_touch_power_off_error",
-                            {"error": f"{type(exc).__name__}: {exc}"},
-                        )
+                    self._safe_log_event(
+                        "cap_touch_power_off_error",
+                        {"error": f"{type(exc).__name__}: {exc}"},
+                    )
             if self.dio is not None:
                 try:
                     self.dio.close()
                     self._update_streamdio_buffer_summary()
                 except Exception as exc:
                     logger.exception("Failed to close StreamDIO")
-                    if self.recorder is not None:
-                        self.recorder.log_event(
-                            "streamdio_close_error",
-                            {"error": f"{type(exc).__name__}: {exc}"},
-                        )
+                    self._safe_log_event(
+                        "streamdio_close_error",
+                        {"error": f"{type(exc).__name__}: {exc}"},
+                    )
             if self.bpod is not None:
                 try:
                     self.bpod.set_softcode_handler(None)
                     self.bpod.close()
                 except Exception as exc:
                     logger.exception("Failed to close Bpod")
-                    if self.recorder is not None:
-                        self.recorder.log_event(
-                            "bpod_close_error",
-                            {"error": f"{type(exc).__name__}: {exc}"},
-                        )
+                    self._safe_log_event(
+                        "bpod_close_error",
+                        {"error": f"{type(exc).__name__}: {exc}"},
+                    )
         finally:
-            if stop_monitor:
-                self._stop_operator_monitor()
-            self._closed = True
+            try:
+                if stop_monitor:
+                    self._stop_operator_monitor()
+            except Exception:
+                logger.exception("Failed to stop operator monitor during cleanup")
+            finally:
+                self._closed = True
+
+    def _safe_log_event(self, event_type: str, payload: dict | None = None) -> None:
+        """Keep recorder failures from interrupting hardware cleanup."""
+        if self.recorder is None:
+            return
+        try:
+            self.recorder.log_event(event_type, payload)
+        except Exception:
+            logger.exception("Failed to record cleanup event %s", event_type)
 
     def _bpod_serial_ports(self) -> set[str]:
         if self.bpod is None:

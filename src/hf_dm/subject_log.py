@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import threading
 import time
 import uuid
@@ -12,6 +11,8 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
+
+from hf_dm.durable_io import fsync_best_effort
 
 _LOG_LOCK = threading.RLock()
 
@@ -112,7 +113,7 @@ def append_subject_entry(
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
             handle.flush()
-            os.fsync(handle.fileno())
+            fsync_best_effort(handle, path=path)
     return {"path": str(path), "entry": row, "appended": True}
 
 
