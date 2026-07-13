@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import os
+import platform
 import queue
 import struct
 import subprocess
+import sys
 import threading
 import time
 import zlib
@@ -32,6 +36,50 @@ _STREAMDIO_WAL_RECORD_V1 = _STREAMDIO_WAL_PAYLOAD
 _STREAMDIO_WAL_RECORD = struct.Struct("<24siiQddI")
 
 
+def _git_identity(candidate: Path) -> dict[str, str | bool | None]:
+    identity: dict[str, str | bool | None] = {
+        "git_commit": None,
+        "git_dirty": None,
+        "git_root": None,
+    }
+    try:
+        root_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(candidate),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if root_result.returncode != 0:
+            return identity
+        root = Path(root_result.stdout.strip()).resolve()
+        identity["git_root"] = str(root)
+        commit_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(root),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if commit_result.returncode == 0:
+            identity["git_commit"] = commit_result.stdout.strip() or None
+        dirty_result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=str(root),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if dirty_result.returncode == 0:
+            identity["git_dirty"] = bool(dirty_result.stdout.strip())
+    except Exception:
+        pass
+    return identity
+
+
 def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
     """Capture code identity once, before acquisition artifacts are created."""
     try:
@@ -44,51 +92,57 @@ def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
         if cwd is not None
         else [Path(__file__).resolve().parents[3], Path.cwd()]
     )
-    git_commit: str | None = None
-    git_dirty: bool | None = None
-    git_root: str | None = None
+    task_git: dict[str, str | bool | None] = {
+        "git_commit": None,
+        "git_dirty": None,
+        "git_root": None,
+    }
     for candidate in candidates:
-        try:
-            root_result = subprocess.run(
-                ["git", "rev-parse", "--show-toplevel"],
-                cwd=str(candidate),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-            )
-            if root_result.returncode != 0:
-                continue
-            root = Path(root_result.stdout.strip())
-            commit_result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=str(root),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-            )
-            dirty_result = subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=normal"],
-                cwd=str(root),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-            )
-            if commit_result.returncode != 0 or dirty_result.returncode != 0:
-                continue
-            git_commit = commit_result.stdout.strip() or None
-            git_dirty = bool(dirty_result.stdout.strip())
-            git_root = str(root)
+        task_git = _git_identity(candidate)
+        if task_git["git_root"] is not None:
             break
-        except Exception:
-            continue
+
+    package_versions: dict[str, str | None] = {}
+    for distribution in ("bpod-hf-dm", "bpod-core", "numpy", "PyYAML", "pyserial", "pygame"):
+        try:
+            package_versions[distribution] = version(distribution)
+        except PackageNotFoundError:
+            package_versions[distribution] = None
+
+    streamdio_driver: dict[str, Any] = {
+        "module": "pybpod_streamDIO_module",
+        "module_path": None,
+        "git_commit": None,
+        "git_dirty": None,
+        "git_root": None,
+    }
+    try:
+        driver_spec = importlib.util.find_spec("pybpod_streamDIO_module")
+        if driver_spec is not None and driver_spec.origin:
+            driver_path = Path(driver_spec.origin).resolve()
+            streamdio_driver["module_path"] = str(driver_path)
+            streamdio_driver.update(_git_identity(driver_path.parent))
+    except Exception:
+        pass
+
+    lock_sha256: str | None = None
+    task_root_value = task_git.get("git_root")
+    if isinstance(task_root_value, str):
+        try:
+            lock_sha256 = hashlib.sha256(
+                (Path(task_root_value) / "requirements.lock").read_bytes()
+            ).hexdigest()
+        except OSError:
+            pass
     return {
-        "git_commit": git_commit,
-        "git_dirty": git_dirty,
-        "git_root": git_root,
+        **task_git,
         "package_version": package_version,
+        "package_versions": package_versions,
+        "python_version": sys.version,
+        "python_executable": sys.executable,
+        "platform": platform.platform(),
+        "requirements_lock_sha256": lock_sha256,
+        "streamdio_driver": streamdio_driver,
         "provenance_captured_wall_s": time.time(),
     }
 
@@ -244,7 +298,12 @@ class SessionRecorder:
         journal_mode: JournalMode = "new",
         runtime_provenance: dict[str, Any] | None = None,
     ):
-        self.out_dir = Path(out_dir)
+        # Acquisition runs alongside native camera/audio libraries.  Some vendor
+        # libraries temporarily change the process working directory, which is
+        # process-wide on Windows and can affect unrelated Python threads.  Keep
+        # every durable recorder path absolute so periodic WAL fsyncs cannot race
+        # those native calls and resolve the session path somewhere else.
+        self.out_dir = Path(out_dir).expanduser().resolve()
         self.out_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.base_path = self.out_dir / (base_name or f"{subject_id}_{phase}_{stamp}")
@@ -295,6 +354,7 @@ class SessionRecorder:
         self._streamdio_wal_fsync_thread: threading.Thread | None = None
         self._streamdio_wal_fsync_count = 0
         self._streamdio_wal_background_error: str | None = None
+        self._streamdio_events_rejected_after_wal_error = 0
         self._journal_handle: Any = None
         self._journal_lock = threading.RLock()
         self._journal_sequence = 0
@@ -524,6 +584,12 @@ class SessionRecorder:
         relative_time_s: float,
     ) -> None:
         """Append one raw StreamDIO event without expensive per-sample object logging."""
+        # The first WAL failure is raised to the StreamDIO callback and latched.
+        # Further high-rate samples must not produce thousands of callback
+        # exceptions while the main task thread is arranging a safe abort.
+        if self._streamdio_wal_background_error is not None:
+            self._streamdio_events_rejected_after_wal_error += 1
+            return
         row = (
             str(event_type),
             -1 if channel is None else int(channel),
@@ -532,9 +598,14 @@ class SessionRecorder:
             float(relative_time_s),
             time.perf_counter(),
         )
+        try:
+            self._append_streamdio_wal(row)
+        except BaseException as exc:
+            self._set_streamdio_wal_background_error(exc)
+            self.raise_if_background_error()
+            raise AssertionError("unreachable")
         self._streamdio_total_count += 1
         self._streamdio_counts[row[0]] += 1
-        self._append_streamdio_wal(row)
         self.streamdio_events.append(row)
         self._prune_streamdio_events_if_needed()
         self._max_streamdio_event_count = max(
@@ -687,6 +758,9 @@ class SessionRecorder:
                         "streamdio_wal_background_error": (
                             self._streamdio_wal_background_error
                         ),
+                        "streamdio_events_rejected_after_wal_error": (
+                            self._streamdio_events_rejected_after_wal_error
+                        ),
                         "streamdio_memory_mode": self._streamdio_memory_mode,
                         "streamdio_total_count": self._streamdio_total_count,
                         "streamdio_recent_in_memory_count": len(self.streamdio_events),
@@ -817,7 +891,6 @@ class SessionRecorder:
         self,
         row: tuple[str, int, int, int, float, float],
     ) -> None:
-        self.raise_if_background_error()
         self._start_streamdio_wal_fsync_worker()
         event_type = row[0].encode("utf-8")
         if len(event_type) > 24:
@@ -866,7 +939,7 @@ class SessionRecorder:
                 self._sync_streamdio_wal()
                 self._streamdio_wal_fsync_count += 1
             except BaseException as exc:
-                self._streamdio_wal_background_error = f"{type(exc).__name__}: {exc}"
+                self._set_streamdio_wal_background_error(exc)
                 return
 
     def _stop_streamdio_wal_fsync_worker(self) -> None:
@@ -881,10 +954,25 @@ class SessionRecorder:
                 )
 
     def _sync_streamdio_wal(self) -> bool:
+        # Duplicate the open descriptor while holding the append lock, then do
+        # the potentially slow filesystem flush after releasing that lock.  The
+        # high-rate StreamDIO callback is therefore never held up by fsync.  The
+        # absolute path remains as a fallback during recovery/finalization.
+        sync_fd: int | None = None
+        with self._streamdio_wal_lock:
+            if self._streamdio_wal_handle is not None:
+                sync_fd = os.dup(self._streamdio_wal_handle.fileno())
+        if sync_fd is not None:
+            with os.fdopen(sync_fd, "rb", buffering=0) as sync_handle:
+                return fsync_best_effort(sync_handle, path=self._streamdio_wal_path)
         if not self._streamdio_wal_path.exists():
             return True
         with self._streamdio_wal_path.open("r+b", buffering=0) as sync_handle:
             return fsync_best_effort(sync_handle, path=self._streamdio_wal_path)
+
+    def _set_streamdio_wal_background_error(self, exc: BaseException) -> None:
+        if self._streamdio_wal_background_error is None:
+            self._streamdio_wal_background_error = f"{type(exc).__name__}: {exc}"
 
     def raise_if_background_error(self) -> None:
         if self._streamdio_wal_background_error is not None:
@@ -907,10 +995,13 @@ class SessionRecorder:
             if self._streamdio_wal_handle is None:
                 return
             self._streamdio_wal_handle.flush()
+            if durable:
+                fsync_best_effort(
+                    self._streamdio_wal_handle,
+                    path=self._streamdio_wal_path,
+                )
             self._streamdio_wal_handle.close()
             self._streamdio_wal_handle = None
-        if durable:
-            self._sync_streamdio_wal()
 
     def _prune_streamdio_events_if_needed(self) -> None:
         if not self._streamdio_memory_bounded or self._streamdio_recent_max_events <= 0:
@@ -1461,6 +1552,18 @@ def recover_session_journal(
         recorder.export_options.get("streamdio_memory_mode", "full")
     )
     recorder._streamdio_memory_bounded = bool(recorder._streamdio_chunk_files) and not wal_rows
+
+    # A hard exit can leave the last time chunk only in the WAL.  The WAL is the
+    # authoritative complete stream, so rebuild every chunk from it instead of
+    # publishing a manifest whose continuous-stream count omits the tail.
+    if wal_rows and recorder._streamdio_chunk_s > 0.0:
+        for prior_chunk in chunk_dir.glob("streamdio_chunk_*.npz"):
+            prior_chunk.unlink()
+        recorder._streamdio_chunk_files.clear()
+        recorder._streamdio_chunk_index = 0
+        recorder._configure_streamdio_chunking()
+        for stream_row in recovered_streamdio:
+            recorder._buffer_streamdio_chunk(stream_row)
 
     recorder.log_event(
         "session_recovered",

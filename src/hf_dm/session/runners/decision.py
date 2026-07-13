@@ -90,10 +90,10 @@ class BpodDecisionEpochRunner:
         final_left_deg = -self.config.display.choice_distance_deg
         final_right_deg = self.config.display.choice_distance_deg
         frame_count = 0
-        frame_interval_sum_s = 0.0
-        frame_interval_max_s = 0.0
+        choice_loop_iteration_count = 0
+        choice_loop_interval_sum_s = 0.0
+        choice_loop_interval_max_s = 0.0
         stall_count = 0
-        previous_frame_mono_s: float | None = None
         previous_choice_loop_mono_s: float | None = None
         stimulus_visible = False
         last_drawn_choice_signature: tuple[float, float, str | None] | None = None
@@ -214,6 +214,11 @@ class BpodDecisionEpochRunner:
                     loop_mono_s = time.perf_counter()
                     if previous_choice_loop_mono_s is not None:
                         loop_interval_s = loop_mono_s - previous_choice_loop_mono_s
+                        choice_loop_interval_sum_s += loop_interval_s
+                        choice_loop_interval_max_s = max(
+                            choice_loop_interval_max_s,
+                            loop_interval_s,
+                        )
                         if loop_interval_s >= stall_threshold_s:
                             stall_count += 1
                             self.recorder.log_debug_event(
@@ -226,6 +231,7 @@ class BpodDecisionEpochRunner:
                                 },
                             )
                     previous_choice_loop_mono_s = loop_mono_s
+                    choice_loop_iteration_count += 1
                     if (
                         frame2ttl_barcode_states
                         and frame2ttl_barcode_index < len(frame2ttl_barcode_states)
@@ -260,12 +266,6 @@ class BpodDecisionEpochRunner:
                         draw_signature != last_drawn_choice_signature
                     )
                     if should_draw:
-                        frame_mono_s = time.perf_counter()
-                        if previous_frame_mono_s is not None:
-                            interval_s = frame_mono_s - previous_frame_mono_s
-                            frame_interval_sum_s += interval_s
-                            frame_interval_max_s = max(frame_interval_max_s, interval_s)
-                        previous_frame_mono_s = frame_mono_s
                         frame_count += 1
                         sync_square_state = None
                         if (
@@ -580,9 +580,9 @@ class BpodDecisionEpochRunner:
             outcome=str(wheel_choice),
             start_mono_s=choice_start_mono_s or choice_end_mono_s,
             end_mono_s=choice_end_mono_s,
-            frame_count=frame_count,
-            frame_interval_sum_s=frame_interval_sum_s,
-            frame_interval_max_s=frame_interval_max_s,
+            frame_count=choice_loop_iteration_count,
+            frame_interval_sum_s=choice_loop_interval_sum_s,
+            frame_interval_max_s=choice_loop_interval_max_s,
             stall_count=stall_count,
             reward_duration_s=reward_s,
         )

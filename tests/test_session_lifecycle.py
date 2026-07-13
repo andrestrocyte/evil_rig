@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -39,6 +40,31 @@ def test_hardware_self_test_disables_barcode_for_shortened_quiescence():
     assert config.timing.quiescence_s == 0.05
     assert config.frame2ttl.barcode_enabled is False
     HardwareSelfTestSession(config)._require_live_barcode_capacity()
+
+
+def test_bpod_descriptor_records_device_and_firmware_identity():
+    session = HFDecisionSession(SessionConfig())
+    session.bpod = SimpleNamespace(
+        port="COM5",
+        serial_number="17032730",
+        version=SimpleNamespace(
+            firmware=(23, 10),
+            machine=4,
+            machine_str="State Machine 2+ r1.0",
+            pcb=3,
+            bpod_core="0.1.0a12",
+        ),
+    )
+
+    assert session._bpod_descriptor() == {
+        "port": "COM5",
+        "serial_number": "17032730",
+        "firmware": [23, 10],
+        "machine": 4,
+        "machine_name": "State Machine 2+ r1.0",
+        "pcb_revision": 3,
+        "bpod_core": "0.1.0a12",
+    }
 
 
 class FakeRelay:
@@ -349,6 +375,20 @@ def test_preflight_saves_stream_camera_and_cleanup_events(tmp_path):
     assert session.display.closed
 
 
+def test_preflight_display_wait_polls_recorder_durability_health(tmp_path):
+    session = HFDecisionSession(SessionConfig())
+    session.recorder = SessionRecorder(tmp_path, "S1", "dm")
+
+    class FailingDisplay(FakeDisplay):
+        def show_black(inner_self, duration_s):
+            session.recorder._streamdio_wal_background_error = "OSError: disk full"
+
+    session.display = FailingDisplay()
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        session._show_black_with_recorder_health(1.0)
+
+
 def test_hardware_self_test_returns_typed_validation_results(tmp_path):
     config = SessionConfig(n_trials=3)
     session = HardwareSelfTestSession(config)
@@ -468,3 +508,10 @@ def test_hardware_self_test_returns_typed_validation_results(tmp_path):
         set(result) == {"name", "status", "detail", "hint"}
         for result in report["results"]
     )
+
+    # The maximum interval is an independent guard: a malformed or legacy
+    # stall counter must not let a slow choice loop pass certification.
+    recorder.trials[0].choice_loop_max_frame_s = 0.2
+    recorder.trials[0].choice_loop_stall_count = 0
+    with pytest.raises(RuntimeError, match="max frame=0.200000s"):
+        session.validate_results()

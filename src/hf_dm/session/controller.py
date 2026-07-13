@@ -291,6 +291,7 @@ class HFDecisionSession:
             "hardware_connected",
             {
                 "bpod_port": self.bpod.port,
+                "bpod": self._bpod_descriptor(),
                 "bpod_usb_ports": sorted(excluded),
                 "bpod_event_allocation": getattr(
                     self.bpod,
@@ -488,6 +489,17 @@ class HFDecisionSession:
         if self.recorder is not None:
             self.recorder.raise_if_background_error()
 
+    def _show_black_with_recorder_health(self, duration_s: float) -> None:
+        """Keep the display responsive while promptly surfacing durability faults."""
+        assert self.display is not None
+        deadline = time.perf_counter() + max(0.0, float(duration_s))
+        while True:
+            remaining_s = deadline - time.perf_counter()
+            if remaining_s <= 0.0:
+                break
+            self.display.show_black(min(0.25, remaining_s))
+            self._check_recorder_health()
+
     def _bpod_serial_ports(self) -> set[str]:
         if self.bpod is None:
             return set()
@@ -627,6 +639,7 @@ class HFDecisionSession:
             "config": config_to_dict(self.config),
             "trial_schedule": list(self._trial_schedule),
             "task_summary": task_design_summary(self.config),
+            "bpod": self._bpod_descriptor(),
             "streamdio_module_info": self._streamdio_module_info(),
             "runtime_provenance": dict(self.runtime_provenance),
             "reward_calibration": (
@@ -635,6 +648,42 @@ class HFDecisionSession:
                 else None
             ),
             **self.runtime_provenance,
+        }
+
+    def _bpod_descriptor(self) -> dict[str, object] | None:
+        if self.bpod is None:
+            return None
+        version_info = getattr(self.bpod, "version", None)
+        firmware = getattr(version_info, "firmware", None)
+        firmware_value = (
+            [int(value) for value in firmware]
+            if isinstance(firmware, (tuple, list))
+            else None
+        )
+        return {
+            "port": str(getattr(self.bpod, "port", "")) or None,
+            "serial_number": str(getattr(self.bpod, "serial_number", "")) or None,
+            "firmware": firmware_value,
+            "machine": (
+                int(version_info.machine)
+                if isinstance(getattr(version_info, "machine", None), int)
+                else None
+            ),
+            "machine_name": (
+                str(version_info.machine_str)
+                if isinstance(getattr(version_info, "machine_str", None), str)
+                else None
+            ),
+            "pcb_revision": (
+                int(version_info.pcb)
+                if isinstance(getattr(version_info, "pcb", None), int)
+                else None
+            ),
+            "bpod_core": (
+                str(version_info.bpod_core)
+                if isinstance(getattr(version_info, "bpod_core", None), str)
+                else None
+            ),
         }
 
     def _load_reward_calibration(self) -> RewardCalibration | None:
@@ -1764,7 +1813,7 @@ class HFDecisionSession:
         end_reason = "preflight"
         try:
             if duration_s > 0.0:
-                self.display.show_black(duration_s)
+                self._show_black_with_recorder_health(duration_s)
             end_snap = self.wheel.snapshot()
             end_camera_count = len(self.dio.get_camera_events())
             end_lick_count = self._lick_event_count()

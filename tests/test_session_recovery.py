@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -116,6 +117,43 @@ def test_recover_session_repairs_truncated_tail_and_finalizes(tmp_path):
     assert sidecar["summary"]["end_reason"] == "recovered_after_crash"
     assert sidecar["summary"]["n_trials_completed"] == 1
     assert evaluate_session_qc(result["bundle_dir"], write=False)["overall_status"] == "PASS"
+
+
+def test_recover_session_rebuilds_incomplete_stream_chunks_from_wal(tmp_path):
+    config = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(tmp_path))
+    config.session_export.layout = "flat"
+    config.session_export.streamdio_chunk_s = 0.01
+    config.session_export.streamdio_memory_mode = "bounded"
+    recorder = SessionRecorder(tmp_path, "S1", "decision_making")
+    recorder.set_export_options(config_to_dict(config)["session_export"])
+    recorder.set_metadata({"config": config_to_dict(config)})
+    recorder.log_streamdio_event("analog_input", 13, 1, 1000, 0.000)
+    recorder.log_streamdio_event("camera", None, None, 2000, 0.020)
+    recorder.log_streamdio_event("analog_input", 13, 2, 3000, 0.030)
+
+    chunk_dir = session_bundle_dir(recorder.base_path, layout="flat") / "continuous_streams"
+    deadline = time.perf_counter() + 1.0
+    while not list(chunk_dir.glob("streamdio_chunk_*.npz")) and time.perf_counter() < deadline:
+        time.sleep(0.005)
+    assert list(chunk_dir.glob("streamdio_chunk_*.npz"))
+
+    assert recorder._streamdio_chunk_queue is not None
+    recorder._streamdio_chunk_queue.put((None, None))
+    assert recorder._streamdio_chunk_thread is not None
+    recorder._streamdio_chunk_thread.join(timeout=1.0)
+    recorder._streamdio_chunk_thread = None
+    recorder._close_streamdio_wal(durable=True)
+    recorder.close_journal()
+
+    result = recover_session_journal(recorder.incomplete_marker_path)
+
+    assert result["recovered_streamdio_events"] == 3
+    assert result["validation"]["valid"]
+    manifest = json.loads(
+        (Path(result["bundle_dir"]) / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["continuous_streams"]["event_count"] == 3
+    assert manifest["counts"]["streamdio_events"] == 3
 
 
 def test_session_journal_sequences_concurrent_event_writers(tmp_path):
@@ -289,6 +327,35 @@ def test_streamdio_wal_is_periodically_fsynced_during_long_trial(tmp_path):
     recorder._close_streamdio_wal()
 
     assert recorder._streamdio_wal_fsync_count >= 1
+
+
+def test_streamdio_wal_paths_survive_process_cwd_changes(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    recorder = SessionRecorder(Path("relative-output"), "S1", "decision_making")
+    recorder.log_streamdio_event("analog_input", 13, 1, 1000, 0.001)
+
+    monkeypatch.chdir(tmp_path.parent)
+    assert recorder._sync_streamdio_wal() is True
+    recorder.log_streamdio_event("camera", None, None, 2000, 0.002)
+    recorder._close_streamdio_wal(durable=True)
+
+    rows, trailing_bytes = load_streamdio_wal(recorder.streamdio_wal_path)
+    assert recorder.streamdio_wal_path.is_absolute()
+    assert [row[0] for row in rows] == ["analog_input", "camera"]
+    assert trailing_bytes == 0
+
+
+def test_streamdio_wal_failure_is_latched_without_callback_error_storm(tmp_path):
+    recorder = SessionRecorder(tmp_path, "S1", "decision_making")
+    recorder._streamdio_wal_background_error = "OSError: disk full"
+
+    for index in range(100):
+        recorder.log_streamdio_event("analog_input", 13, index, index, index / 1000)
+
+    assert recorder._streamdio_events_rejected_after_wal_error == 100
+    assert recorder._streamdio_total_count == 0
+    with pytest.raises(RuntimeError, match="disk full"):
+        recorder.raise_if_background_error()
 
 
 def test_streamdio_wal_background_disk_failure_is_prominent(tmp_path, monkeypatch):

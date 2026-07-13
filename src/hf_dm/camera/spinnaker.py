@@ -338,6 +338,14 @@ class _SpinnakerCRecorder:
         self._system = ctypes.c_void_p()
         self._camera_list = ctypes.c_void_p()
         self._camera = ctypes.c_void_p()
+        self._device_info: dict[str, str | None] = {
+            "serial_number": None,
+            "model_name": None,
+            "vendor_name": None,
+            "device_version": None,
+            "firmware_version": None,
+        }
+        self._dll_path: str | None = None
         self._camera_initialized = False
         self._acquisition_started = False
         self._timestamps: _FrameTimestampWriter | None = None
@@ -365,6 +373,16 @@ class _SpinnakerCRecorder:
             self._check("spinCameraListCreateEmpty", ctypes.byref(self._camera_list))
             self._check("spinSystemGetCameras", self._system, self._camera_list)
             self._camera = self._select_camera()
+            self._device_info = {
+                "serial_number": self._camera_string(self._camera, "DeviceSerialNumber"),
+                "model_name": self._camera_string(self._camera, "DeviceModelName"),
+                "vendor_name": self._camera_string(self._camera, "DeviceVendorName"),
+                "device_version": self._camera_string(self._camera, "DeviceVersion"),
+                "firmware_version": self._camera_string(
+                    self._camera,
+                    "DeviceFirmwareVersion",
+                ),
+            }
             self._check("spinCameraInit", self._camera)
             self._camera_initialized = True
             self._configure_camera()
@@ -404,6 +422,8 @@ class _SpinnakerCRecorder:
 
         summary = {
             "backend": "spinnaker_c",
+            "device": dict(self._device_info),
+            "spinnaker_c_dll": self._dll_path,
             "session_dir": str(self.session_dir),
             "frames_saved": int(self._frame_count),
             "capture_stats": _capture_stats(
@@ -461,6 +481,7 @@ class _SpinnakerCRecorder:
         dll_path = next((path for path in candidates if path.exists()), None)
         if dll_path is None:
             raise RuntimeError("Spinnaker C API DLL not found")
+        self._dll_path = str(dll_path.resolve())
         if hasattr(os, "add_dll_directory"):
             self._dll_dir_handle = os.add_dll_directory(str(dll_path.parent))
         self._dll = ctypes.CDLL(str(dll_path))
@@ -803,7 +824,9 @@ class HeadlessSpinnakerRecorder:
         preview_max_height: int = 390,
         preview_min_interval_s: float = 0.125,
     ) -> None:
-        self._out_dir = Path(out_dir)
+        # Native camera SDK calls run on a capture thread.  Use an absolute path
+        # so a process-wide working-directory change cannot redirect frame data.
+        self._out_dir = Path(out_dir).expanduser().resolve()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.session_dir = self._out_dir / f"{subject_id}_{phase}_{stamp}_spinnaker"
         self._serial_number = serial_number
@@ -842,6 +865,13 @@ class HeadlessSpinnakerRecorder:
         self._pyspin: Any = None
         self._system: Any = None
         self._camera: Any = None
+        self._device_info: dict[str, str | None] = {
+            "serial_number": None,
+            "model_name": None,
+            "vendor_name": None,
+            "device_version": None,
+            "firmware_version": None,
+        }
         self._timestamps: _FrameTimestampWriter | None = None
         self._c_backend: _SpinnakerCRecorder | None = None
 
@@ -901,6 +931,13 @@ class HeadlessSpinnakerRecorder:
                 raise RuntimeError("No Spinnaker cameras found")
 
             self._camera = self._select_camera(cam_list)
+            self._device_info = {
+                "serial_number": self._pyspin_device_value("DeviceSerialNumber"),
+                "model_name": self._pyspin_device_value("DeviceModelName"),
+                "vendor_name": self._pyspin_device_value("DeviceVendorName"),
+                "device_version": self._pyspin_device_value("DeviceVersion"),
+                "firmware_version": self._pyspin_device_value("DeviceFirmwareVersion"),
+            }
             cam_list.Clear()
             self._camera.Init()
             self._configure_camera()
@@ -937,6 +974,7 @@ class HeadlessSpinnakerRecorder:
 
         summary = {
             "backend": self.backend,
+            "device": dict(self._device_info),
             "session_dir": str(self.session_dir),
             "frames_saved": int(self._frame_count),
             "capture_stats": _capture_stats(
@@ -1019,6 +1057,13 @@ class HeadlessSpinnakerRecorder:
             if str(cam.TLDevice.DeviceSerialNumber.GetValue()) == self._serial_number:
                 return cam
         raise RuntimeError(f"Spinnaker camera serial not found: {self._serial_number}")
+
+    def _pyspin_device_value(self, name: str) -> str | None:
+        try:
+            value = getattr(self._camera.TLDevice, name).GetValue()
+            return str(value) if value is not None else None
+        except Exception:
+            return None
 
     def _configure_camera(self) -> None:
         PySpin = self._pyspin

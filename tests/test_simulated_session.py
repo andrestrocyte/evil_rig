@@ -62,7 +62,13 @@ def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
     assert all(trial.force_samples > 0 for trial in session.recorder.trials)
     assert session.recorder.trials[0].frame2ttl_choice_edge_count > 0
     assert session.recorder.trials[1].frame2ttl_choice_edge_count > 0
-    assert session.recorder.trials[2].choice_loop_frames == 1
+    # A stationary timeout trial redraws once, but the choice-loop cadence must
+    # still be measured on every host iteration rather than between redraws.
+    assert session.recorder.trials[2].choice_loop_frames > 1
+    assert (
+        session.recorder.trials[2].choice_loop_max_frame_s
+        < config.timing.choice_loop_stall_s
+    )
     assert session.recorder.trials[2].frame2ttl_choice_edge_count <= 2
     assert any(
         event[0] == "dio_input" and int(event[1]) == FRAME2TTL_INPUT_CHANNEL
@@ -223,6 +229,12 @@ def test_default_balancing_preserves_seeded_trial_record_snapshot(tmp_path):
     assert "git_commit" in provenance
     assert provenance["git_dirty"] in {True, False, None}
     assert provenance["package_version"] == "0.1.0"
+    assert provenance["package_versions"]["bpod-core"] == "0.1.0a12"
+    assert provenance["package_versions"]["numpy"]
+    assert provenance["python_version"]
+    assert provenance["python_executable"]
+    assert provenance["requirements_lock_sha256"]
+    assert provenance["streamdio_driver"]["module"] == "pybpod_streamDIO_module"
     assert header["payload"]["git_commit"] == provenance["git_commit"]
     assert header["payload"]["git_dirty"] == provenance["git_dirty"]
     assert all(trial.reward_volume_ul is None for trial in session.recorder.trials)
