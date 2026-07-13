@@ -65,13 +65,13 @@ class SimulatedBpod:
                 }
             )
             outgoing = state.actions.get("SoftCode")
-            if outgoing is not None and self._handler is not None:
-                self._handler(int(outgoing))
             if self._serial_handler is not None:
                 for output_name, message_id in state.actions.items():
                     if output_name == "SoftCode":
                         continue
                     self._serial_handler(str(output_name), int(message_id))
+            if outgoing is not None and self._handler is not None:
+                self._handler(int(outgoing))
 
             deadline = entered + float(state.timer)
             target: str | None = None

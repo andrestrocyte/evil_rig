@@ -99,13 +99,70 @@ def test_production_fsm_owns_quiescence_choice_reward_and_timeout(mock_relay):
     assert fsm.states["ChoiceBlankHigh"].transitions["Tup"] == "RewardHigh_Pre"
     assert fsm.states["RewardHigh"].timer == 0.08
     assert fsm.states["RewardLow"].timer == 0.04
+    assert fsm.states["RewardHigh"].actions[mock_relay.module_name] == mock_relay.ids.pump_on
+    assert fsm.states["RewardLow"].actions[mock_relay.module_name] == mock_relay.ids.pump_on
     assert fsm.states["PostRewardHigh"].timer == 1.0
+    assert (
+        fsm.states["PostRewardHigh"].actions[mock_relay.module_name]
+        == mock_relay.ids.pump_off
+    )
     assert (
         fsm.states["TimeoutNoise_Pre"].actions[mock_relay.module_name]
         == STREAMDIO_STATE_MARKER_MESSAGE_IDS["TimeoutNoise"]
     )
     assert fsm.states["TimeoutNoise"].actions[mock_relay.module_name] == 210
     assert fsm.states["PostTimeout"].actions[mock_relay.module_name] == 211
+
+
+def test_production_fsm_directly_times_active_force_transitions(mock_relay):
+    fsm = build_host_supervised_decision_fsm(
+        mock_relay,
+        force_direction="cw",
+        quiescence_s=3.0,
+        choice_timeout_s=20.0,
+        choice_blank_s=1.0,
+        high_reward_s=0.08,
+        low_reward_s=0.04,
+        post_reward_s=1.0,
+        timeout_noise_s=2.0,
+        post_timeout_s=1.0,
+    )
+
+    fsm.check()
+    assert fsm.states["ChoiceWindow"].actions[mock_relay.module_name] == mock_relay.ids.cw_force_on
+    assert (
+        fsm.states["ChoiceBlankHigh"].actions[mock_relay.module_name]
+        == mock_relay.ids.cw_force_off
+    )
+    assert (
+        fsm.states["ChoiceBlankLow"].actions[mock_relay.module_name]
+        == mock_relay.ids.cw_force_off
+    )
+    assert fsm.states["ChoiceWindow"].transitions["Tup"] == "TimeoutForceOff"
+    assert (
+        fsm.states["TimeoutForceOff"].actions[mock_relay.module_name]
+        == mock_relay.ids.cw_force_off
+    )
+    assert fsm.states["TimeoutForceOff"].transitions["Tup"] == "TimeoutNoise_Pre"
+
+
+def test_production_fsm_never_directly_opens_pump_for_omitted_reward(mock_relay):
+    fsm = build_host_supervised_decision_fsm(
+        mock_relay,
+        quiescence_s=3.0,
+        choice_timeout_s=20.0,
+        choice_blank_s=1.0,
+        high_reward_s=0.001,
+        low_reward_s=0.04,
+        high_reward_enabled=False,
+        post_reward_s=1.0,
+        timeout_noise_s=2.0,
+        post_timeout_s=1.0,
+    )
+
+    fsm.check()
+    assert mock_relay.module_name not in fsm.states["RewardHigh"].actions
+    assert fsm.states["RewardLow"].actions[mock_relay.module_name] == mock_relay.ids.pump_on
 
 
 def test_production_fsm_supports_shape_specific_reward_delays(mock_relay):

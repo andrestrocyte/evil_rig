@@ -1,10 +1,12 @@
 import json
 import os
+import time
 from itertools import groupby
 
 import numpy as np
 
 from hf_dm.config import SessionConfig, TrainingPhase
+from hf_dm.fsm import softcodes as sc
 from hf_dm.hardware.bringup_constants import FRAME2TTL_INPUT_CHANNEL
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.simulated import (
@@ -67,6 +69,11 @@ def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
     )
     assert any(event[0] == "bpod_state" for event in session.recorder.streamdio_events)
     assert "bpod_state_marker" in event_types
+    assert event_types.count("iti_start") == 3
+    assert event_types.count("iti_end") == 3
+    speaker_states = [operation[1] for operation in session.speaker_relay.ops]
+    assert True in speaker_states
+    assert speaker_states.index(True) < speaker_states.index(False, speaker_states.index(True))
     assert len(session.recorder.bpod_trials) == 3
     with np.load(session.recorder.base_path.with_suffix(".npz"), allow_pickle=True) as data:
         assert "trials_json" in data.files
@@ -84,11 +91,42 @@ def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
         "Quiescence",
         "ChoiceWindow_Pre",
         "ChoiceWindow",
+        "TimeoutForceOff",
         "TimeoutNoise_Pre",
         "TimeoutNoise",
         "PostTimeout_Pre",
         "PostTimeout",
     ]
+
+
+def test_choice_candidate_loses_cleanly_when_bpod_timeout_wins(tmp_path):
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    config = SessionConfig(n_trials=1, results_dir=str(tmp_path))
+    config.camera.record_video = False
+    config.camera.save_dir = str(tmp_path / "videos")
+    shorten_for_simulation(config)
+    config.timing.choice_timeout_s = 0.01
+    session = SimulatedHFDecisionSession(
+        config,
+        SimulationOptions(choice_mode="matched", frames_to_choice=1),
+    )
+    session.connect()
+    original_send = session.bpod.send_softcode
+
+    def delayed_choice(softcode: int) -> None:
+        if softcode in {sc.CHOICE_HIGH, sc.CHOICE_LOW}:
+            time.sleep(0.03)
+        original_send(softcode)
+
+    session.bpod.send_softcode = delayed_choice
+
+    summary = session.run()
+
+    assert summary.n_trials_completed == 1
+    assert session.recorder.trials[0].choice == "timeout"
+    event_types = [event.event_type for event in session.recorder.events]
+    assert "choice_detected" not in event_types
+    assert "choice_candidate_rejected" in event_types
 
 
 def test_default_balancing_preserves_seeded_trial_record_snapshot(tmp_path):
@@ -196,20 +234,22 @@ def test_extracted_runners_preserve_trial_records_and_event_stream(tmp_path):
         "bpod_state_marker",
         "bpod_state_marker",
         "force_on",
-        "lick_edge",
-        "lick",
-        "stimulus_on",
-        "choice_detected",
-        "bpod_state_marker",
-        "force_off",
-        "stimulus_off",
+            "lick_edge",
+            "lick",
+            "stimulus_on",
+            "bpod_state_marker",
+            "force_off",
+            "choice_detected",
+            "stimulus_off",
         "bpod_state_marker",
         "pump_start",
         "bpod_state_marker",
         "pump_end",
         "bpod_trial_complete",
-        "choice_loop_stats",
-        "trial_end",
+            "choice_loop_stats",
+            "trial_end",
+            "iti_start",
+            "iti_end",
     ]
     timeout_trial = [
         "trial_start",
@@ -228,8 +268,10 @@ def test_extracted_runners_preserve_trial_records_and_event_stream(tmp_path):
         "bpod_state_marker",
         "white_noise_end",
         "bpod_trial_complete",
-        "choice_loop_stats",
-        "trial_end",
+            "choice_loop_stats",
+            "trial_end",
+            "iti_start",
+            "iti_end",
     ]
     session_end = [
         "task_outputs_cleanup_verified",

@@ -11,8 +11,11 @@ from hf_dm.data.recorder import SessionRecorder
 def test_fsync_best_effort_degrades_for_unsupported_filesystem(tmp_path, monkeypatch):
     path = tmp_path / "journal.jsonl"
     durable_io._warned_locations.clear()
+    attempts = 0
 
     def unsupported(_file_descriptor: int) -> None:
+        nonlocal attempts
+        attempts += 1
         raise OSError(errno.EBADF, "unsupported by mounted filesystem")
 
     monkeypatch.setattr(durable_io.os, "fsync", unsupported)
@@ -22,6 +25,7 @@ def test_fsync_best_effort_degrades_for_unsupported_filesystem(tmp_path, monkeyp
         with pytest.warns(RuntimeWarning, match="durability is reduced"):
             assert durable_io.fsync_best_effort(handle, path=path) is False
         assert durable_io.fsync_best_effort(handle, path=path) is False
+    assert attempts == 2
 
 
 def test_fsync_best_effort_propagates_real_io_errors(tmp_path, monkeypatch):

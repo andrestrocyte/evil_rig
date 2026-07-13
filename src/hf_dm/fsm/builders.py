@@ -66,11 +66,14 @@ def _add_state_marker(
 def build_host_supervised_decision_fsm(
     speaker_relay: SerialRelay,
     *,
+    force_direction: Direction | None = None,
     quiescence_s: float,
     choice_timeout_s: float,
     choice_blank_s: float,
     high_reward_s: float,
     low_reward_s: float,
+    high_reward_enabled: bool = True,
+    low_reward_enabled: bool = True,
     post_reward_s: float,
     timeout_noise_s: float,
     post_timeout_s: float,
@@ -82,6 +85,15 @@ def build_host_supervised_decision_fsm(
     abort_transition = {f"SoftCode{sc.SESSION_ABORT}": _marker_name("Abort")}
     high_delay = choice_blank_s if high_delay_s is None else float(high_delay_s)
     low_delay = choice_blank_s if low_delay_s is None else float(low_delay_s)
+    force_on_action: dict[str, int] | None = None
+    force_off_action: dict[str, int] | None = None
+    if force_direction == "cw":
+        force_on_action = speaker_relay.act(speaker_relay.ids.cw_force_on)
+        force_off_action = speaker_relay.act(speaker_relay.ids.cw_force_off)
+    elif force_direction == "ccw":
+        force_on_action = speaker_relay.act(speaker_relay.ids.ccw_force_on)
+        force_off_action = speaker_relay.act(speaker_relay.ids.ccw_force_off)
+    timeout_target = "TimeoutForceOff" if force_off_action is not None else _marker_name("TimeoutNoise")
 
     _add_state_marker(
         fsm,
@@ -118,10 +130,10 @@ def build_host_supervised_decision_fsm(
         transitions={
             f"SoftCode{sc.CHOICE_HIGH}": _marker_name("ChoiceBlankHigh"),
             f"SoftCode{sc.CHOICE_LOW}": _marker_name("ChoiceBlankLow"),
-            "Tup": _marker_name("TimeoutNoise"),
+            "Tup": timeout_target,
             **abort_transition,
         },
-        actions=_softcode_action(sc.STATE_CHOICE),
+        actions=_softcode_action(sc.STATE_CHOICE, force_on_action),
         comment="Python renders at 60 Hz; Bpod owns the 20 s Tup timeout.",
     )
     _add_state_marker(
@@ -134,7 +146,7 @@ def build_host_supervised_decision_fsm(
         name="ChoiceBlankHigh",
         timer=high_delay,
         transitions={"Tup": _marker_name("RewardHigh"), **abort_transition},
-        actions=_softcode_action(sc.STATE_BLANK),
+        actions=_softcode_action(sc.STATE_BLANK, force_off_action),
     )
     _add_state_marker(
         fsm,
@@ -146,7 +158,7 @@ def build_host_supervised_decision_fsm(
         name="ChoiceBlankLow",
         timer=low_delay,
         transitions={"Tup": _marker_name("RewardLow"), **abort_transition},
-        actions=_softcode_action(sc.STATE_BLANK),
+        actions=_softcode_action(sc.STATE_BLANK, force_off_action),
     )
     _add_state_marker(
         fsm,
@@ -158,7 +170,14 @@ def build_host_supervised_decision_fsm(
         name="RewardHigh",
         timer=high_reward_s,
         transitions={"Tup": _marker_name("PostRewardHigh"), **abort_transition},
-        actions=_softcode_action(sc.STATE_PUMP_ON),
+        actions=_softcode_action(
+            sc.STATE_PUMP_ON,
+            (
+                speaker_relay.act(speaker_relay.ids.pump_on)
+                if high_reward_enabled
+                else None
+            ),
+        ),
     )
     _add_state_marker(
         fsm,
@@ -170,7 +189,14 @@ def build_host_supervised_decision_fsm(
         name="RewardLow",
         timer=low_reward_s,
         transitions={"Tup": _marker_name("PostRewardLow"), **abort_transition},
-        actions=_softcode_action(sc.STATE_PUMP_ON),
+        actions=_softcode_action(
+            sc.STATE_PUMP_ON,
+            (
+                speaker_relay.act(speaker_relay.ids.pump_on)
+                if low_reward_enabled
+                else None
+            ),
+        ),
     )
     _add_state_marker(
         fsm,
@@ -182,7 +208,10 @@ def build_host_supervised_decision_fsm(
         name="PostRewardHigh",
         timer=post_reward_s,
         transitions={"Tup": ">exit", **abort_transition},
-        actions=_softcode_action(sc.STATE_PUMP_OFF),
+        actions=_softcode_action(
+            sc.STATE_PUMP_OFF,
+            speaker_relay.act(speaker_relay.ids.pump_off),
+        ),
     )
     _add_state_marker(
         fsm,
@@ -194,7 +223,10 @@ def build_host_supervised_decision_fsm(
         name="PostRewardLow",
         timer=post_reward_s,
         transitions={"Tup": ">exit", **abort_transition},
-        actions=_softcode_action(sc.STATE_PUMP_OFF),
+        actions=_softcode_action(
+            sc.STATE_PUMP_OFF,
+            speaker_relay.act(speaker_relay.ids.pump_off),
+        ),
     )
     _add_state_marker(
         fsm,
@@ -202,6 +234,14 @@ def build_host_supervised_decision_fsm(
         state_name="TimeoutNoise",
         abort_transition=abort_transition,
     )
+    if force_off_action is not None:
+        fsm.add_state(
+            name="TimeoutForceOff",
+            timer=0.001,
+            transitions={"Tup": _marker_name("TimeoutNoise"), **abort_transition},
+            actions=force_off_action,
+            comment="Bpod turns active force off before host-side verification.",
+        )
     fsm.add_state(
         name="TimeoutNoise",
         timer=timeout_noise_s,

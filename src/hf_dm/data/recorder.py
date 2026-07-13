@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import struct
 import subprocess
 import threading
 import time
@@ -22,6 +23,9 @@ from hf_dm.durable_io import fsync_best_effort
 Direction = Literal["cw", "ccw"]
 Choice = Literal["cw", "ccw", "timeout", "centering"]
 JournalMode = Literal["new", "resume", "disabled"]
+
+_STREAMDIO_WAL_MAGIC = b"HFDMSTR1\n"
+_STREAMDIO_WAL_RECORD = struct.Struct("<24siiQdd")
 
 
 def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
@@ -262,6 +266,9 @@ class SessionRecorder:
         self._streamdio_chunk_thread: threading.Thread | None = None
         self._streamdio_chunk_files: list[str] = []
         self._streamdio_chunk_error: str | None = None
+        self._streamdio_failed_chunk_rows: list[
+            tuple[str, int, int, int, float, float]
+        ] = []
         self._streamdio_memory_mode = "full"
         self._streamdio_memory_bounded = False
         self._streamdio_recent_max_events = 0
@@ -276,6 +283,9 @@ class SessionRecorder:
         self._session_start_mono = time.perf_counter()
         self._journal_path = self.base_path.with_suffix(".journal.jsonl")
         self._incomplete_marker_path = self.base_path.with_suffix(".incomplete.json")
+        self._streamdio_wal_path = self.base_path.with_suffix(".streamdio.wal")
+        self._streamdio_wal_handle: Any = None
+        self._streamdio_wal_lock = threading.Lock()
         self._journal_handle: Any = None
         self._journal_lock = threading.RLock()
         self._journal_sequence = 0
@@ -295,6 +305,10 @@ class SessionRecorder:
     @property
     def incomplete_marker_path(self) -> Path:
         return self._incomplete_marker_path
+
+    @property
+    def streamdio_wal_path(self) -> Path:
+        return self._streamdio_wal_path
 
     def _open_journal(self, *, subject_id: str, phase: str) -> None:
         if self._journal_mode == "disabled":
@@ -336,6 +350,7 @@ class SessionRecorder:
                     "schema_version": 1,
                     "status": "incomplete",
                     "journal": self._journal_path.name,
+                    "streamdio_wal": self._streamdio_wal_path.name,
                     **header,
                 },
                 indent=2,
@@ -453,6 +468,7 @@ class SessionRecorder:
 
     def add_trial(self, trial: TrialRecord) -> None:
         self.trials.append(trial)
+        self._flush_streamdio_wal(durable=True)
         self._journal_append("trial", asdict(trial), durable=True)
         self._max_trial_count = max(self._max_trial_count, len(self.trials))
         self.log_event(
@@ -515,6 +531,7 @@ class SessionRecorder:
         )
         self._streamdio_total_count += 1
         self._streamdio_counts[row[0]] += 1
+        self._append_streamdio_wal(row)
         self.streamdio_events.append(row)
         self._prune_streamdio_events_if_needed()
         self._max_streamdio_event_count = max(
@@ -532,6 +549,7 @@ class SessionRecorder:
         self.log_event("session_end", {"end_reason": summary.end_reason})
         self._journal_append("session_summary", asdict(summary), durable=True)
         self.close_journal()
+        self._close_streamdio_wal(durable=True)
         self._finalize_streamdio_chunks()
 
         npz_path = self.base_path.with_suffix(".npz")
@@ -686,6 +704,7 @@ class SessionRecorder:
         if json_path.exists() and npz_error is None and export_error is None:
             try:
                 self._incomplete_marker_path.unlink(missing_ok=True)
+                self._streamdio_wal_path.unlink(missing_ok=True)
             except OSError:
                 pass
         self._finalized = True
@@ -784,6 +803,66 @@ class SessionRecorder:
             self._streamdio_chunk_s = 0.0
             self._streamdio_memory_bounded = False
 
+    def _append_streamdio_wal(
+        self,
+        row: tuple[str, int, int, int, float, float],
+    ) -> None:
+        event_type = row[0].encode("utf-8")
+        if len(event_type) > 24:
+            raise ValueError(f"StreamDIO event type exceeds WAL limit: {row[0]!r}")
+        record = _STREAMDIO_WAL_RECORD.pack(
+            event_type.ljust(24, b"\0"),
+            int(row[1]),
+            int(row[2]),
+            int(row[3]),
+            float(row[4]),
+            float(row[5]),
+        )
+        with self._streamdio_wal_lock:
+            if self._streamdio_wal_handle is None:
+                new_file = not self._streamdio_wal_path.exists()
+                self._streamdio_wal_handle = self._streamdio_wal_path.open(
+                    "ab",
+                    buffering=0,
+                )
+                if new_file or self._streamdio_wal_path.stat().st_size == 0:
+                    self._streamdio_wal_handle.write(_STREAMDIO_WAL_MAGIC)
+            written = self._streamdio_wal_handle.write(record)
+            if written != len(record):
+                raise OSError(
+                    f"Short StreamDIO WAL write: {written} of {len(record)} bytes"
+                )
+
+    def _flush_streamdio_wal(self, *, durable: bool = False) -> None:
+        with self._streamdio_wal_lock:
+            if self._streamdio_wal_handle is None:
+                return
+            self._streamdio_wal_handle.flush()
+            if durable:
+                synced = fsync_best_effort(
+                    self._streamdio_wal_handle,
+                    path=self._streamdio_wal_path,
+                )
+                if not synced:
+                    self._streamdio_wal_handle.close()
+                    self._streamdio_wal_handle = self._streamdio_wal_path.open(
+                        "ab",
+                        buffering=0,
+                    )
+
+    def _close_streamdio_wal(self, *, durable: bool = False) -> None:
+        with self._streamdio_wal_lock:
+            if self._streamdio_wal_handle is None:
+                return
+            self._streamdio_wal_handle.flush()
+            if durable:
+                fsync_best_effort(
+                    self._streamdio_wal_handle,
+                    path=self._streamdio_wal_path,
+                )
+            self._streamdio_wal_handle.close()
+            self._streamdio_wal_handle = None
+
     def _prune_streamdio_events_if_needed(self) -> None:
         if not self._streamdio_memory_bounded or self._streamdio_recent_max_events <= 0:
             return
@@ -835,21 +914,46 @@ class SessionRecorder:
             index, rows = self._streamdio_chunk_queue.get()
             if index is None:
                 return
-            try:
-                path = self._streamdio_chunk_dir / f"streamdio_chunk_{int(index):03d}.npz"
-                _atomic_write_npz(
-                    path,
-                    streamdio_events=self._streamdio_rows_to_structured(rows or []),
-                )
-                self._streamdio_chunk_files.append(str(path))
-            except Exception as exc:
-                self._streamdio_chunk_error = f"{type(exc).__name__}: {exc}"
+            path = self._streamdio_chunk_dir / f"streamdio_chunk_{int(index):03d}.npz"
+            error: Exception | None = None
+            for attempt in range(3):
+                try:
+                    _atomic_write_npz(
+                        path,
+                        streamdio_events=self._streamdio_rows_to_structured(rows or []),
+                    )
+                    self._streamdio_chunk_files.append(str(path))
+                    error = None
+                    break
+                except Exception as exc:
+                    error = exc
+                    if attempt < 2:
+                        time.sleep(0.05 * (attempt + 1))
+            if error is not None:
+                self._streamdio_chunk_error = f"{type(error).__name__}: {error}"
+                self._streamdio_failed_chunk_rows.extend(rows or [])
 
     def _streamdio_rows_for_finalize(self) -> list[tuple[str, int, int, int, float, float]]:
         if not self._streamdio_memory_bounded:
             return list(self.streamdio_events)
+        if self._streamdio_wal_path.exists():
+            try:
+                wal_rows, trailing_bytes = load_streamdio_wal(self._streamdio_wal_path)
+                if trailing_bytes == 0 and len(wal_rows) == self._streamdio_total_count:
+                    return wal_rows
+                self._streamdio_chunk_error = (
+                    "StreamDIO WAL incomplete at finalize: "
+                    f"{len(wal_rows)} of {self._streamdio_total_count} events, "
+                    f"{trailing_bytes} trailing bytes"
+                )
+            except Exception as exc:
+                self._streamdio_chunk_error = (
+                    f"StreamDIO WAL read failed: {type(exc).__name__}: {exc}"
+                )
         rows = self._load_streamdio_chunk_rows()
-        return rows if rows else list(self.streamdio_events)
+        if rows or self._streamdio_failed_chunk_rows:
+            return [*rows, *self._streamdio_failed_chunk_rows]
+        return list(self.streamdio_events)
 
     def _load_streamdio_chunk_rows(self) -> list[tuple[str, int, int, int, float, float]]:
         rows: list[tuple[str, int, int, int, float, float]] = []
@@ -1023,11 +1127,19 @@ class SessionRecorder:
         return np.array(rows, dtype=dtype)
 
     def _events_to_structured(self) -> np.ndarray:
-        dtype = [("wall_time_s", "f8"), ("monotonic_s", "f8"), ("event_type", "U64"), ("payload_json", "U1024")]
-        rows = []
-        for e in self.events:
-            payload = json.dumps(e.payload)[:1000]
-            rows.append((e.wall_time_s, e.monotonic_s, e.event_type, payload))
+        payloads = [json.dumps(event.payload) for event in self.events]
+        event_type_chars = max(1, *(len(event.event_type) for event in self.events))
+        payload_chars = max(1, *(len(payload) for payload in payloads))
+        dtype = [
+            ("wall_time_s", "f8"),
+            ("monotonic_s", "f8"),
+            ("event_type", f"U{event_type_chars}"),
+            ("payload_json", f"U{payload_chars}"),
+        ]
+        rows = [
+            (event.wall_time_s, event.monotonic_s, event.event_type, payload)
+            for event, payload in zip(self.events, payloads, strict=True)
+        ]
         return np.array(rows, dtype=dtype)
 
     def _streamdio_to_structured(self) -> np.ndarray:
@@ -1049,6 +1161,41 @@ class SessionRecorder:
 
 
 _JOURNAL_SUFFIX = ".journal.jsonl"
+
+
+def load_streamdio_wal(
+    path: Path | str,
+) -> tuple[list[tuple[str, int, int, int, float, float]], int]:
+    """Load complete raw StreamDIO WAL records and report a truncated tail."""
+
+    wal_path = Path(path)
+    rows: list[tuple[str, int, int, int, float, float]] = []
+    with wal_path.open("rb") as handle:
+        magic = handle.read(len(_STREAMDIO_WAL_MAGIC))
+        if magic != _STREAMDIO_WAL_MAGIC:
+            raise ValueError(f"Invalid StreamDIO WAL header: {wal_path}")
+        trailing_bytes = 0
+        while True:
+            record = handle.read(_STREAMDIO_WAL_RECORD.size)
+            if not record:
+                break
+            if len(record) != _STREAMDIO_WAL_RECORD.size:
+                trailing_bytes = len(record)
+                break
+            event_type, channel, value, timestamp_us, relative_s, host_s = (
+                _STREAMDIO_WAL_RECORD.unpack(record)
+            )
+            rows.append(
+                (
+                    event_type.rstrip(b"\0").decode("utf-8"),
+                    int(channel),
+                    int(value),
+                    int(timestamp_us),
+                    float(relative_s),
+                    float(host_s),
+                )
+            )
+    return rows, trailing_bytes
 
 
 def resolve_session_journal(path: Path | str) -> Path:
@@ -1178,6 +1325,12 @@ def recover_session_journal(
     header = dict(rows[0]["payload"])
     subject_id = str(header.get("subject_id") or "unknown")
     phase = str(header.get("phase") or "unknown")
+    wal_name = str(header.get("streamdio_wal") or f"{base_name}.streamdio.wal")
+    wal_path = journal_path.parent / wal_name
+    wal_rows: list[tuple[str, int, int, int, float, float]] = []
+    wal_trailing_bytes = 0
+    if wal_path.exists():
+        wal_rows, wal_trailing_bytes = load_streamdio_wal(wal_path)
 
     recorder = SessionRecorder(
         journal_path.parent,
@@ -1235,7 +1388,8 @@ def recover_session_journal(
     layout = str(recorder.export_options.get("layout", "mm_hierarchy"))
     chunk_dir = session_bundle_dir(recorder.base_path, layout=layout) / "continuous_streams"
     recorder._streamdio_chunk_files = [str(item) for item in sorted(chunk_dir.glob("streamdio_chunk_*.npz"))]
-    recovered_streamdio = recorder._load_streamdio_chunk_rows()
+    chunk_streamdio = recorder._load_streamdio_chunk_rows()
+    recovered_streamdio = wal_rows if wal_rows else chunk_streamdio
     recorder.streamdio_events = recovered_streamdio
     recorder._streamdio_total_count = len(recovered_streamdio)
     recorder._streamdio_counts = Counter(row[0] for row in recovered_streamdio)
@@ -1244,7 +1398,7 @@ def recover_session_journal(
     recorder._streamdio_memory_mode = str(
         recorder.export_options.get("streamdio_memory_mode", "full")
     )
-    recorder._streamdio_memory_bounded = bool(recorder._streamdio_chunk_files)
+    recorder._streamdio_memory_bounded = bool(recorder._streamdio_chunk_files) and not wal_rows
 
     recorder.log_event(
         "session_recovered",
@@ -1255,6 +1409,7 @@ def recover_session_journal(
             "recovered_trials": len(recorder.trials),
             "recovered_bpod_trials": len(recorder.bpod_trials),
             "recovered_streamdio_events": len(recovered_streamdio),
+            "streamdio_wal_trailing_bytes": wal_trailing_bytes,
         },
     )
     config_metadata = recorder.metadata.get("config")
@@ -1289,4 +1444,5 @@ def recover_session_journal(
         "recovered_trials": len(recorder.trials),
         "recovered_bpod_trials": len(recorder.bpod_trials),
         "recovered_streamdio_events": len(recovered_streamdio),
+        "streamdio_wal_trailing_bytes": wal_trailing_bytes,
     }

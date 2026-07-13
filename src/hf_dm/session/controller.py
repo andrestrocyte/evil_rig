@@ -103,8 +103,43 @@ class HFDecisionSession:
         self.runtime_provenance: dict[str, object] = {}
         self._trial_schedule = self._build_trial_schedule()
 
+    def _require_live_barcode_capacity(self) -> None:
+        cfg = self.config.frame2ttl
+        if (
+            self.config.phase != TrainingPhase.DECISION_MAKING
+            or not cfg.enabled
+            or not cfg.barcode_enabled
+        ):
+            return
+        longest_code = encode_frame2ttl_trial_code(
+            trial_index=0,
+            star_side="right",
+            trial_mode="forced",
+            forced_shape="circle",
+            modality="other",
+        )
+        frame_count = len(
+            frame2ttl_barcode_states(
+                longest_code,
+                preamble_high_frames=cfg.barcode_preamble_high_frames,
+                preamble_low_frames=cfg.barcode_preamble_low_frames,
+                one_high_frames=cfg.barcode_one_high_frames,
+                zero_high_frames=cfg.barcode_zero_high_frames,
+                inter_bit_low_frames=cfg.barcode_inter_bit_low_frames,
+            )
+        )
+        required_s = frame_count / float(max(1, self.config.display.fps))
+        if self.config.timing.quiescence_s < required_s:
+            raise RuntimeError(
+                "Configured quiescence cannot display the longest enabled Frame2TTL "
+                f"barcode: {self.config.timing.quiescence_s:.3f} s available, "
+                f"{required_s:.3f} s required for {frame_count} frames at "
+                f"{self.config.display.fps} FPS"
+            )
+
     def connect(self) -> None:
         self._closed = False
+        self._require_live_barcode_capacity()
         self.runtime_provenance = capture_runtime_provenance()
         ports = self.config.ports
         self.bpod = connect_bpod_core(None if ports.bpod_port == "AUTO" else ports.bpod_port)

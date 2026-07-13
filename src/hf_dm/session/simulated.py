@@ -529,6 +529,34 @@ class SimulatedHFDecisionSession(HFDecisionSession):
 
     def _handle_simulated_bpod_serial_action(self, output_name: str, message_id: int) -> None:
         del output_name
+        if self.speaker_relay is not None:
+            ids = getattr(self.speaker_relay, "ids", None)
+            if ids is not None and int(message_id) == int(ids.speaker_gate_on):
+                self.speaker_relay.speaker_gate(True)
+                return
+            if ids is not None and int(message_id) == int(ids.speaker_gate_off):
+                self.speaker_relay.speaker_gate(False)
+                return
+        if self.relay is not None and self.speaker_relay is not None:
+            ids = getattr(self.speaker_relay, "ids", None)
+            if ids is not None and int(message_id) == int(ids.pump_on):
+                self.relay.pump_on()
+                return
+            if ids is not None and int(message_id) == int(ids.pump_off):
+                self.relay.pump_off()
+                return
+            if ids is not None and int(message_id) == int(ids.cw_force_on):
+                self.relay.set_force_direction("cw")
+                return
+            if ids is not None and int(message_id) == int(ids.ccw_force_on):
+                self.relay.set_force_direction("ccw")
+                return
+            if ids is not None and int(message_id) in {
+                int(ids.cw_force_off),
+                int(ids.ccw_force_off),
+            }:
+                self.relay.force_off()
+                return
         state_id = STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID.get(int(message_id))
         if state_id is None or self.dio is None:
             return
@@ -592,7 +620,7 @@ class SimulatedHFDecisionSession(HFDecisionSession):
         emitter = getattr(self.dio, "emit_frame2ttl_transition", None)
         if callable(emitter):
             relative_s = None
-            if source in {"barcode", "choice"}:
+            if source in {"barcode", "choice"} or source.startswith("barcode_"):
                 key = (int(trial_index), str(source))
                 base = self._frame2ttl_sim_relative_bases.setdefault(
                     key,
