@@ -36,6 +36,8 @@ class CertificationDialogResult:
 def run_certification_dialog(
     config: SessionConfig,
     report: dict[str, Any],
+    *,
+    session_start: bool = True,
 ) -> CertificationDialogResult:
     """Open the fail-closed operator workflow and return only after a decision."""
 
@@ -51,7 +53,11 @@ def run_certification_dialog(
         state_error = f"{type(exc).__name__}: {exc}"
 
     root = tk.Tk()
-    root.title("HF-DM animal-use readiness")
+    root.title(
+        "HF-DM animal-use readiness"
+        if session_start
+        else "HF-DM calibration and certification"
+    )
     root.geometry("920x720")
     root.minsize(780, 620)
     result: dict[str, Any] = {
@@ -81,7 +87,7 @@ def run_certification_dialog(
     subjects_var = tk.StringVar(
         value=str(saved.get("subjects_dir") or config.welfare.subjects_dir)
     )
-    run_confirmed_var = tk.BooleanVar(value=False)
+    run_confirmed_var = tk.BooleanVar(value=not session_start)
     safety_vars = {
         "no_animal_present": tk.BooleanVar(value=False),
         "collection_vessel_installed": tk.BooleanVar(value=False),
@@ -468,12 +474,17 @@ def run_certification_dialog(
 
     footer = ttk.Frame(root, padding=(12, 4, 12, 12))
     footer.pack(fill="x")
-    ttk.Checkbutton(
+    if session_start:
+        ttk.Checkbutton(
+            footer,
+            text="I confirm this animal-use run and completed the safety/welfare checklist",
+            variable=run_confirmed_var,
+        ).pack(side="left")
+    continue_button = ttk.Button(
         footer,
-        text="I confirm this animal-use run and completed the safety/welfare checklist",
-        variable=run_confirmed_var,
-    ).pack(side="left")
-    continue_button = ttk.Button(footer, text="Start session", state="disabled")
+        text="Start session" if session_start else "Close - certification ready",
+        state="disabled",
+    )
     continue_button.pack(side="right")
 
     def cancel_dialog() -> None:
@@ -498,7 +509,11 @@ def run_certification_dialog(
             tree.insert("", "end", values=(check.get("status"), f"{check.get('name')}: {detail}"))
         passed = current.get("status") == "PASS"
         status_var.set(
-            "All release checks pass; confirm this run to enable Start session."
+            (
+                "All release checks pass; confirm this run to enable Start session."
+                if session_start
+                else "All release checks pass; certification is ready."
+            )
             if passed
             else f"Blocked: {sum(c.get('status') != 'PASS' for c in current.get('checks', []))} check(s) failed."
         )
@@ -537,7 +552,7 @@ def run_certification_dialog(
         result["operator_confirmed"] = run_confirmed_var.get()
         append_gui_audit(
             config,
-            "animal_session_authorized",
+            "animal_session_authorized" if session_start else "certification_dialog_ready",
             operator=operator_var.get(),
             detail={"subject_id": config.subject_id},
         )

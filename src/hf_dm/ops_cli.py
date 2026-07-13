@@ -11,6 +11,13 @@ from pathlib import Path
 
 import yaml
 
+from hf_dm.certification import evaluate_animal_use_gate
+from hf_dm.certification_gui import run_certification_dialog
+from hf_dm.certification_workflow import (
+    apply_operator_state,
+    ensure_certification_path,
+    load_operator_state,
+)
 from hf_dm.config import (
     ConfigValidationError,
     SessionConfig,
@@ -148,6 +155,12 @@ def main() -> None:
     certify_parser.add_argument("--confirm-force-clear", action="store_true")
     certify_parser.add_argument("--confirm-speaker-safe", action="store_true")
     certify_parser.add_argument("--confirm-emergency-stop", action="store_true")
+
+    certification_gui_parser = sub.add_parser(
+        "certification-gui",
+        help="Open the calibration and rig-certification desktop workflow",
+    )
+    certification_gui_parser.add_argument("--config", type=Path, required=True)
 
     roi_parser = sub.add_parser("camera-roi-setup", help="Select or write Spinnaker ROI fields")
     roi_parser.add_argument("--config", type=Path, required=True)
@@ -381,6 +394,32 @@ def main() -> None:
         print(json.dumps(result, indent=2, sort_keys=True))
         if result["status"] != "PASS":
             raise SystemExit(1)
+        return
+    if args.command == "certification-gui":
+        config = validate_session_config(SessionConfig.from_yaml(args.config))
+        config.session_export.source_config_path = str(args.config.resolve())
+        ensure_certification_path(config)
+        try:
+            apply_operator_state(config, load_operator_state(config))
+        except Exception:
+            # The dialog reports corrupt saved state and allows replacement.
+            pass
+        validate_session_config(config)
+        report = evaluate_animal_use_gate(config, operator_confirmed=True)
+        outcome = run_certification_dialog(config, report, session_start=False)
+        final_report = evaluate_animal_use_gate(config, operator_confirmed=True)
+        print(
+            json.dumps(
+                {
+                    "ready": final_report["status"] == "PASS",
+                    "closed_ready": outcome.continue_session,
+                    "certification_path": final_report.get("certification_path"),
+                    "report": final_report,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return
     if args.command == "camera-roi-setup":
         result = _write_camera_roi(

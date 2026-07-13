@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -16,7 +18,11 @@ from hf_dm.certification_workflow import (
     write_effective_config,
     write_json_artifact,
 )
-from hf_dm.cli import _remediate_animal_use_gate
+from hf_dm.cli import (
+    _remediate_animal_use_gate,
+    _validate_uncertified_bench_request,
+    main as cli_main,
+)
 from hf_dm.config import SessionConfig
 
 
@@ -158,3 +164,110 @@ def test_remediation_returns_only_after_final_gate_passes(monkeypatch, tmp_path)
 
     assert confirmed is True
     assert calls == [False, True]
+
+
+def test_uncertified_bench_requires_explicit_no_animal_confirmation():
+    with pytest.raises(ValueError, match="requires --confirm-no-animal"):
+        _validate_uncertified_bench_request(
+            allow_uncertified=True,
+            confirm_no_animal=False,
+            conflicting_mode=False,
+        )
+    with pytest.raises(ValueError, match="requires --allow-uncertified"):
+        _validate_uncertified_bench_request(
+            allow_uncertified=False,
+            confirm_no_animal=True,
+            conflicting_mode=False,
+        )
+
+    assert _validate_uncertified_bench_request(
+        allow_uncertified=True,
+        confirm_no_animal=True,
+        conflicting_mode=False,
+    )
+
+
+def test_uncertified_bench_cannot_mask_another_operational_mode():
+    with pytest.raises(ValueError, match="only valid for a normal full-task run"):
+        _validate_uncertified_bench_request(
+            allow_uncertified=True,
+            confirm_no_animal=True,
+            conflicting_mode=True,
+        )
+
+
+def test_uncertified_full_task_is_labeled_bench_and_audited(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config_path = tmp_path / "task.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "subject_id: bench-mouse",
+                "n_trials: 1",
+                f"results_dir: {tmp_path.as_posix()}/sessions",
+                "camera:",
+                "  record_video: false",
+                "  required: false",
+                f"  save_dir: {tmp_path.as_posix()}/videos",
+                "monitor:",
+                "  enabled: false",
+                "animal_use:",
+                "  enabled: true",
+                f"  certification_path: {tmp_path.as_posix()}/missing-certificate.json",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class FakeSession:
+        def __init__(self, config, *, run_mode, animal_use_confirmed):
+            captured["config"] = config
+            captured["run_mode"] = run_mode
+            captured["animal_use_confirmed"] = animal_use_confirmed
+
+        def connect(self):
+            captured["connected"] = True
+
+        def run(self):
+            return types.SimpleNamespace(
+                end_reason="completed",
+                n_trials_completed=1,
+                n_trials_planned=1,
+            )
+
+        def close(self, **_kwargs):
+            captured["closed"] = True
+
+    monkeypatch.setattr("hf_dm.cli.HFDecisionSession", FakeSession)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hf-dm-run",
+            "--config",
+            str(config_path),
+            "--no-session-dialog",
+            "--allow-uncertified",
+            "--confirm-no-animal",
+        ],
+    )
+
+    cli_main()
+
+    assert captured["connected"] is True
+    assert captured["run_mode"] == "bench"
+    assert captured["animal_use_confirmed"] is False
+    overrides = captured["config"].session_export.cli_overrides
+    bypass = next(
+        item for item in overrides if item["source"].startswith("hf-dm-run --allow-uncertified")
+    )
+    assert bypass["values"] == {
+        "run_mode": "bench",
+        "animal_present": False,
+        "certification_required": False,
+    }
+    assert "Session finished: completed" in capsys.readouterr().out
