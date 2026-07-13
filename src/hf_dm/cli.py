@@ -242,6 +242,14 @@ def main() -> None:
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
+        "--confirm-animal-use",
+        action="store_true",
+        help=(
+            "One-run confirmation that the operator completed the animal safety and "
+            "welfare checklist. Required when animal_use.enabled is true."
+        ),
+    )
+    parser.add_argument(
         "--simulate",
         action="store_true",
         help="Run a hardware-free simulation that exercises the live display/task loop.",
@@ -358,6 +366,12 @@ def main() -> None:
         type=int,
         default=None,
         help="Runtime cap-touch release delta for --cap-touch-diagnostic.",
+    )
+    parser.add_argument(
+        "--cap-touch-report",
+        type=Path,
+        default=None,
+        help="Write the cap-touch diagnostic JSON report to this path.",
     )
     parser.add_argument(
         "--preflight-duration",
@@ -584,7 +598,7 @@ def main() -> None:
             )
     validate_session_config(config)
     if args.cap_touch_diagnostic:
-        run_cap_touch_diagnostic(
+        report = run_cap_touch_diagnostic(
             config,
             duration_s=args.cap_touch_duration,
             poll_hz=args.cap_touch_poll_hz,
@@ -593,6 +607,12 @@ def main() -> None:
             delta_low=args.cap_touch_delta_low,
             raw_analog=args.cap_touch_raw_analog,
         )
+        if args.cap_touch_report is not None:
+            args.cap_touch_report.parent.mkdir(parents=True, exist_ok=True)
+            args.cap_touch_report.write_text(
+                json.dumps(report, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         return
     if args.simulate:
         if args.simulate_headless:
@@ -635,7 +655,12 @@ def main() -> None:
         )
         session = HardwareSelfTestSession(config)
     else:
-        session = HFDecisionSession(config)
+        bench_mode = bool(args.preflight or any(frame2ttl_modes))
+        session = HFDecisionSession(
+            config,
+            run_mode="bench" if bench_mode else "animal",
+            animal_use_confirmed=args.confirm_animal_use,
+        )
     try:
         session.connect()
         if args.frame2ttl_diagnostic:
@@ -659,7 +684,9 @@ def main() -> None:
                 report = session.validate_results()
                 print(f"Hardware self-test validated: {json.dumps(report, sort_keys=True)}")
     except BaseException:
-        session.close()
+        # Preserve the initiating failure; close records and interlocks any
+        # independent cleanup failure without replacing the original cause.
+        session.close(raise_on_error=False)
         raise
     print(f"Session finished: {summary.end_reason}")
     print(f"Trials completed: {summary.n_trials_completed}/{summary.n_trials_planned}")

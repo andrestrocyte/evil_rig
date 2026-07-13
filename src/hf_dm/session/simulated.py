@@ -470,7 +470,7 @@ class SimulatedVideoRecorder:
 
 class SimulatedHFDecisionSession(HFDecisionSession):
     def __init__(self, config: SessionConfig, options: SimulationOptions):
-        super().__init__(config)
+        super().__init__(config, run_mode="simulation")
         self.options = options
         self._frame2ttl_sim_relative_bases: dict[tuple[int, str], float] = {}
         self.wheel = SimulatedWheel(

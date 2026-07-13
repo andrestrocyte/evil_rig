@@ -27,6 +27,7 @@ from hf_dm.data.session_export import (
 )
 from hf_dm.data.video_export import export_preview_video
 from hf_dm.session.controller import HFDecisionSession
+from hf_dm.rig_certification import run_rig_certification
 from hf_dm.valve_calibration import run_guided_valve_calibration
 from hf_dm.validation import ValidationResult, validation_report
 
@@ -131,6 +132,22 @@ def main() -> None:
     preflight_parser.add_argument("--monitor", action="store_true")
     preflight_parser.add_argument("--no-monitor", action="store_true")
     preflight_parser.add_argument("-v", "--verbose", action="store_true")
+
+    certify_parser = sub.add_parser(
+        "certify-rig",
+        help="Run the unified no-animal release certification workflow",
+    )
+    certify_parser.add_argument("--config", type=Path, required=True)
+    certify_parser.add_argument("--output", type=Path, default=None)
+    certify_parser.add_argument("--physical-evidence", type=Path, default=None)
+    certify_parser.add_argument("--preflight-duration", type=float, default=3.0)
+    certify_parser.add_argument("--cap-touch-duration", type=float, default=10.0)
+    certify_parser.add_argument("--barcode-repetitions", type=int, default=3)
+    certify_parser.add_argument("--confirm-no-animal", action="store_true")
+    certify_parser.add_argument("--confirm-collection-vessel", action="store_true")
+    certify_parser.add_argument("--confirm-force-clear", action="store_true")
+    certify_parser.add_argument("--confirm-speaker-safe", action="store_true")
+    certify_parser.add_argument("--confirm-emergency-stop", action="store_true")
 
     roi_parser = sub.add_parser("camera-roi-setup", help="Select or write Spinnaker ROI fields")
     roi_parser.add_argument("--config", type=Path, required=True)
@@ -310,7 +327,7 @@ def main() -> None:
                 source="hf-dm rig-preflight --no-monitor",
                 values={"monitor.enabled": False},
             )
-        session = HFDecisionSession(config)
+        session = HFDecisionSession(config, run_mode="bench")
         try:
             session.connect()
             summary = session.preflight(duration_s=args.duration)
@@ -340,6 +357,30 @@ def main() -> None:
                 indent=2,
             )
         )
+        return
+    if args.command == "certify-rig":
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+        result = run_rig_certification(
+            args.config,
+            output=args.output,
+            physical_evidence=args.physical_evidence,
+            preflight_duration_s=args.preflight_duration,
+            cap_touch_duration_s=args.cap_touch_duration,
+            barcode_repetitions=args.barcode_repetitions,
+            confirmations={
+                "no_animal_present": args.confirm_no_animal,
+                "collection_vessel_installed": args.confirm_collection_vessel,
+                "force_mechanism_clear": args.confirm_force_clear,
+                "speaker_exposure_safe": args.confirm_speaker_safe,
+                "emergency_power_control_available": args.confirm_emergency_stop,
+            },
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        if result["status"] != "PASS":
+            raise SystemExit(1)
         return
     if args.command == "camera-roi-setup":
         result = _write_camera_roi(

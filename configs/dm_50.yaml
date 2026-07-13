@@ -18,6 +18,7 @@ timing:
   timeout_noise_s: 2.0
   post_timeout_s: 1.0
   choice_loop_stall_s: 0.1
+  output_verification_timeout_s: 0.15
 
 wheel:
   gain_deg_per_mm: 4.0
@@ -116,6 +117,28 @@ integrations:
   mm_soundcard_status: true
   mm_alyx_register: false
   mm_flir_roi_gui: true
+
+welfare:
+  subjects_dir: subjects
+  water_target_ml:
+  append_session_water: true
+  max_cumulative_reward_ul:
+  require_current_weight: true
+  max_weight_age_days: 1
+
+animal_use:
+  enabled: true
+  certification_path: ../certifications/dm_50_rig.json
+  max_certification_age_days: 30
+  max_calibration_age_days: 30
+  max_calibration_residual_ul: 0.5
+  require_clean_git: true
+  require_local_storage: true
+  require_camera: true
+  require_speaker: true
+  require_licks: true
+  require_operator_confirmation: true
+  hardware_failsafe_revision:
 
 session_export:
   layout: mm_hierarchy

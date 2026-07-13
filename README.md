@@ -287,11 +287,13 @@ Drop `--simulate-headless` to open the pygame window. Choice modes: `matched`, `
 `timeout`, `cw`, `ccw`, `alternate` (in the DM task, *matched* = star/high-effort, *opposite* =
 circle/low-effort).
 
-**3. On the rig**, preflight then run:
+**3. On the rig**, preflight first. The shipped animal profiles are intentionally fail-closed: a
+session will not open hardware until the exact tagged release/config/calibration has a current PASS
+certificate and the operator confirms that this is an animal-use run.
 
 ```bash
 python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration 2
-python -m hf_dm.cli --config configs/dm_50.yaml
+python -m hf_dm.cli --config configs/dm_50.yaml --confirm-animal-use
 ```
 
 > On the Windows rig, `python -m hf_dm.cli ...` is the reliable launcher. The editable
@@ -403,6 +405,7 @@ self-test) do not start Bpod trials.
 | `--frame2ttl-diagnostic [--frame2ttl-flips N]` | Flashes the sync square, counts DI05 edges |
 | `--frame2ttl-barcode-diagnostic` | Displays representative count barcodes, reports decode/match accuracy |
 | `--bpod-opcode-diagnostic` | Sends Bpod state-marker opcodes, reports `bpod_state` timestamps reaching StreamDIO |
+| `hf-dm certify-rig` | **Activates real outputs.** Runs the complete machine certification and merges signed instrument evidence into the certificate consumed by the animal-use startup gate |
 
 ```bash
 python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration 2
@@ -418,11 +421,36 @@ Cap-touch thresholds (firmware v4) can be tuned from YAML (`licks.cap_touch_*`) 
 `--cap-touch-raw-analog` to temporarily stream pin 25 as the single analog input for a bringup-style
 readout.
 
+### Animal-use release gate
+
+The production YAML files set `animal_use.enabled: true`. Startup is blocked unless all of these
+match the current run: a clean exact Git tag and commit, dependency lock, config hash, reward
+calibration hash and fit quality, hardware failsafe revision, Bpod/StreamDIO/camera identities,
+current subject weight/water limits, required peripherals, signed approvals, and a current
+all-PASS rig certificate. `WARN` never satisfies this gate.
+
+The unified certification command refuses to actuate until the operator truthfully supplies all
+five no-animal safety confirmations:
+
+```powershell
+hf-dm certify-rig --config configs/dm_50.yaml `
+  --physical-evidence certifications/rig1-physical-evidence.json `
+  --confirm-no-animal --confirm-collection-vessel --confirm-force-clear `
+  --confirm-speaker-safe --confirm-emergency-stop
+```
+
+It runs preflight, the production-FSM hardware self-test, Frame2TTL square and barcode tests, Bpod
+opcode transport, and cap-touch diagnostics. A PASS additionally requires traceable oscilloscope,
+SPL-meter, force-gauge, geometry, independent failsafe/failure-injection, full-duration soak, and
+welfare-protocol evidence. See [Animal-ready release and certification](docs/ANIMAL_READY_RELEASE.md)
+and the tracked [physical evidence template](docs/physical_evidence.example.json).
+
 ---
 
 ## Counterbalancing, calibration & welfare
 
-All three are **opt-in**; defaults preserve historical behavior exactly.
+Counterbalancing, calibration annotation, and welfare logging retain backward-compatible defaults.
+The shipped production profiles additionally enable the fail-closed animal-use gate described above.
 
 ```yaml
 task:
@@ -549,6 +577,7 @@ print(matched.mean(), trials["response_time_s"].mean())
 | `export-session <json> [--export-preview-video]` | Regenerate derived exports |
 | `export-preview-video <dir>` | Offline FFV1 AVI from saved PGM frames |
 | `rig-preflight --config <cfg>` | No-trial hardware preflight, writes `rig_preflight_report.json` |
+| `certify-rig --config <cfg>` | Unified no-animal, real-output certification; requires five explicit safety confirmations and signed physical evidence |
 | `calibrate-valve --config <cfg>` | Guided reward-valve calibration (actuates pump) |
 | `log-weight <subject> --weight W` | Append a subject weight/water record |
 | `camera-roi-setup --config <cfg>` | Select/write Spinnaker ROI (`--interactive`, `--visual`, `--clear`) |
@@ -571,7 +600,7 @@ non-zero exit code.
 
 | Flag group | Flags |
 |------------|-------|
-| Core | `--config` (required), `-v/--verbose` |
+| Core | `--config` (required), `--confirm-animal-use` for one certified animal run, `-v/--verbose` |
 | Modes | `--simulate`, `--preflight`, `--hardware-self-test`, `--cap-touch-diagnostic`, `--frame2ttl-diagnostic`, `--frame2ttl-barcode-diagnostic`, `--bpod-opcode-diagnostic` |
 | Simulation | `--simulate-headless`, `--simulate-choice-mode`, `--simulate-trials` |
 | Monitor | `--monitor`, `--no-monitor` |
@@ -637,9 +666,10 @@ mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_expor
 
 GitHub Actions runs Ruff, the stable-module mypy gate, and the full pytest suite on **Windows and
 Linux** (Python 3.12, dummy SDL video/audio). Tests are hardware-free: a `SimulatedHFDecisionSession`
-drives the real controller path with mocked Bpod/StreamDIO. Physical rig certification remains the
-job of `rig-preflight` and the hardware diagnostics, whose reports use typed `name/status/detail/hint`
-results.
+drives the real controller path with mocked Bpod/StreamDIO. They cannot establish Bpod clock drift,
+USB load timing, acoustic/force/valve safety, or power-loss behavior on a particular rig. The
+`certify-rig` workflow combines live diagnostics with signed instrument and failure-injection
+evidence; only its exact all-PASS certificate unlocks an animal session.
 
 For audio/display-less environments, export `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy`.
 

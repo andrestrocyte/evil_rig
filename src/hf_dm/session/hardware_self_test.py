@@ -35,7 +35,7 @@ class HardwareSelfTestSession(HFDecisionSession):
     _force_sequence: tuple[Direction, ...] = ("cw", "cw", "ccw")
 
     def __init__(self, config: SessionConfig, options: HardwareSelfTestOptions | None = None):
-        super().__init__(config)
+        super().__init__(config, run_mode="bench")
         self.options = options or HardwareSelfTestOptions()
         self._injectors: dict[int, threading.Thread] = {}
 

@@ -339,7 +339,7 @@ def test_ops_cli_rig_preflight_writes_report_and_refreshes_manifest(
     )
 
     class FakeSession:
-        def __init__(self, config):
+        def __init__(self, config, **_kwargs):
             self.config = config
             self.recorder = None
             self.closed = False

@@ -45,6 +45,8 @@ class RewardCalibration:
     fit_slope_ul_per_s: float | None = None
     fit_intercept_ul: float | None = None
     fit_r_squared: float | None = None
+    fit_max_abs_residual_ul: float | None = None
+    fit_rmse_ul: float | None = None
 
     @classmethod
     def load(cls, path: Path | str) -> "RewardCalibration":
@@ -78,6 +80,8 @@ class RewardCalibration:
             fit_slope_ul_per_s=_optional_float(fit.get("slope_ul_per_s")),
             fit_intercept_ul=_optional_float(fit.get("intercept_ul")),
             fit_r_squared=_optional_float(fit.get("r_squared")),
+            fit_max_abs_residual_ul=_optional_float(fit.get("max_abs_residual_ul")),
+            fit_rmse_ul=_optional_float(fit.get("rmse_ul")),
         )
 
     @property
@@ -122,6 +126,8 @@ class RewardCalibration:
                 "slope_ul_per_s": self.fit_slope_ul_per_s,
                 "intercept_ul": self.fit_intercept_ul,
                 "r_squared": self.fit_r_squared,
+                "max_abs_residual_ul": self.fit_max_abs_residual_ul,
+                "rmse_ul": self.fit_rmse_ul,
             },
         }
 
@@ -163,6 +169,8 @@ def fit_valve_calibration(
     slope, intercept = np.polyfit(x, y, 1)
     predicted = slope * x + intercept
     residual_sum = float(np.sum((y - predicted) ** 2))
+    max_abs_residual_ul = float(np.max(np.abs(y - predicted)))
+    rmse_ul = float(np.sqrt(np.mean((y - predicted) ** 2)))
     total_sum = float(np.sum((y - np.mean(y)) ** 2))
     if total_sum <= np.finfo(float).eps:
         r_squared = 1.0 if residual_sum <= np.finfo(float).eps else 0.0
@@ -178,6 +186,8 @@ def fit_valve_calibration(
             "slope_ul_per_s": float(slope),
             "intercept_ul": float(intercept),
             "r_squared": float(r_squared),
+            "max_abs_residual_ul": max_abs_residual_ul,
+            "rmse_ul": rmse_ul,
         },
     }
 

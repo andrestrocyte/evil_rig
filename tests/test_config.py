@@ -177,6 +177,32 @@ def test_reward_calibration_path_loads_without_changing_default(tmp_path):
     assert configured.session_export.source_config_path == str(path.resolve())
 
 
+def test_animal_use_and_welfare_release_fields_load(tmp_path):
+    path = tmp_path / "animal.yaml"
+    path.write_text(
+        "animal_use:\n"
+        "  enabled: true\n"
+        "  certification_path: certifications/rig.json\n"
+        "  max_certification_age_days: 14\n"
+        "  hardware_failsafe_revision: watchdog-r2\n"
+        "welfare:\n"
+        "  max_cumulative_reward_ul: 750\n"
+        "  require_current_weight: true\n"
+        "  max_weight_age_days: 2\n",
+        encoding="utf-8",
+    )
+
+    config = SessionConfig.from_yaml(path)
+
+    assert config.animal_use.enabled is True
+    assert config.animal_use.certification_path == "certifications/rig.json"
+    assert config.animal_use.max_certification_age_days == 14
+    assert config.animal_use.hardware_failsafe_revision == "watchdog-r2"
+    assert config.welfare.max_cumulative_reward_ul == 750
+    assert config.welfare.require_current_weight is True
+    assert config.welfare.max_weight_age_days == 2
+
+
 def test_welfare_log_config_loads(tmp_path):
     path = tmp_path / "welfare.yaml"
     path.write_text(
