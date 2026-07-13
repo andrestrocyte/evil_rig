@@ -125,6 +125,7 @@ session_export:
   export_timeline: true
   streamdio_chunk_s: 45
   streamdio_memory_mode: bounded
+  streamdio_wal_fsync_s: 1.0
   streamdio_recent_events: 50000
 
 results_dir: data/sessions

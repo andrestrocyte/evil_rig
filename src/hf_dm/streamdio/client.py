@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any, Callable
 
 from hf_dm.hardware.bringup_constants import (
@@ -74,6 +74,10 @@ class StreamDIOClient:
         self._output_states: dict[int, int] = {}
         self._output_sequences: dict[int, int] = defaultdict(int)
         self._output_events: dict[int, tuple[int, int, float, float]] = {}
+        self._output_event_history: dict[
+            int,
+            deque[tuple[int, int, int, float, float]],
+        ] = defaultdict(lambda: deque(maxlen=64))
         self._last_buffer_stats: dict[str, int] = {}
 
     def open(
@@ -97,6 +101,9 @@ class StreamDIOClient:
             n_outputs = int(self._dio.module_info["n_output_channels"])
             with self._output_condition:
                 self._output_states = {channel: 0 for channel in range(1, n_outputs + 1)}
+                self._output_sequences = defaultdict(int)
+                self._output_events = {}
+                self._output_event_history = defaultdict(lambda: deque(maxlen=64))
         except Exception as exc:
             self._dio = None
             raise RuntimeError(
@@ -234,11 +241,26 @@ class StreamDIOClient:
             with self._output_condition:
                 self._output_states[channel_i] = value_i
                 self._output_sequences[channel_i] += 1
+                sequence = self._output_sequences[channel_i]
+                host_mono_s = time.perf_counter()
                 self._output_events[channel_i] = (
                     value_i,
                     int(timestamp_us),
                     float(relative_time),
-                    time.perf_counter(),
+                    host_mono_s,
+                )
+                history = getattr(self, "_output_event_history", None)
+                if history is None:
+                    history = defaultdict(lambda: deque(maxlen=64))
+                    self._output_event_history = history
+                history[channel_i].append(
+                    (
+                        sequence,
+                        value_i,
+                        int(timestamp_us),
+                        float(relative_time),
+                        host_mono_s,
+                    )
                 )
                 self._output_condition.notify_all()
         if self._callback is not None:
@@ -312,6 +334,52 @@ class StreamDIOClient:
         raise RuntimeError(
             f"StreamDIO acknowledged output channel {channel_i} state {state_i}, "
             "but no matching physical output event arrived"
+        )
+
+    def output_sequence_snapshot(self, channels: tuple[int, ...]) -> dict[int, int]:
+        """Return event cursors used to observe later Bpod-serial output changes."""
+
+        with self._output_condition:
+            return {
+                int(channel): int(self._output_sequences[int(channel)])
+                for channel in channels
+            }
+
+    def wait_for_output_event(
+        self,
+        channel: int,
+        state: bool | int,
+        *,
+        after_sequence: int,
+        timeout_s: float = 0.15,
+    ) -> dict[str, Any]:
+        """Observe a Bpod-issued physical output event without issuing a command."""
+
+        channel_i = int(channel)
+        state_i = 1 if bool(state) else 0
+        deadline = time.perf_counter() + max(0.0, float(timeout_s))
+        with self._output_condition:
+            while True:
+                history = getattr(self, "_output_event_history", {}).get(channel_i, ())
+                for sequence, value, timestamp_us, relative_s, host_mono_s in history:
+                    if int(sequence) > int(after_sequence) and int(value) == state_i:
+                        return {
+                            "channel": channel_i,
+                            "state": state_i,
+                            "event_verified": True,
+                            "actuator": "bpod_fsm_serial",
+                            "sequence": int(sequence),
+                            "module_timestamp_us": int(timestamp_us),
+                            "relative_time_s": float(relative_s),
+                            "event_host_perf_counter_s": float(host_mono_s),
+                        }
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    break
+                self._output_condition.wait(timeout=remaining)
+        raise RuntimeError(
+            "No matching Bpod-serial physical output event arrived for "
+            f"channel {channel_i} state {state_i} after sequence {after_sequence}"
         )
 
     def set_speaker_noise(

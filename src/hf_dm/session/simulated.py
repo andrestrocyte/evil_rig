@@ -19,8 +19,11 @@ from hf_dm.fsm.runtime import TrialRuntime
 from hf_dm.hardware.bringup_constants import (
     CAP_TOUCH_POWER_OUTPUT_CHANNEL,
     CAP_TOUCH_POWER_PIN,
+    CCW_FORCE_OUTPUT_CHANNEL,
+    CW_FORCE_OUTPUT_CHANNEL,
     FRAME2TTL_INPUT_CHANNEL,
     LICK_INPUT_CHANNEL,
+    PUMP_OUTPUT_CHANNEL,
     STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID,
     STREAMDIO_STATE_MARKER_MESSAGE_IDS,
 )
@@ -142,6 +145,12 @@ class SimulatedRelay:
             return [self._transition(3, False), self._transition(5, True)]
         return self.force_off()
 
+    def apply_bpod_output(self, name: str, channel: int, state: bool) -> dict:
+        self.ops.append(
+            ("bpod_output", str(name), int(channel), int(bool(state)), time.perf_counter())
+        )
+        return self._transition(channel, state)
+
     def force_off(self) -> list[dict]:
         self.ops.append(("force_off", time.perf_counter()))
         return [self._transition(3, False), self._transition(5, False)]
@@ -229,6 +238,12 @@ class SimulatedDIO:
         self._callback = None
         self._stream_start_mono = time.perf_counter()
         self._frame2ttl_state: int | None = None
+        self._output_condition = threading.Condition()
+        self._output_sequences: dict[int, int] = {}
+        self._output_event_history: dict[
+            int,
+            list[tuple[int, int, int, float, float]],
+        ] = {}
 
     def start_streaming(self, callback=None) -> None:
         self._callback = callback
@@ -302,6 +317,70 @@ class SimulatedDIO:
             None,
             int(event_relative_s * 1_000_000),
             event_relative_s,
+        )
+
+    def emit_output_transition(self, channel: int, state: bool) -> None:
+        channel_i = int(channel)
+        state_i = int(bool(state))
+        relative_s = max(0.0, time.perf_counter() - self._stream_start_mono)
+        timestamp_us = int(relative_s * 1_000_000)
+        host_mono_s = time.perf_counter()
+        with self._output_condition:
+            sequence = self._output_sequences.get(channel_i, 0) + 1
+            self._output_sequences[channel_i] = sequence
+            self._output_event_history.setdefault(channel_i, []).append(
+                (sequence, state_i, timestamp_us, relative_s, host_mono_s)
+            )
+            self._output_condition.notify_all()
+        if self._callback is not None:
+            self._callback(
+                "dio_output",
+                channel_i,
+                state_i,
+                timestamp_us,
+                relative_s,
+            )
+
+    def output_sequence_snapshot(self, channels: tuple[int, ...]) -> dict[int, int]:
+        with self._output_condition:
+            return {
+                int(channel): int(self._output_sequences.get(int(channel), 0))
+                for channel in channels
+            }
+
+    def wait_for_output_event(
+        self,
+        channel: int,
+        state: bool | int,
+        *,
+        after_sequence: int,
+        timeout_s: float = 0.15,
+    ) -> dict[str, Any]:
+        channel_i = int(channel)
+        state_i = int(bool(state))
+        deadline = time.perf_counter() + max(0.0, float(timeout_s))
+        with self._output_condition:
+            while True:
+                for sequence, value, timestamp_us, relative_s, host_mono_s in (
+                    self._output_event_history.get(channel_i, ())
+                ):
+                    if sequence > int(after_sequence) and value == state_i:
+                        return {
+                            "channel": channel_i,
+                            "state": state_i,
+                            "event_verified": True,
+                            "actuator": "bpod_fsm_serial",
+                            "sequence": sequence,
+                            "module_timestamp_us": timestamp_us,
+                            "relative_time_s": relative_s,
+                            "event_host_perf_counter_s": host_mono_s,
+                        }
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    break
+                self._output_condition.wait(timeout=remaining)
+        raise RuntimeError(
+            f"No simulated output event for channel {channel_i} state {state_i}"
         )
 
     def close(self) -> None:
@@ -465,6 +544,7 @@ class SimulatedHFDecisionSession(HFDecisionSession):
                 {"backend": "spinnaker_sim", "save_dir": str(session_dir)},
             )
         self.dio.start_streaming(callback=self._handle_streamdio_event)
+        self._start_output_verifier()
         self.recorder.log_event("streamdio_streaming_started", {"simulated": True})
         self.recorder.log_event("all_off_startup_verified", self.relay.all_off())
         self.recorder.log_event(
@@ -540,22 +620,34 @@ class SimulatedHFDecisionSession(HFDecisionSession):
         if self.relay is not None and self.speaker_relay is not None:
             ids = getattr(self.speaker_relay, "ids", None)
             if ids is not None and int(message_id) == int(ids.pump_on):
-                self.relay.pump_on()
+                self.relay.apply_bpod_output("pump_on", PUMP_OUTPUT_CHANNEL, True)
+                if self.dio is not None:
+                    self.dio.emit_output_transition(PUMP_OUTPUT_CHANNEL, True)
                 return
             if ids is not None and int(message_id) == int(ids.pump_off):
-                self.relay.pump_off()
+                self.relay.apply_bpod_output("pump_off", PUMP_OUTPUT_CHANNEL, False)
+                if self.dio is not None:
+                    self.dio.emit_output_transition(PUMP_OUTPUT_CHANNEL, False)
                 return
             if ids is not None and int(message_id) == int(ids.cw_force_on):
-                self.relay.set_force_direction("cw")
+                self.relay.apply_bpod_output("cw_force_on", CW_FORCE_OUTPUT_CHANNEL, True)
+                if self.dio is not None:
+                    self.dio.emit_output_transition(CW_FORCE_OUTPUT_CHANNEL, True)
                 return
             if ids is not None and int(message_id) == int(ids.ccw_force_on):
-                self.relay.set_force_direction("ccw")
+                self.relay.apply_bpod_output("ccw_force_on", CCW_FORCE_OUTPUT_CHANNEL, True)
+                if self.dio is not None:
+                    self.dio.emit_output_transition(CCW_FORCE_OUTPUT_CHANNEL, True)
                 return
-            if ids is not None and int(message_id) in {
-                int(ids.cw_force_off),
-                int(ids.ccw_force_off),
-            }:
-                self.relay.force_off()
+            if ids is not None and int(message_id) == int(ids.cw_force_off):
+                self.relay.apply_bpod_output("cw_force_off", CW_FORCE_OUTPUT_CHANNEL, False)
+                if self.dio is not None:
+                    self.dio.emit_output_transition(CW_FORCE_OUTPUT_CHANNEL, False)
+                return
+            if ids is not None and int(message_id) == int(ids.ccw_force_off):
+                self.relay.apply_bpod_output("ccw_force_off", CCW_FORCE_OUTPUT_CHANNEL, False)
+                if self.dio is not None:
+                    self.dio.emit_output_transition(CCW_FORCE_OUTPUT_CHANNEL, False)
                 return
         state_id = STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID.get(int(message_id))
         if state_id is None or self.dio is None:
@@ -590,6 +682,14 @@ class SimulatedHFDecisionSession(HFDecisionSession):
         )
 
     def _on_choice_window_started(self, runtime: TrialRuntime) -> None:
+        if runtime.task_kind == "centering":
+            start = runtime.centering_start_position_deg
+            if start is None:
+                runtime.fail(RuntimeError("Missing simulated centering start position"))
+                return
+            movement = "cw" if start < 0.0 else "ccw"
+            self.wheel.plan_choice(movement, abs(start))
+            return
         planned = runtime.simulated_choice  # type: ignore[attr-defined]
         self.wheel.plan_choice(planned, self.config.display.choice_distance_deg)
         if self.options.emit_licks:
@@ -602,8 +702,8 @@ class SimulatedHFDecisionSession(HFDecisionSession):
             )
 
     def _prepare_centering_trial(self, start_position_deg: float) -> None:
-        movement = "cw" if start_position_deg < 0.0 else "ccw"
-        self.wheel.plan_choice(movement, abs(start_position_deg))
+        del start_position_deg
+        self.wheel.plan_choice("timeout", 0.0)
 
     def _notify_frame2ttl_display_state(
         self,

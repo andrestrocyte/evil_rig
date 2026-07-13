@@ -68,6 +68,7 @@ session_export:
   streamdio_chunk_s: 45
   streamdio_memory_mode: bounded
   streamdio_recent_events: 123
+  streamdio_wal_fsync_s: 0.5
   cli_overrides:
     - source: pytest
       values:
@@ -86,6 +87,7 @@ session_export:
     assert config.session_export.streamdio_chunk_s == 45
     assert config.session_export.streamdio_memory_mode == "bounded"
     assert config.session_export.streamdio_recent_events == 123
+    assert config.session_export.streamdio_wal_fsync_s == 0.5
     assert config.session_export.cli_overrides == [
         {"source": "pytest", "values": {"monitor.enabled": True}}
     ]
@@ -117,6 +119,7 @@ def test_official_profiles_use_mm_layout_visual_roi_and_ten_choices():
         assert config.session_export.layout == "mm_hierarchy", filename
         assert config.monitor.trial_history == 10, filename
         assert config.integrations.mm_flir_roi_gui, filename
+        assert config.session_export.streamdio_wal_fsync_s == 1.0, filename
 
 
 def test_semantic_config_validation_reports_all_dangerous_values():

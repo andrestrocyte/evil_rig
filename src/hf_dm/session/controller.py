@@ -6,8 +6,9 @@ import logging
 import random
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from bpod_core.bpod import Bpod
 from bpod_core.fsm import StateMachine
@@ -53,6 +54,13 @@ from hf_dm.hardware.bringup_constants import (
     STREAMDIO_STATE_MARKER_NAMES,
 )
 from hf_dm.monitor import OperatorMonitor
+from hf_dm.safety_interlock import (
+    arm_safety_interlock,
+    assert_safety_interlock_clear,
+    clear_safety_interlock,
+    latch_safety_interlock,
+    safety_interlock_path,
+)
 from hf_dm.session.runners import (
     BpodDecisionEpochRunner,
     BpodDecisionTrialRunner,
@@ -93,6 +101,10 @@ class HFDecisionSession:
         self._closed = False
         self._last_choice_loop_stats: dict[str, float | int | str | bool] = {}
         self._active_trial_runtime: TrialRuntime | None = None
+        self._output_verifier: ThreadPoolExecutor | None = None
+        self._output_verification_lock = threading.Lock()
+        self._output_verification_futures: list[tuple[TrialRuntime, Future[dict[str, Any]]]] = []
+        self._output_verification_sequences: dict[int, int] = {}
         self._streamdio_status_poll_stop = threading.Event()
         self._streamdio_status_poll_thread: threading.Thread | None = None
         self._streamdio_module_status_snapshot_count = 0
@@ -100,6 +112,8 @@ class HFDecisionSession:
         self._latest_streamdio_module_status: dict | None = None
         self._cap_touch_status_snapshot_count = 0
         self._latest_cap_touch_status: dict | None = None
+        self._safety_interlock_path = safety_interlock_path()
+        self._safety_interlock_armed = False
         self.runtime_provenance: dict[str, object] = {}
         self._trial_schedule = self._build_trial_schedule()
 
@@ -140,6 +154,16 @@ class HFDecisionSession:
     def connect(self) -> None:
         self._closed = False
         self._require_live_barcode_capacity()
+        assert_safety_interlock_clear(self._safety_interlock_path)
+        arm_safety_interlock(
+            {
+                "subject_id": self.config.subject_id,
+                "phase": self.config.phase.value,
+                "results_dir": self.config.results_dir,
+            },
+            self._safety_interlock_path,
+        )
+        self._safety_interlock_armed = True
         self.runtime_provenance = capture_runtime_provenance()
         ports = self.config.ports
         self.bpod = connect_bpod_core(None if ports.bpod_port == "AUTO" else ports.bpod_port)
@@ -190,6 +214,7 @@ class HFDecisionSession:
         self._start_operator_monitor()
         self._start_optional_video_recording()
         self.dio.start_streaming(callback=self._handle_streamdio_event)
+        self._start_output_verifier()
         self.recorder.log_event("streamdio_streaming_started", {})
         self.relay = StreamDIOOutputs(
             self.dio,
@@ -280,7 +305,7 @@ class HFDecisionSession:
                 "lick_channels": list(self.config.licks.channels),
                 "frame2ttl": self._frame2ttl_descriptor(),
                 "cap_touch_power_output_channel": self.config.licks.power_output_channel,
-                "output_control": "bpod_fsm_softcode_to_verified_streamdio_usb",
+                "output_control": "bpod_fsm_serial_with_async_streamdio_observation",
                 "speaker_control": "bpod_fsm_serial_pin27_gate_plus_pc_white_noise",
             },
         )
@@ -289,13 +314,24 @@ class HFDecisionSession:
         if self._closed:
             return
         cleanup_result: dict = {}
+        cleanup_errors: list[dict[str, str]] = []
+
+        def cleanup_failed(stage: str, exc: BaseException) -> None:
+            error = f"{type(exc).__name__}: {exc}"
+            cleanup_errors.append({"stage": stage, "error": error})
+            logger.critical("Hardware cleanup failed at %s: %s", stage, error)
+
         try:
             if self.bpod is not None and self.bpod.is_running:
                 try:
                     self.bpod.send_softcode(sc.SESSION_ABORT)
                     self._wait_for_bpod_trial_threads()
-                except Exception:
+                except Exception as exc:
                     logger.exception("Failed to abort active Bpod trial during cleanup")
+                    cleanup_failed("bpod_abort", exc)
+            if self._active_trial_runtime is not None:
+                self._drain_output_verifications(self._active_trial_runtime)
+            self._shutdown_output_verifier()
             try:
                 self._stop_streamdio_status_poll()
             except Exception:
@@ -307,6 +343,7 @@ class HFDecisionSession:
                     self._safe_log_event("task_outputs_cleanup_verified", result)
                 except Exception as exc:
                     logger.exception("Failed to make task outputs safe")
+                    cleanup_failed("task_outputs_off", exc)
                     self._safe_log_event(
                         "task_outputs_cleanup_error",
                         {"error": f"{type(exc).__name__}: {exc}"},
@@ -318,6 +355,7 @@ class HFDecisionSession:
                     self._safe_log_event("speaker_gate_cleanup", {"state": "off"})
                 except Exception as exc:
                     logger.exception("Failed to turn off Bpod speaker gate")
+                    cleanup_failed("speaker_gate_off", exc)
                     self._safe_log_event(
                         "speaker_gate_cleanup_error",
                         {"error": f"{type(exc).__name__}: {exc}"},
@@ -329,8 +367,9 @@ class HFDecisionSession:
                         {"status": self._sound_status()},
                     )
                     self.white_noise_player.stop()
-                except Exception:
+                except Exception as exc:
                     logger.exception("Failed to stop white-noise playback")
+                    cleanup_failed("white_noise_stop", exc)
                 finally:
                     self.white_noise_player = None
             if self.dio is not None:
@@ -339,14 +378,18 @@ class HFDecisionSession:
                     self._safe_log_event("streamdio_camera_triggers_stopped", {})
                 except Exception as exc:
                     logger.exception("Failed to stop StreamDIO camera triggers")
+                    cleanup_failed("camera_triggers_stop", exc)
                     self._safe_log_event(
                         "streamdio_camera_stop_error",
                         {"error": f"{type(exc).__name__}: {exc}"},
                     )
             try:
-                self._stop_optional_video_recording()
-            except Exception:
+                video_error = self._stop_optional_video_recording()
+                if video_error is not None:
+                    cleanup_failed("camera_recording_stop", RuntimeError(video_error))
+            except Exception as exc:
                 logger.exception("Failed to finish optional video cleanup")
+                cleanup_failed("camera_recording_stop", exc)
             if self.relay is not None:
                 try:
                     cap_touch_off = self.relay.cap_touch_power(False)
@@ -370,6 +413,7 @@ class HFDecisionSession:
                     self._safe_log_event("all_off_cleanup_verified", cleanup_result)
                 except Exception as exc:
                     logger.exception("Failed to turn off cap-touch power")
+                    cleanup_failed("cap_touch_power_off", exc)
                     self._safe_log_event(
                         "cap_touch_power_off_error",
                         {"error": f"{type(exc).__name__}: {exc}"},
@@ -380,6 +424,7 @@ class HFDecisionSession:
                     self._update_streamdio_buffer_summary()
                 except Exception as exc:
                     logger.exception("Failed to close StreamDIO")
+                    cleanup_failed("streamdio_close", exc)
                     self._safe_log_event(
                         "streamdio_close_error",
                         {"error": f"{type(exc).__name__}: {exc}"},
@@ -390,6 +435,7 @@ class HFDecisionSession:
                     self.bpod.close()
                 except Exception as exc:
                     logger.exception("Failed to close Bpod")
+                    cleanup_failed("bpod_close", exc)
                     self._safe_log_event(
                         "bpod_close_error",
                         {"error": f"{type(exc).__name__}: {exc}"},
@@ -401,6 +447,32 @@ class HFDecisionSession:
             except Exception:
                 logger.exception("Failed to stop operator monitor during cleanup")
             finally:
+                if self._safety_interlock_armed:
+                    if cleanup_errors:
+                        try:
+                            path = latch_safety_interlock(
+                                cleanup_errors,
+                                path=self._safety_interlock_path,
+                            )
+                            logger.critical(
+                                "Rig safety interlock remains latched at %s; "
+                                "new live sessions are blocked",
+                                path,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not update the hardware safety interlock; "
+                                "the armed marker is intentionally retained"
+                            )
+                    else:
+                        try:
+                            clear_safety_interlock(self._safety_interlock_path)
+                        except Exception as exc:
+                            cleanup_failed("safety_interlock_clear", exc)
+                            logger.exception(
+                                "Verified cleanup completed but the safety interlock "
+                                "could not be cleared; new sessions remain blocked"
+                            )
                 self._closed = True
 
     def _safe_log_event(self, event_type: str, payload: dict | None = None) -> None:
@@ -411,6 +483,10 @@ class HFDecisionSession:
             self.recorder.log_event(event_type, payload)
         except Exception:
             logger.exception("Failed to record cleanup event %s", event_type)
+
+    def _check_recorder_health(self) -> None:
+        if self.recorder is not None:
+            self.recorder.raise_if_background_error()
 
     def _bpod_serial_ports(self) -> set[str]:
         if self.bpod is None:
@@ -1588,9 +1664,9 @@ class HFDecisionSession:
                     "a session without video."
                 ) from exc
 
-    def _stop_optional_video_recording(self) -> None:
+    def _stop_optional_video_recording(self) -> str | None:
         if self.camera_recorder is None:
-            return
+            return None
         assert self.recorder is not None
         try:
             summary = self.camera_recorder.stop()
@@ -1602,6 +1678,7 @@ class HFDecisionSession:
                 },
             )
             self.recorder.log_event("video_recording_stopped", summary)
+            return None
         except Exception as exc:
             logger.exception("Failed to stop headless Spinnaker recording")
             self.recorder.log_event(
@@ -1612,6 +1689,7 @@ class HFDecisionSession:
                     "error": f"{type(exc).__name__}: {exc}",
                 },
             )
+            return f"{type(exc).__name__}: {exc}"
         finally:
             self.camera_recorder = None
 
@@ -2190,6 +2268,7 @@ class HFDecisionSession:
             return
         deadline = time.perf_counter() + max(0.0, float(duration_s))
         while time.perf_counter() < deadline:
+            self._check_recorder_health()
             self.display.pump_events()
             self.display.clock.tick(self.config.display.fps)
 
@@ -2221,6 +2300,7 @@ class HFDecisionSession:
         self.recorder.log_event("quiescence_wait_start", {"required_s": self.config.timing.quiescence_s})
         self.wheel.reset_trial()
         while True:
+            self._check_recorder_health()
             if self.display is not None:
                 self.display.pump_events()
             self._track_engagement_from_wheel()
@@ -2297,7 +2377,176 @@ class HFDecisionSession:
         if softcode_thread is not None and hasattr(softcode_thread, "drain"):
             softcode_thread.drain()
 
+    def _start_output_verifier(self) -> None:
+        if self._output_verifier is None:
+            self._output_verifier = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="hf-dm-output-verifier",
+            )
+
+    def _reset_output_verification_sequences(self) -> None:
+        if self.dio is None:
+            self._output_verification_sequences = {}
+            return
+        snapshot = getattr(self.dio, "output_sequence_snapshot", None)
+        if not callable(snapshot):
+            raise RuntimeError("StreamDIO does not support passive output verification")
+        self._output_verification_sequences = snapshot(
+            (
+                PUMP_OUTPUT_CHANNEL,
+                CW_FORCE_OUTPUT_CHANNEL,
+                CCW_FORCE_OUTPUT_CHANNEL,
+            )
+        )
+
+    def _queue_output_verification(
+        self,
+        runtime: TrialRuntime,
+        *,
+        kind: str,
+        channel: int,
+        state: bool,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self.dio is None or self.recorder is None:
+            raise RuntimeError("Output verification requested before StreamDIO was ready")
+        self._start_output_verifier()
+        assert self._output_verifier is not None
+        channel_i = int(channel)
+        with self._output_verification_lock:
+            after_sequence = int(self._output_verification_sequences.get(channel_i, 0))
+            self._output_verification_sequences[channel_i] = after_sequence + 1
+            future = self._output_verifier.submit(
+                self._verify_bpod_output,
+                runtime,
+                kind=kind,
+                channel=channel_i,
+                state=bool(state),
+                after_sequence=after_sequence,
+                payload=dict(payload),
+            )
+            self._output_verification_futures.append((runtime, future))
+        return {
+            "verification": "queued",
+            "actuator": "bpod_fsm_serial",
+            "channel": channel_i,
+            "state": int(bool(state)),
+            "after_sequence": after_sequence,
+        }
+
+    def _verify_bpod_output(
+        self,
+        runtime: TrialRuntime,
+        *,
+        kind: str,
+        channel: int,
+        state: bool,
+        after_sequence: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        assert self.dio is not None and self.recorder is not None
+        try:
+            transition = self.dio.wait_for_output_event(
+                int(channel),
+                bool(state),
+                after_sequence=int(after_sequence),
+                timeout_s=0.15,
+            )
+            actual_mono_s = float(transition["event_host_perf_counter_s"])
+            event_payload = {
+                **payload,
+                "transition": transition,
+                "actuator": "bpod_fsm_serial",
+                "verification": "asynchronous_streamdio_event",
+            }
+            if kind == "force_on":
+                event_payload["transitions"] = [transition]
+                event_payload["actual_on_mono_s"] = actual_mono_s
+                self.recorder.log_event("force_on", event_payload)
+            elif kind == "force_off":
+                event_payload["transitions"] = [transition]
+                event_payload["actual_off_mono_s"] = actual_mono_s
+                self.recorder.log_event("force_off", event_payload)
+            elif kind == "pump_on":
+                runtime.pump_actual_on_mono_s = actual_mono_s
+                event_payload["actual_on_mono_s"] = actual_mono_s
+                self.recorder.log_event("pump_start", event_payload)
+            elif kind == "pump_off":
+                actual_open_s = (
+                    None
+                    if runtime.pump_actual_on_mono_s is None
+                    else actual_mono_s - runtime.pump_actual_on_mono_s
+                )
+                event_payload["actual_off_mono_s"] = actual_mono_s
+                event_payload["actual_open_s"] = actual_open_s
+                self.recorder.log_event("pump_end", event_payload)
+            elif kind == "pump_safety_off":
+                event_payload["actual_off_mono_s"] = actual_mono_s
+                self.recorder.log_event("pump_safety_off", event_payload)
+            else:
+                raise RuntimeError(f"Unknown output verification kind: {kind}")
+            return transition
+        except BaseException as exc:
+            self.recorder.log_event(
+                "output_verification_failed",
+                {
+                    **payload,
+                    "kind": kind,
+                    "channel": int(channel),
+                    "state": int(bool(state)),
+                    "after_sequence": int(after_sequence),
+                    "actuator": "bpod_fsm_serial",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            runtime.fail(exc)
+            return {
+                "event_verified": False,
+                "channel": int(channel),
+                "state": int(bool(state)),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def _drain_output_verifications(
+        self,
+        runtime: TrialRuntime,
+        *,
+        timeout_s: float = 2.0,
+    ) -> None:
+        with self._output_verification_lock:
+            selected = [
+                future
+                for owner, future in self._output_verification_futures
+                if owner is runtime
+            ]
+        if selected:
+            done, pending = wait(selected, timeout=max(0.0, float(timeout_s)))
+            if pending:
+                runtime.fail(
+                    RuntimeError(
+                        f"Timed out draining {len(pending)} output verification jobs"
+                    )
+                )
+            for future in done:
+                future.result()
+        with self._output_verification_lock:
+            self._output_verification_futures = [
+                (owner, future)
+                for owner, future in self._output_verification_futures
+                if owner is not runtime
+            ]
+
+    def _shutdown_output_verifier(self) -> None:
+        verifier = self._output_verifier
+        self._output_verifier = None
+        if verifier is not None:
+            verifier.shutdown(wait=True, cancel_futures=False)
+        with self._output_verification_lock:
+            self._output_verification_futures.clear()
+            self._output_verification_sequences.clear()
+
     def _prepare_bpod_run(self, trial_number: int) -> None:
+        self._reset_output_verification_sequences()
         if self.speaker_relay is None:
             return
         prepare = getattr(self.speaker_relay, "prepare_bpod_run", None)
@@ -2315,12 +2564,12 @@ class HFDecisionSession:
             )
 
     def _handle_bpod_softcode(self, softcode: int) -> None:
-        """Execute verified host outputs when the Bpod FSM enters a state."""
+        """Observe Bpod-owned outputs and update the non-real-time host view."""
         runtime = self._active_trial_runtime
         if runtime is None:
             logger.warning("Ignoring Bpod output SoftCode %d without an active trial", softcode)
             return
-        if self.relay is None or self.recorder is None:
+        if self.dio is None or self.recorder is None:
             runtime.fail(RuntimeError("Bpod SoftCode arrived before task outputs were ready"))
             return
 
@@ -2333,7 +2582,10 @@ class HFDecisionSession:
             if softcode == sc.STATE_CHOICE:
                 self.wheel.reset_trial()
                 if runtime.force_direction is None:
-                    transition = self.relay.force_off()
+                    verification: dict[str, Any] = {
+                        "verification": "not_required",
+                        "actuator": "bpod_fsm_serial",
+                    }
                     self.recorder.log_event(
                         "force_skipped",
                         {
@@ -2343,44 +2595,56 @@ class HFDecisionSession:
                             "forced_shape": runtime.forced_shape,
                             "choice_target_direction": runtime.choice_target_direction,
                             "reason": self._force_skip_reason(runtime),
-                            "transitions": transition,
-                            "actual_off_mono_s": self._actual_transition_time(transition),
+                            "transitions": [],
                             "trigger": "bpod_state_entry",
+                            "actuator": "bpod_fsm_serial",
                         },
                     )
                 else:
-                    transition = self.relay.set_force_direction(runtime.force_direction)
-                    actual_on = self._actual_transition_time(transition)
-                    self.recorder.log_event(
-                        "force_on",
-                        {
+                    force_channel = (
+                        CW_FORCE_OUTPUT_CHANNEL
+                        if runtime.force_direction == "cw"
+                        else CCW_FORCE_OUTPUT_CHANNEL
+                    )
+                    verification = self._queue_output_verification(
+                        runtime,
+                        kind="force_on",
+                        channel=force_channel,
+                        state=True,
+                        payload={
                             "trial_index": runtime.trial_index,
                             "force_direction": runtime.force_direction,
                             "force_output_direction": runtime.force_direction,
                             "choice_target_direction": runtime.choice_target_direction,
-                            "transitions": transition,
-                            "actual_on_mono_s": actual_on,
                             "trigger": "bpod_state_entry",
                         },
                     )
-                self._on_choice_window_started(runtime)
                 self._publish_fsm_state("ChoiceWindow", runtime=runtime, phase="choice")
-                runtime.enter("choice", softcode=softcode, output_result=transition)
+                runtime.enter("choice", softcode=softcode, output_result=verification)
+                self._on_choice_window_started(runtime)
                 return
 
             if softcode == sc.STATE_BLANK:
                 runtime.close_choice()
-                transition = self.relay.force_off()
-                self.recorder.log_event(
-                    "force_off",
-                    {
-                        "trial_index": runtime.trial_index,
-                        "reason": "choice",
-                        "transitions": transition,
-                        "actual_off_mono_s": self._actual_transition_time(transition),
-                        "trigger": "bpod_state_entry",
-                    },
-                )
+                verification = {"verification": "not_required"}
+                if runtime.force_direction is not None:
+                    force_channel = (
+                        CW_FORCE_OUTPUT_CHANNEL
+                        if runtime.force_direction == "cw"
+                        else CCW_FORCE_OUTPUT_CHANNEL
+                    )
+                    verification = self._queue_output_verification(
+                        runtime,
+                        kind="force_off",
+                        channel=force_channel,
+                        state=False,
+                        payload={
+                            "trial_index": runtime.trial_index,
+                            "reason": "choice",
+                            "force_direction": runtime.force_direction,
+                            "trigger": "bpod_state_entry",
+                        },
+                    )
                 blank_state = (
                     "ChoiceBlankHigh"
                     if runtime.chosen_shape == "star"
@@ -2389,7 +2653,7 @@ class HFDecisionSession:
                     else "ChoiceBlank"
                 )
                 self._publish_fsm_state(blank_state, runtime=runtime, phase="blank")
-                runtime.enter("blank", softcode=softcode, output_result=transition)
+                runtime.enter("blank", softcode=softcode, output_result=verification)
                 return
 
             if softcode == sc.STATE_PUMP_ON:
@@ -2427,18 +2691,16 @@ class HFDecisionSession:
                         output_result={"pump_skipped": True, "reason": "risk_no_reward"},
                     )
                     return
-                transition = self.relay.pump_on()
-                actual_on = self._actual_transition_time(transition)
-                runtime.pump_actual_on_mono_s = actual_on
-                self.recorder.log_event(
-                    "pump_start",
-                    {
+                verification = self._queue_output_verification(
+                    runtime,
+                    kind="pump_on",
+                    channel=PUMP_OUTPUT_CHANNEL,
+                    state=True,
+                    payload={
                         "trial_index": runtime.trial_index,
                         "duration_s": reward_s,
                         "chosen_shape": runtime.chosen_shape,
                         "modality": runtime.modality,
-                        "transition": transition,
-                        "actual_on_mono_s": actual_on,
                         "trigger": "bpod_state_entry",
                     },
                 )
@@ -2457,29 +2719,25 @@ class HFDecisionSession:
                     runtime=runtime,
                     phase="reward",
                 )
-                runtime.enter("reward", softcode=softcode, output_result=transition)
+                runtime.enter("reward", softcode=softcode, output_result=verification)
                 return
 
             if softcode == sc.STATE_PUMP_OFF:
-                transition = self.relay.pump_off()
-                actual_off = self._actual_transition_time(transition)
-                actual_open = (
-                    None
-                    if runtime.pump_actual_on_mono_s is None
-                    else actual_off - runtime.pump_actual_on_mono_s
-                )
-                self.recorder.log_event(
-                    "pump_end",
-                    {
-                        "trial_index": runtime.trial_index,
-                        "chosen_shape": runtime.chosen_shape,
-                        "modality": runtime.modality,
-                        "transition": transition,
-                        "actual_off_mono_s": actual_off,
-                        "actual_open_s": actual_open,
-                        "trigger": "bpod_state_entry",
-                    },
-                )
+                reward_s = self._runtime_reward_duration(runtime, runtime.chosen_shape)
+                verification = {"verification": "not_required"}
+                if reward_s > 0.0:
+                    verification = self._queue_output_verification(
+                        runtime,
+                        kind="pump_off",
+                        channel=PUMP_OUTPUT_CHANNEL,
+                        state=False,
+                        payload={
+                            "trial_index": runtime.trial_index,
+                            "chosen_shape": runtime.chosen_shape,
+                            "modality": runtime.modality,
+                            "trigger": "bpod_state_entry",
+                        },
+                    )
                 self._publish_monitor(
                     "pump",
                     {
@@ -2493,22 +2751,30 @@ class HFDecisionSession:
                     runtime=runtime,
                     phase="post_reward",
                 )
-                runtime.enter("post_reward", softcode=softcode, output_result=transition)
+                runtime.enter("post_reward", softcode=softcode, output_result=verification)
                 return
 
             if softcode == sc.STATE_TIMEOUT_ON:
                 runtime.close_choice(clear=True)
-                transition = self.relay.force_off()
-                self.recorder.log_event(
-                    "force_off",
-                    {
-                        "trial_index": runtime.trial_index,
-                        "reason": "timeout",
-                        "transitions": transition,
-                        "actual_off_mono_s": self._actual_transition_time(transition),
-                        "trigger": "bpod_state_entry",
-                    },
-                )
+                verification = {"verification": "not_required"}
+                if runtime.force_direction is not None:
+                    force_channel = (
+                        CW_FORCE_OUTPUT_CHANNEL
+                        if runtime.force_direction == "cw"
+                        else CCW_FORCE_OUTPUT_CHANNEL
+                    )
+                    verification = self._queue_output_verification(
+                        runtime,
+                        kind="force_off",
+                        channel=force_channel,
+                        state=False,
+                        payload={
+                            "trial_index": runtime.trial_index,
+                            "reason": "timeout",
+                            "force_direction": runtime.force_direction,
+                            "trigger": "bpod_state_entry",
+                        },
+                    )
                 self.recorder.log_event(
                     "white_noise_start",
                     {
@@ -2528,7 +2794,7 @@ class HFDecisionSession:
                     },
                 )
                 self._publish_fsm_state("TimeoutNoise", runtime=runtime, phase="timeout")
-                runtime.enter("timeout", softcode=softcode, output_result=transition)
+                runtime.enter("timeout", softcode=softcode, output_result=verification)
                 return
 
             if softcode == sc.STATE_TIMEOUT_OFF:
@@ -2555,9 +2821,46 @@ class HFDecisionSession:
                 return
 
             if softcode == sc.STATE_ABORT:
-                result = self.relay.task_outputs_off()
+                pump_verification = self._queue_output_verification(
+                    runtime,
+                    kind="pump_safety_off",
+                    channel=PUMP_OUTPUT_CHANNEL,
+                    state=False,
+                    payload={
+                        "trial_index": runtime.trial_index,
+                        "reason": "abort",
+                        "trigger": "bpod_abort_state",
+                    },
+                )
+                force_verification = None
+                if runtime.force_direction is not None:
+                    force_channel = (
+                        CW_FORCE_OUTPUT_CHANNEL
+                        if runtime.force_direction == "cw"
+                        else CCW_FORCE_OUTPUT_CHANNEL
+                    )
+                    force_verification = self._queue_output_verification(
+                        runtime,
+                        kind="force_off",
+                        channel=force_channel,
+                        state=False,
+                        payload={
+                            "trial_index": runtime.trial_index,
+                            "reason": "abort",
+                            "force_direction": runtime.force_direction,
+                            "trigger": "bpod_abort_state",
+                        },
+                    )
                 self._publish_fsm_state("Abort", runtime=runtime, phase="abort")
-                runtime.enter("abort", softcode=softcode, output_result=result)
+                runtime.enter(
+                    "abort",
+                    softcode=softcode,
+                    output_result={
+                        "pump": pump_verification,
+                        "force": force_verification,
+                        "speaker_gate": "bpod_fsm_serial_off",
+                    },
+                )
                 return
 
             raise RuntimeError(f"Unknown Bpod output SoftCode {softcode}")

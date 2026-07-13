@@ -21,6 +21,43 @@ _warned_locations: set[str] = set()
 _warning_lock = threading.Lock()
 
 
+def _warn_unsupported(location: str) -> None:
+    with _warning_lock:
+        should_warn = location not in _warned_locations
+        _warned_locations.add(location)
+    if should_warn:
+        warnings.warn(
+            f"Filesystem directory at {location!r} does not support fsync; "
+            "continuing after flush. Crash/power-loss durability is reduced for "
+            "files in this directory.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def _sync_descriptor(file_descriptor: int) -> None:
+    """Flush without poisoning file descriptors on unsupported Windows volumes."""
+
+    if os.name != "nt":
+        os.fsync(file_descriptor)
+        return
+
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    flush_file_buffers = kernel32.FlushFileBuffers
+    flush_file_buffers.argtypes = [ctypes.c_void_p]
+    flush_file_buffers.restype = ctypes.c_int
+    native_handle = msvcrt.get_osfhandle(file_descriptor)
+    ctypes.set_last_error(0)
+    if not flush_file_buffers(ctypes.c_void_p(native_handle)):
+        winerror = ctypes.get_last_error()
+        error = OSError(errno.EINVAL, f"FlushFileBuffers failed with WinError {winerror}")
+        error.winerror = winerror  # type: ignore[attr-defined]
+        raise error
+
+
 def fsync_best_effort(handle: IO[Any], *, path: Path | str | None = None) -> bool:
     """Flush *handle* to stable storage when the backing filesystem supports it.
 
@@ -37,21 +74,15 @@ def fsync_best_effort(handle: IO[Any], *, path: Path | str | None = None) -> boo
     file_descriptor = handle.fileno()
     if file_descriptor < 0:
         raise OSError(errno.EBADF, "invalid file descriptor")
-    location = str(Path(path).resolve().anchor if path is not None else "unknown filesystem")
+    location = "unknown filesystem"
+    if path is not None:
+        directory = Path(path).resolve().parent
+        location = str(directory)
     try:
-        os.fsync(file_descriptor)
+        _sync_descriptor(file_descriptor)
     except OSError as exc:
         if exc.errno not in _UNSUPPORTED_FSYNC_ERRNOS:
             raise
-        with _warning_lock:
-            should_warn = location not in _warned_locations
-            _warned_locations.add(location)
-        if should_warn:
-            warnings.warn(
-                f"Filesystem at {location!r} does not support fsync; continuing after flush. "
-                "Crash/power-loss durability is reduced for files on this filesystem.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        _warn_unsupported(location)
         return False
     return True

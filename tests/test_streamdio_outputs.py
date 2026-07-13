@@ -1,5 +1,5 @@
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from hf_dm.hardware.bringup_constants import (
     CAP_TOUCH_INPUT_PIN,
@@ -121,6 +121,7 @@ def _client() -> StreamDIOClient:
     client._output_states = {channel: 0 for channel in range(1, 14)}
     client._output_sequences = defaultdict(int)
     client._output_events = {}
+    client._output_event_history = defaultdict(lambda: deque(maxlen=64))
     client._dio = FakeProtocol()
     client._dio.client = client
     return client
@@ -136,6 +137,23 @@ def test_output_command_requires_matching_firmware_event():
     assert transition["channel"] == 1
     assert transition["state"] == 1
     assert transition["module_timestamp_us"] == 1234
+
+
+def test_passive_output_observer_accepts_event_that_arrived_before_wait():
+    client = _client()
+    client._dispatch_event("dio_output", 1, 1, 4321, 0.004321)
+
+    transition = client.wait_for_output_event(
+        1,
+        True,
+        after_sequence=0,
+        timeout_s=0.0,
+    )
+
+    assert transition["event_verified"]
+    assert transition["actuator"] == "bpod_fsm_serial"
+    assert transition["sequence"] == 1
+    assert transition["module_timestamp_us"] == 4321
 
 
 def test_rotary_force_config_requires_cap_touch_digitizer_firmware():
