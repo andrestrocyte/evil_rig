@@ -78,15 +78,37 @@ def certified_config_payload(config: SessionConfig) -> dict[str, Any]:
     """Return the effective safety-relevant config used for release matching."""
 
     payload = config_to_dict(config)
+    # Subject/session identity and output locations change for every acquisition.
+    # They are validated independently at startup and must not invalidate a rig
+    # certificate that otherwise matches the exact task and hardware contract.
+    payload["subject_id"] = None
+    payload["results_dir"] = None
+    reward = payload.get("reward")
+    if isinstance(reward, dict):
+        # The calibration artifact itself is bound separately by SHA-256.
+        reward["calibration_path"] = None
+    camera = payload.get("camera")
+    if isinstance(camera, dict):
+        camera["save_dir"] = None
+    task = payload.get("task")
+    if isinstance(task, dict):
+        task["selected_mouse_dir"] = None
+        task["session_name"] = None
+        task["session_dir"] = None
+    welfare = payload.get("welfare")
+    if isinstance(welfare, dict):
+        welfare["subjects_dir"] = None
+    animal_use = payload.get("animal_use")
+    if isinstance(animal_use, dict):
+        animal_use["certification_path"] = None
     export = payload.get("session_export")
     if isinstance(export, dict):
         # Absolute source locations are provenance, not experiment semantics.
         export["source_config_path"] = None
-        overrides = export.get("cli_overrides")
-        if isinstance(overrides, list):
-            for override in overrides:
-                if isinstance(override, dict):
-                    override.pop("created_wall_time_s", None)
+        # Overrides are an audit trail. Their effective values already appear in
+        # the canonical config fields above, while setup timestamps and paths are
+        # intentionally session-specific.
+        export["cli_overrides"] = []
     return payload
 
 
@@ -248,11 +270,21 @@ def evaluate_animal_use_gate(
         identity.get("requirements_lock_sha256"),
     )
 
-    storage: dict[str, Any]
-    try:
-        storage = storage_probe(config.results_dir)
-    except Exception as exc:
-        storage = {"pass": False, "error": f"{type(exc).__name__}: {exc}"}
+    storage_paths = {"results": config.results_dir}
+    if config.camera.record_video or config.camera.required:
+        storage_paths["camera"] = config.camera.save_dir
+    storage: dict[str, Any] = {"paths": {}}
+    for name, path in storage_paths.items():
+        try:
+            storage["paths"][name] = storage_probe(path)
+        except Exception as exc:
+            storage["paths"][name] = {
+                "pass": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+    storage["pass"] = all(
+        item.get("pass") is True for item in storage["paths"].values()
+    )
     check(
         "local_durable_storage",
         not config.animal_use.require_local_storage or storage.get("pass") is True,

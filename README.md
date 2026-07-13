@@ -445,6 +445,15 @@ SPL-meter, force-gauge, geometry, independent failsafe/failure-injection, full-d
 welfare-protocol evidence. See [Animal-ready release and certification](docs/ANIMAL_READY_RELEASE.md)
 and the tracked [physical evidence template](docs/physical_evidence.example.json).
 
+Normal animal-session startup is also interactive. A missing, stale, or mismatched certificate (or
+missing calibration, weight/water record, durable storage, welfare cap, or one-run confirmation)
+opens the **HF-DM animal-use readiness** desktop window. It shows every failed gate, accepts the
+supported operational values, logs subject weight/water, runs guided valve calibration, edits signed
+physical-evidence JSON, and launches the same full certification workflow. All actions and command
+output are logged beside the ignored certificate. **Start session** stays disabled until the
+production gate returns PASS; the GUI never fabricates physical evidence or overrides a failed test.
+Use `--no-certification-dialog` only for deliberately non-interactive automation.
+
 ---
 
 ## Counterbalancing, calibration & welfare

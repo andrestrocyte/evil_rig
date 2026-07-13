@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from copy import deepcopy
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,6 +12,7 @@ from hf_dm.certification import (
     AnimalUseGateError,
     assert_animal_use_ready,
     build_release_identity,
+    certified_config_sha256,
     evaluate_animal_use_gate,
 )
 from hf_dm.config import SessionConfig
@@ -206,6 +208,66 @@ def test_operator_confirmation_is_per_run_and_cannot_be_stored_in_certificate(tm
     assert next(
         item for item in report["checks"] if item["name"] == "operator_confirmation"
     )["status"] == "FAIL"
+
+
+def test_certificate_hash_ignores_per_session_identity_and_storage_paths(tmp_path):
+    config, _provenance, _certificate, _now = _release_fixture(tmp_path)
+    baseline = certified_config_sha256(config)
+    changed = deepcopy(config)
+    changed.subject_id = "different-mouse"
+    changed.results_dir = str(tmp_path / "other-session")
+    changed.camera.save_dir = str(tmp_path / "other-video")
+    changed.reward.calibration_path = str(tmp_path / "relocated-calibration.json")
+    changed.welfare.subjects_dir = str(tmp_path / "other-subject-records")
+    changed.animal_use.certification_path = str(tmp_path / "relocated-certificate.json")
+    changed.task.selected_mouse_dir = str(tmp_path / "different-mouse")
+    changed.task.session_name = "different-session"
+    changed.task.session_dir = str(tmp_path / "different-session")
+    changed.session_export.source_config_path = str(tmp_path / "effective.yaml")
+    changed.session_export.cli_overrides.append({"created_wall_time_s": time.time()})
+
+    assert certified_config_sha256(changed) == baseline
+
+
+def test_certificate_hash_still_binds_task_and_safety_values(tmp_path):
+    config, _provenance, _certificate, _now = _release_fixture(tmp_path)
+    baseline = certified_config_sha256(config)
+
+    for mutate in (
+        lambda value: setattr(value, "n_trials", value.n_trials + 1),
+        lambda value: setattr(value.reward, "matched_pump_s", 0.09),
+        lambda value: setattr(value.timing, "choice_timeout_s", 21.0),
+        lambda value: setattr(value.animal_use, "hardware_failsafe_revision", "watchdog-r3"),
+    ):
+        changed = deepcopy(config)
+        mutate(changed)
+        assert certified_config_sha256(changed) != baseline
+
+
+def test_gate_probes_results_and_camera_storage(tmp_path):
+    config, provenance, _certificate, now = _release_fixture(tmp_path)
+    config.camera.save_dir = str(tmp_path / "videos")
+    calls = []
+
+    def probe(path):
+        calls.append(str(path))
+        return {"pass": "videos" not in str(path)}
+
+    report = evaluate_animal_use_gate(
+        config,
+        operator_confirmed=True,
+        provenance=provenance,
+        now_s=now,
+        storage_probe=probe,
+    )
+
+    assert calls == [config.results_dir, config.camera.save_dir]
+    storage = next(
+        item for item in report["checks"] if item["name"] == "local_durable_storage"
+    )
+    assert storage["status"] == "FAIL"
+    assert storage["detail"]["paths"]["results"]["pass"] is True
+    assert storage["detail"]["paths"]["camera"]["pass"] is False
 
 
 def test_animal_gate_blocks_before_bpod_or_streamdio_is_opened(tmp_path, monkeypatch):
