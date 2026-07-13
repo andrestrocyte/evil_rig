@@ -9,7 +9,15 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Any, Callable
 
+from hf_dm.certification import AnimalUseGateError, assert_animal_use_ready
+from hf_dm.certification_gui import CertificationDialogResult, run_certification_dialog
+from hf_dm.certification_workflow import (
+    append_gui_audit,
+    apply_operator_state,
+    load_operator_state,
+)
 from hf_dm.config import (
     SessionConfig,
     config_to_dict,
@@ -232,6 +240,52 @@ def _normalize_modality(value: str) -> str:
     return modality
 
 
+def _load_saved_operator_state(config: SessionConfig) -> None:
+    if not config.animal_use.enabled:
+        return
+    try:
+        values = load_operator_state(config)
+        apply_operator_state(config, values)
+    except Exception as exc:
+        # A corrupt overlay must never prevent the remediation window from
+        # opening. It will display the same error and require corrected values.
+        append_gui_audit(
+            config,
+            "operator_state_load_failed",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def _remediate_animal_use_gate(
+    config: SessionConfig,
+    *,
+    operator_confirmed: bool,
+    dialog_enabled: bool,
+    report: dict[str, Any] | None = None,
+    dialog_fn: Callable[
+        [SessionConfig, dict[str, Any]], CertificationDialogResult
+    ] = run_certification_dialog,
+) -> bool:
+    """Return confirmation only after the production gate passes."""
+
+    try:
+        assert_animal_use_ready(config, operator_confirmed=operator_confirmed)
+        return operator_confirmed
+    except AnimalUseGateError as exc:
+        blocked_report: dict[str, Any] = report or exc.report
+        if not dialog_enabled:
+            raise
+    try:
+        outcome = dialog_fn(config, blocked_report)
+    except Exception:
+        # GUI/display failures preserve the original fail-closed behavior.
+        raise AnimalUseGateError(blocked_report)
+    if not outcome.continue_session or not outcome.operator_confirmed:
+        raise AnimalUseGateError(blocked_report)
+    assert_animal_use_ready(config, operator_confirmed=True)
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run HF decision-making session (bpod-core + StreamDIO)")
     parser.add_argument(
@@ -410,6 +464,14 @@ def main() -> None:
         "--no-session-dialog",
         action="store_true",
         help="Skip mouse/session setup dialogs and use YAML or explicit session args.",
+    )
+    parser.add_argument(
+        "--no-certification-dialog",
+        action="store_true",
+        help=(
+            "Keep animal-use certificate failures non-interactive. Intended for automation; "
+            "normal operator sessions open the remediation window."
+        ),
     )
     parser.add_argument(
         "--session-mouse-dir",
@@ -596,6 +658,7 @@ def main() -> None:
                 source="hf-dm-run session arguments",
                 values=session_arg_overrides,
             )
+    _load_saved_operator_state(config)
     validate_session_config(config)
     if args.cap_touch_diagnostic:
         report = run_cap_touch_diagnostic(
@@ -656,13 +719,51 @@ def main() -> None:
         session = HardwareSelfTestSession(config)
     else:
         bench_mode = bool(args.preflight or any(frame2ttl_modes))
+        animal_use_confirmed = args.confirm_animal_use
+        if not bench_mode and config.animal_use.enabled:
+            animal_use_confirmed = _remediate_animal_use_gate(
+                config,
+                operator_confirmed=animal_use_confirmed,
+                dialog_enabled=not args.no_certification_dialog,
+            )
         session = HFDecisionSession(
             config,
             run_mode="bench" if bench_mode else "animal",
-            animal_use_confirmed=args.confirm_animal_use,
+            animal_use_confirmed=animal_use_confirmed,
         )
+    connected = False
+    while True:
+        try:
+            session.connect()
+            connected = True
+            break
+        except AnimalUseGateError as exc:
+            session.close(raise_on_error=False)
+            is_interactive_animal = (
+                not args.simulate
+                and not args.hardware_self_test
+                and not args.preflight
+                and not any(frame2ttl_modes)
+                and config.animal_use.enabled
+            )
+            if not is_interactive_animal:
+                raise
+            animal_use_confirmed = _remediate_animal_use_gate(
+                config,
+                operator_confirmed=False,
+                dialog_enabled=not args.no_certification_dialog,
+                report=exc.report,
+            )
+            session = HFDecisionSession(
+                config,
+                run_mode="animal",
+                animal_use_confirmed=animal_use_confirmed,
+            )
+        except BaseException:
+            session.close(raise_on_error=False)
+            raise
     try:
-        session.connect()
+        assert connected
         if args.frame2ttl_diagnostic:
             summary = session.frame2ttl_diagnostic(
                 n_flips=args.frame2ttl_flips,

@@ -18,6 +18,12 @@ An animal-use certificate is bound to one exact combination of:
 Changing any bound input invalidates the old certificate. Bench diagnostics and simulation use an
 explicit non-animal run mode and do not weaken the animal gate.
 
+Per-session identity and storage locations (subject/session names, results/video folders, subject-log
+folder, certificate location, and calibration filename) are not part of the canonical configuration
+hash. Results and video storage are probed on every startup, and the calibration file contents are
+bound separately by SHA-256. Task, timing, reward duration, welfare limit, and hardware changes remain
+certificate-bound.
+
 ## Before certification
 
 1. Work from a clean release checkout and create a reproducible release tag. Do not tag a release
@@ -70,14 +76,33 @@ its example values are not certification evidence.
 
 ## Starting an animal session
 
-After `certify-rig` writes an all-PASS certificate at the configured path, run:
+For normal desktop operation, start the task without a certificate command. If a certificate,
+calibration, current weight/water target, durable storage check, release match, or one-run operator
+confirmation is missing, the task opens **HF-DM animal-use readiness** automatically before Bpod or
+StreamDIO is opened. The window provides:
+
+- the exact failed production checks and their details;
+- persistent operator/calibration/evidence/failsafe/welfare fields;
+- append-only weight and water-target logging;
+- guided valve calibration with pump-actuation warnings and GUI mass entry;
+- a physical-evidence JSON editor seeded from the tracked structural template;
+- one-button full certification after all five live-hardware safety confirmations;
+- a per-action JSONL audit trail and timestamped certification command logs beside the certificate.
+
+The **Start session** button remains disabled until the production gate itself returns PASS and the
+operator confirms that specific run. The GUI cannot turn placeholders, missing physical
+measurements, WARN results, or failed machine checks into PASS.
+
+Start normally with:
 
 ```powershell
-python -m hf_dm.cli --config configs/dm_50.yaml --confirm-animal-use
+python -m hf_dm.cli --config configs/dm_50.yaml
 ```
 
-The confirmation applies to one process invocation. The gate is evaluated once before hardware is
-opened and again against connected device identities before streaming or output actuation.
+`--confirm-animal-use` remains available for scripted operation. `--no-certification-dialog` keeps
+certificate failures non-interactive for automation and exits fail-closed. The confirmation applies
+to one process invocation. The gate is evaluated once before hardware is opened and again against
+connected device identities before streaming or output actuation.
 
 ## Failure response
 
