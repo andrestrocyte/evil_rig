@@ -508,3 +508,10 @@ def test_hardware_self_test_returns_typed_validation_results(tmp_path):
         set(result) == {"name", "status", "detail", "hint"}
         for result in report["results"]
     )
+
+    # The maximum interval is an independent guard: a malformed or legacy
+    # stall counter must not let a slow choice loop pass certification.
+    recorder.trials[0].choice_loop_max_frame_s = 0.2
+    recorder.trials[0].choice_loop_stall_count = 0
+    with pytest.raises(RuntimeError, match="max frame=0.200000s"):
+        session.validate_results()

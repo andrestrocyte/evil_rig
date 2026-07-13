@@ -62,7 +62,13 @@ def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
     assert all(trial.force_samples > 0 for trial in session.recorder.trials)
     assert session.recorder.trials[0].frame2ttl_choice_edge_count > 0
     assert session.recorder.trials[1].frame2ttl_choice_edge_count > 0
-    assert session.recorder.trials[2].choice_loop_frames == 1
+    # A stationary timeout trial redraws once, but the choice-loop cadence must
+    # still be measured on every host iteration rather than between redraws.
+    assert session.recorder.trials[2].choice_loop_frames > 1
+    assert (
+        session.recorder.trials[2].choice_loop_max_frame_s
+        < config.timing.choice_loop_stall_s
+    )
     assert session.recorder.trials[2].frame2ttl_choice_edge_count <= 2
     assert any(
         event[0] == "dio_input" and int(event[1]) == FRAME2TTL_INPUT_CHANNEL

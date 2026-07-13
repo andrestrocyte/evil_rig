@@ -285,10 +285,18 @@ class HardwareSelfTestSession(HFDecisionSession):
                     "camera_ttl_per_trial",
                     f"trial {trial.trial_index}: no camera TTL timestamps",
                 )
-            if trial.choice_loop_stall_count:
+            stall_threshold_s = max(
+                float(self.config.timing.choice_loop_stall_s),
+                (1.0 / max(1, self.config.display.fps)) * 3.0,
+            )
+            if (
+                trial.choice_loop_stall_count
+                or trial.choice_loop_max_frame_s >= stall_threshold_s
+            ):
                 fail(
                     "choice_loop_stalls",
-                    f"trial {trial.trial_index}: {trial.choice_loop_stall_count} choice-loop stalls"
+                    f"trial {trial.trial_index}: {trial.choice_loop_stall_count} "
+                    f"choice-loop stalls, max frame={trial.choice_loop_max_frame_s:.6f}s"
                 )
 
         output_states = {
