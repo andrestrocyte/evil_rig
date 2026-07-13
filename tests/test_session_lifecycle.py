@@ -187,6 +187,27 @@ def test_run_finalizes_after_video_and_hardware_cleanup(tmp_path):
     assert session.relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
 
 
+def test_cleanup_continues_when_logging_and_audio_shutdown_fail():
+    session = HFDecisionSession(SessionConfig())
+    session.bpod = MagicMock()
+    session.bpod.is_running = False
+    session.relay = FakeRelay()
+    session.speaker_relay = FakeRelay()
+    session.white_noise_player = MagicMock()
+    session.white_noise_player.stop.side_effect = OSError("audio unavailable")
+    session.dio = FakeDIO()
+    session.recorder = MagicMock()
+    session.recorder.log_event.side_effect = OSError("disk unavailable")
+
+    session.close()
+
+    assert session.relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
+    assert session.speaker_relay.ops == [("speaker_gate", False)]
+    assert session.dio.ops == ["stop_camera", "close"]
+    session.bpod.close.assert_called_once_with()
+    assert session._closed is True
+
+
 def test_preflight_saves_stream_camera_and_cleanup_events(tmp_path):
     cfg = SessionConfig(n_trials=99, results_dir=str(tmp_path))
     session = HFDecisionSession(cfg)

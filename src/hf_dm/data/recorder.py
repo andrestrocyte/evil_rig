@@ -17,6 +17,8 @@ from typing import Any, Literal
 
 import numpy as np
 
+from hf_dm.durable_io import fsync_best_effort
+
 Direction = Literal["cw", "ccw"]
 Choice = Literal["cw", "ccw", "timeout", "centering"]
 JournalMode = Literal["new", "resume", "disabled"]
@@ -91,7 +93,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
             handle.flush()
-            os.fsync(handle.fileno())
+            fsync_best_effort(handle, path=temporary)
         os.replace(temporary, path)
     finally:
         if temporary.exists():
@@ -106,7 +108,7 @@ def _atomic_write_npz(path: Path, **arrays: Any) -> None:
         with temporary.open("wb") as handle:
             np.savez_compressed(handle, **arrays)
             handle.flush()
-            os.fsync(handle.fileno())
+            fsync_best_effort(handle, path=temporary)
         os.replace(temporary, path)
     finally:
         if temporary.exists():
@@ -360,7 +362,17 @@ class SessionRecorder:
             self._journal_handle.write(json.dumps(row, separators=(",", ":")) + "\n")
             self._journal_handle.flush()
             if durable:
-                os.fsync(self._journal_handle.fileno())
+                synced = fsync_best_effort(self._journal_handle, path=self._journal_path)
+                if not synced:
+                    # On some Windows virtual filesystems a rejected fsync poisons
+                    # the descriptor for later writes. Reopen the append-only journal.
+                    self._journal_handle.close()
+                    self._journal_handle = self._journal_path.open(
+                        "a",
+                        encoding="utf-8",
+                        newline="\n",
+                        buffering=1,
+                    )
             self._journal_sequence += 1
 
     def close_journal(self) -> None:

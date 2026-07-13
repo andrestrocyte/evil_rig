@@ -13,6 +13,7 @@ from typing import Any, Literal
 import numpy as np
 
 from hf_dm.data.session_export import session_bundle_dir
+from hf_dm.durable_io import fsync_best_effort
 
 QcStatus = Literal["PASS", "WARN", "FAIL"]
 
@@ -394,7 +395,7 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             json.dump(payload, handle, indent=2)
             handle.write("\n")
             handle.flush()
-            os.fsync(handle.fileno())
+            fsync_best_effort(handle, path=temporary)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)

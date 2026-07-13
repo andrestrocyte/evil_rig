@@ -16,6 +16,7 @@ from typing import Any, Callable, Sequence
 import numpy as np
 
 from hf_dm.config import SessionConfig
+from hf_dm.durable_io import fsync_best_effort
 from hf_dm.hardware.discovery import resolve_bpod_port
 from hf_dm.streamdio.client import StreamDIOClient
 from hf_dm.streamdio.outputs import StreamDIOOutputs
@@ -382,7 +383,7 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             json.dump(payload, handle, indent=2)
             handle.write("\n")
             handle.flush()
-            os.fsync(handle.fileno())
+            fsync_best_effort(handle, path=temporary)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
