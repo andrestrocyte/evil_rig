@@ -31,6 +31,8 @@ class TrialRuntime:
     low_delay_s: float = 0.0
     star_reward_delivered: bool = True
     risk_star_probability: float | None = None
+    task_kind: Literal["decision", "centering"] = "decision"
+    centering_start_position_deg: float | None = None
     phase: str = "starting"
     phase_started_mono_s: float = field(default_factory=time.perf_counter)
     error: str | None = None
@@ -128,6 +130,8 @@ class TrialRuntime:
                 "low_delay_s": self.low_delay_s,
                 "star_reward_delivered": self.star_reward_delivered,
                 "risk_star_probability": self.risk_star_probability,
+                "task_kind": self.task_kind,
+                "centering_start_position_deg": self.centering_start_position_deg,
                 "choice_detected_mono_s": self.choice_detected_mono_s,
                 "choice_closed": self.choice_closed,
                 "state_entries": list(self.state_entries),

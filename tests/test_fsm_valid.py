@@ -162,7 +162,40 @@ def test_production_fsm_never_directly_opens_pump_for_omitted_reward(mock_relay)
 
     fsm.check()
     assert mock_relay.module_name not in fsm.states["RewardHigh"].actions
+    assert mock_relay.module_name not in fsm.states["PostRewardHigh"].actions
     assert fsm.states["RewardLow"].actions[mock_relay.module_name] == mock_relay.ids.pump_on
+    assert (
+        fsm.states["PostRewardLow"].actions[mock_relay.module_name]
+        == mock_relay.ids.pump_off
+    )
+
+
+def test_production_fsm_abort_owns_ordered_output_shutdown(mock_relay):
+    fsm = build_host_supervised_decision_fsm(
+        mock_relay,
+        force_direction="ccw",
+        quiescence_s=3.0,
+        choice_timeout_s=20.0,
+        choice_blank_s=1.0,
+        high_reward_s=0.08,
+        low_reward_s=0.04,
+        post_reward_s=1.0,
+        timeout_noise_s=2.0,
+        post_timeout_s=1.0,
+    )
+
+    fsm.check()
+    assert fsm.states["Abort"].actions[mock_relay.module_name] == mock_relay.ids.pump_off
+    assert fsm.states["Abort"].transitions["Tup"] == "AbortForceOff"
+    assert (
+        fsm.states["AbortForceOff"].actions[mock_relay.module_name]
+        == mock_relay.ids.ccw_force_off
+    )
+    assert fsm.states["AbortForceOff"].transitions["Tup"] == "AbortSpeakerOff"
+    assert (
+        fsm.states["AbortSpeakerOff"].actions[mock_relay.module_name]
+        == mock_relay.ids.speaker_gate_off
+    )
 
 
 def test_production_fsm_supports_shape_specific_reward_delays(mock_relay):

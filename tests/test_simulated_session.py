@@ -7,6 +7,7 @@ import numpy as np
 
 from hf_dm.config import SessionConfig, TrainingPhase
 from hf_dm.fsm import softcodes as sc
+from hf_dm.fsm.runtime import TrialRuntime
 from hf_dm.hardware.bringup_constants import FRAME2TTL_INPUT_CHANNEL
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.simulated import (
@@ -105,7 +106,7 @@ def test_choice_candidate_loses_cleanly_when_bpod_timeout_wins(tmp_path):
     config.camera.record_video = False
     config.camera.save_dir = str(tmp_path / "videos")
     shorten_for_simulation(config)
-    config.timing.choice_timeout_s = 0.01
+    config.timing.choice_timeout_s = 0.20
     session = SimulatedHFDecisionSession(
         config,
         SimulationOptions(choice_mode="matched", frames_to_choice=1),
@@ -113,12 +114,14 @@ def test_choice_candidate_loses_cleanly_when_bpod_timeout_wins(tmp_path):
     session.connect()
     original_send = session.bpod.send_softcode
 
-    def delayed_choice(softcode: int) -> None:
+    def withhold_choice_until_timeout(softcode: int) -> None:
         if softcode in {sc.CHOICE_HIGH, sc.CHOICE_LOW}:
-            time.sleep(0.03)
+            while session.bpod.is_running:
+                time.sleep(0.001)
+            return
         original_send(softcode)
 
-    session.bpod.send_softcode = delayed_choice
+    session.bpod.send_softcode = withhold_choice_until_timeout
 
     summary = session.run()
 
@@ -127,6 +130,52 @@ def test_choice_candidate_loses_cleanly_when_bpod_timeout_wins(tmp_path):
     event_types = [event.event_type for event in session.recorder.events]
     assert "choice_detected" not in event_types
     assert "choice_candidate_rejected" in event_types
+
+
+def test_softcode_output_observation_is_nonblocking_and_never_actuates(
+    tmp_path,
+    monkeypatch,
+):
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    config = SessionConfig(n_trials=1, results_dir=str(tmp_path))
+    config.camera.record_video = False
+    shorten_for_simulation(config)
+    session = SimulatedHFDecisionSession(config, SimulationOptions(choice_mode="timeout"))
+    session.connect()
+    runtime = TrialRuntime(
+        trial_index=1,
+        force_direction="cw",
+        choice_target_direction="cw",
+        star_direction="cw",
+        circle_direction="ccw",
+        star_side="left",
+        circle_side="right",
+    )
+    runtime.simulated_choice = "timeout"  # type: ignore[attr-defined]
+    session._active_trial_runtime = runtime
+    session._reset_output_verification_sequences()
+
+    def missing_event(*_args, **_kwargs):
+        time.sleep(0.15)
+        raise RuntimeError("synthetic missing output event")
+
+    monkeypatch.setattr(session.dio, "wait_for_output_event", missing_event)
+    task_ops_before = list(session.relay.ops)
+
+    started = time.perf_counter()
+    session._handle_bpod_softcode(sc.STATE_CHOICE)
+    callback_elapsed_s = time.perf_counter() - started
+
+    assert callback_elapsed_s < 0.05
+    assert runtime.snapshot()["phase"] == "choice"
+    assert session.relay.ops == task_ops_before
+    session._drain_output_verifications(runtime)
+    assert "synthetic missing output event" in str(runtime.snapshot()["error"])
+    assert "output_verification_failed" in [
+        event.event_type for event in session.recorder.events
+    ]
+    session._active_trial_runtime = None
+    session.close()
 
 
 def test_default_balancing_preserves_seeded_trial_record_snapshot(tmp_path):
@@ -233,35 +282,29 @@ def test_extracted_runners_preserve_trial_records_and_event_stream(tmp_path):
         "fsm_definition_added",
         "bpod_state_marker",
         "bpod_state_marker",
-        "force_on",
-            "lick_edge",
-            "lick",
-            "stimulus_on",
-            "bpod_state_marker",
-            "force_off",
-            "choice_detected",
-            "stimulus_off",
+        "lick_edge",
+        "lick",
+        "stimulus_on",
         "bpod_state_marker",
-        "pump_start",
+        "choice_detected",
+        "stimulus_off",
         "bpod_state_marker",
-        "pump_end",
+        "bpod_state_marker",
         "bpod_trial_complete",
-            "choice_loop_stats",
-            "trial_end",
-            "iti_start",
-            "iti_end",
+        "choice_loop_stats",
+        "trial_end",
+        "iti_start",
+        "iti_end",
     ]
     timeout_trial = [
         "trial_start",
         "fsm_definition_added",
         "bpod_state_marker",
         "bpod_state_marker",
-        "force_on",
         "lick_edge",
         "lick",
         "stimulus_on",
         "bpod_state_marker",
-        "force_off",
         "white_noise_start",
         "stimulus_off",
         "choice_timeout",
@@ -280,14 +323,51 @@ def test_extracted_runners_preserve_trial_records_and_event_stream(tmp_path):
         "all_off_cleanup_verified",
         "session_end",
     ]
-    event_stream = [event.event_type for event in session.recorder.events]
-    assert event_stream == (
+    asynchronously_observed_outputs = {
+        "output_actual",
+        "force_on",
+        "force_off",
+        "pump_start",
+        "pump_end",
+    }
+    stable_event_stream = [
+        event.event_type
+        for event in session.recorder.events
+        if event.event_type not in asynchronously_observed_outputs
+    ]
+    assert stable_event_stream == (
         session_start
         + responded_trial
         + responded_trial
         + timeout_trial
         + session_end
     )
+    bpod_outputs = [
+        operation[1:4]
+        for operation in session.relay.ops
+        if operation[0] == "bpod_output"
+    ]
+    assert bpod_outputs == [
+        ("cw_force_on", 3, 1),
+        ("cw_force_off", 3, 0),
+        ("pump_on", 1, 1),
+        ("pump_off", 1, 0),
+        ("ccw_force_on", 5, 1),
+        ("ccw_force_off", 5, 0),
+        ("pump_on", 1, 1),
+        ("pump_off", 1, 0),
+        ("ccw_force_on", 5, 1),
+        ("ccw_force_off", 5, 0),
+    ]
+    host_task_ops = [
+        operation[0]
+        for operation in session.relay.ops
+        if operation[0] != "bpod_output"
+    ]
+    assert "pump_on" not in host_task_ops
+    assert "force" not in host_task_ops
+    assert host_task_ops.count("pump_off") == 2
+    assert host_task_ops.count("force_off") == 2
 
 
 def test_blocked_side_schedule_is_balanced_reproducible_and_capped():
@@ -397,6 +477,25 @@ def test_simulated_centering_requires_wheel_motion_and_rewards_at_center(tmp_pat
     assert abs(trial.final_position_deg) <= config.centering_threshold_deg
     assert abs(trial.net_pulses) > 0
     assert "pump_start" in event_types
+    bpod_outputs = [
+        operation[1]
+        for operation in session.relay.ops
+        if operation[0] == "bpod_output"
+    ]
+    expected_force = "cw" if trial.force_direction == "cw" else "ccw"
+    assert bpod_outputs == [
+        f"{expected_force}_force_on",
+        f"{expected_force}_force_off",
+        "pump_on",
+        "pump_off",
+    ]
+    host_task_ops = [
+        operation[0]
+        for operation in session.relay.ops
+        if operation[0] != "bpod_output"
+    ]
+    assert "pump_on" not in host_task_ops
+    assert "force" not in host_task_ops
 
 
 def test_simulated_frame2ttl_barcode_decodes_when_quiescence_allows_full_code(tmp_path):

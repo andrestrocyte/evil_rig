@@ -121,6 +121,7 @@ class BpodDecisionEpochRunner:
         self.bpod.run(fsm, trial_number=trial_index)
         try:
             while self.bpod.is_running:
+                self._check_recorder_health()
                 state = runtime.snapshot()
                 phase = str(state["phase"])
                 if state["error"] and not abort_sent:
@@ -512,6 +513,7 @@ class BpodDecisionEpochRunner:
             raise
         finally:
             self._wait_for_bpod_trial_threads()
+            self._drain_output_verifications(runtime)
 
         bpod_data = self.bpod.get_data(concat=False)
         self.recorder.log_bpod_trial(trial_index, bpod_data)

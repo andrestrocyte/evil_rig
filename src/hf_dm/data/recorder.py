@@ -9,6 +9,7 @@ import struct
 import subprocess
 import threading
 import time
+import zlib
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -24,8 +25,11 @@ Direction = Literal["cw", "ccw"]
 Choice = Literal["cw", "ccw", "timeout", "centering"]
 JournalMode = Literal["new", "resume", "disabled"]
 
-_STREAMDIO_WAL_MAGIC = b"HFDMSTR1\n"
-_STREAMDIO_WAL_RECORD = struct.Struct("<24siiQdd")
+_STREAMDIO_WAL_MAGIC_V1 = b"HFDMSTR1\n"
+_STREAMDIO_WAL_MAGIC = b"HFDMSTR2\n"
+_STREAMDIO_WAL_PAYLOAD = struct.Struct("<24siiQdd")
+_STREAMDIO_WAL_RECORD_V1 = _STREAMDIO_WAL_PAYLOAD
+_STREAMDIO_WAL_RECORD = struct.Struct("<24siiQddI")
 
 
 def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
@@ -286,6 +290,11 @@ class SessionRecorder:
         self._streamdio_wal_path = self.base_path.with_suffix(".streamdio.wal")
         self._streamdio_wal_handle: Any = None
         self._streamdio_wal_lock = threading.Lock()
+        self._streamdio_wal_fsync_s = 1.0
+        self._streamdio_wal_fsync_stop = threading.Event()
+        self._streamdio_wal_fsync_thread: threading.Thread | None = None
+        self._streamdio_wal_fsync_count = 0
+        self._streamdio_wal_background_error: str | None = None
         self._journal_handle: Any = None
         self._journal_lock = threading.RLock()
         self._journal_sequence = 0
@@ -377,17 +386,7 @@ class SessionRecorder:
             self._journal_handle.write(json.dumps(row, separators=(",", ":")) + "\n")
             self._journal_handle.flush()
             if durable:
-                synced = fsync_best_effort(self._journal_handle, path=self._journal_path)
-                if not synced:
-                    # On some Windows virtual filesystems a rejected fsync poisons
-                    # the descriptor for later writes. Reopen the append-only journal.
-                    self._journal_handle.close()
-                    self._journal_handle = self._journal_path.open(
-                        "a",
-                        encoding="utf-8",
-                        newline="\n",
-                        buffering=1,
-                    )
+                fsync_best_effort(self._journal_handle, path=self._journal_path)
             self._journal_sequence += 1
 
     def close_journal(self) -> None:
@@ -408,6 +407,10 @@ class SessionRecorder:
     def set_export_options(self, options: dict[str, Any]) -> None:
         self.export_options = json.loads(json.dumps(options, default=str))
         self._journal_append("export_options", self.export_options)
+        self._streamdio_wal_fsync_s = max(
+            0.001,
+            float(self.export_options.get("streamdio_wal_fsync_s", 1.0)),
+        )
         self._configure_streamdio_chunking()
 
     def register_stream(self, name: str, summary: dict[str, Any]) -> None:
@@ -543,6 +546,7 @@ class SessionRecorder:
     def finalize(self, summary: SessionSummary) -> Path:
         if self._finalized:
             raise RuntimeError(f"SessionRecorder already finalized: {self.base_path}")
+        self.raise_if_background_error()
         finalize_start = time.perf_counter()
         self.summary = summary
         self._append_session_water_log(summary)
@@ -550,6 +554,7 @@ class SessionRecorder:
         self._journal_append("session_summary", asdict(summary), durable=True)
         self.close_journal()
         self._close_streamdio_wal(durable=True)
+        self.raise_if_background_error()
         self._finalize_streamdio_chunks()
 
         npz_path = self.base_path.with_suffix(".npz")
@@ -677,6 +682,11 @@ class SessionRecorder:
                         "streamdio_chunk_files": list(self._streamdio_chunk_files),
                         "streamdio_chunk_count": len(self._streamdio_chunk_files),
                         "streamdio_chunk_error": self._streamdio_chunk_error,
+                        "streamdio_wal_fsync_s": self._streamdio_wal_fsync_s,
+                        "streamdio_wal_fsync_count": self._streamdio_wal_fsync_count,
+                        "streamdio_wal_background_error": (
+                            self._streamdio_wal_background_error
+                        ),
                         "streamdio_memory_mode": self._streamdio_memory_mode,
                         "streamdio_total_count": self._streamdio_total_count,
                         "streamdio_recent_in_memory_count": len(self.streamdio_events),
@@ -807,10 +817,12 @@ class SessionRecorder:
         self,
         row: tuple[str, int, int, int, float, float],
     ) -> None:
+        self.raise_if_background_error()
+        self._start_streamdio_wal_fsync_worker()
         event_type = row[0].encode("utf-8")
         if len(event_type) > 24:
             raise ValueError(f"StreamDIO event type exceeds WAL limit: {row[0]!r}")
-        record = _STREAMDIO_WAL_RECORD.pack(
+        payload = _STREAMDIO_WAL_PAYLOAD.pack(
             event_type.ljust(24, b"\0"),
             int(row[1]),
             int(row[2]),
@@ -818,6 +830,7 @@ class SessionRecorder:
             float(row[4]),
             float(row[5]),
         )
+        record = payload + struct.pack("<I", zlib.crc32(payload) & 0xFFFFFFFF)
         with self._streamdio_wal_lock:
             if self._streamdio_wal_handle is None:
                 new_file = not self._streamdio_wal_path.exists()
@@ -833,35 +846,71 @@ class SessionRecorder:
                     f"Short StreamDIO WAL write: {written} of {len(record)} bytes"
                 )
 
+    def _start_streamdio_wal_fsync_worker(self) -> None:
+        with self._streamdio_wal_lock:
+            if self._streamdio_wal_fsync_thread is not None:
+                return
+            self._streamdio_wal_fsync_stop.clear()
+            self._streamdio_wal_fsync_thread = threading.Thread(
+                target=self._streamdio_wal_fsync_loop,
+                name="hf-dm-streamdio-wal-fsync",
+                daemon=True,
+            )
+            self._streamdio_wal_fsync_thread.start()
+
+    def _streamdio_wal_fsync_loop(self) -> None:
+        while not self._streamdio_wal_fsync_stop.wait(self._streamdio_wal_fsync_s):
+            if not self._streamdio_wal_path.exists():
+                continue
+            try:
+                self._sync_streamdio_wal()
+                self._streamdio_wal_fsync_count += 1
+            except BaseException as exc:
+                self._streamdio_wal_background_error = f"{type(exc).__name__}: {exc}"
+                return
+
+    def _stop_streamdio_wal_fsync_worker(self) -> None:
+        self._streamdio_wal_fsync_stop.set()
+        thread = self._streamdio_wal_fsync_thread
+        self._streamdio_wal_fsync_thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(1.0, self._streamdio_wal_fsync_s + 0.5))
+            if thread.is_alive() and self._streamdio_wal_background_error is None:
+                self._streamdio_wal_background_error = (
+                    "RuntimeError: StreamDIO WAL fsync worker did not stop"
+                )
+
+    def _sync_streamdio_wal(self) -> bool:
+        if not self._streamdio_wal_path.exists():
+            return True
+        with self._streamdio_wal_path.open("r+b", buffering=0) as sync_handle:
+            return fsync_best_effort(sync_handle, path=self._streamdio_wal_path)
+
+    def raise_if_background_error(self) -> None:
+        if self._streamdio_wal_background_error is not None:
+            raise RuntimeError(
+                "StreamDIO WAL durability failed: "
+                f"{self._streamdio_wal_background_error}"
+            )
+
     def _flush_streamdio_wal(self, *, durable: bool = False) -> None:
         with self._streamdio_wal_lock:
             if self._streamdio_wal_handle is None:
                 return
             self._streamdio_wal_handle.flush()
-            if durable:
-                synced = fsync_best_effort(
-                    self._streamdio_wal_handle,
-                    path=self._streamdio_wal_path,
-                )
-                if not synced:
-                    self._streamdio_wal_handle.close()
-                    self._streamdio_wal_handle = self._streamdio_wal_path.open(
-                        "ab",
-                        buffering=0,
-                    )
+        if durable:
+            self._sync_streamdio_wal()
 
     def _close_streamdio_wal(self, *, durable: bool = False) -> None:
+        self._stop_streamdio_wal_fsync_worker()
         with self._streamdio_wal_lock:
             if self._streamdio_wal_handle is None:
                 return
             self._streamdio_wal_handle.flush()
-            if durable:
-                fsync_best_effort(
-                    self._streamdio_wal_handle,
-                    path=self._streamdio_wal_path,
-                )
             self._streamdio_wal_handle.close()
             self._streamdio_wal_handle = None
+        if durable:
+            self._sync_streamdio_wal()
 
     def _prune_streamdio_events_if_needed(self) -> None:
         if not self._streamdio_memory_bounded or self._streamdio_recent_max_events <= 0:
@@ -1172,19 +1221,32 @@ def load_streamdio_wal(
     rows: list[tuple[str, int, int, int, float, float]] = []
     with wal_path.open("rb") as handle:
         magic = handle.read(len(_STREAMDIO_WAL_MAGIC))
-        if magic != _STREAMDIO_WAL_MAGIC:
+        if magic == _STREAMDIO_WAL_MAGIC:
+            record_struct = _STREAMDIO_WAL_RECORD
+            has_checksum = True
+        elif magic == _STREAMDIO_WAL_MAGIC_V1:
+            record_struct = _STREAMDIO_WAL_RECORD_V1
+            has_checksum = False
+        else:
             raise ValueError(f"Invalid StreamDIO WAL header: {wal_path}")
         trailing_bytes = 0
         while True:
-            record = handle.read(_STREAMDIO_WAL_RECORD.size)
+            record = handle.read(record_struct.size)
             if not record:
                 break
-            if len(record) != _STREAMDIO_WAL_RECORD.size:
+            if len(record) != record_struct.size:
                 trailing_bytes = len(record)
                 break
-            event_type, channel, value, timestamp_us, relative_s, host_s = (
-                _STREAMDIO_WAL_RECORD.unpack(record)
-            )
+            if has_checksum:
+                payload = record[:-4]
+                expected_crc = struct.unpack("<I", record[-4:])[0]
+                if (zlib.crc32(payload) & 0xFFFFFFFF) != expected_crc:
+                    trailing_bytes = len(record) + len(handle.read())
+                    break
+                unpacked = _STREAMDIO_WAL_PAYLOAD.unpack(payload)
+            else:
+                unpacked = _STREAMDIO_WAL_RECORD_V1.unpack(record)
+            event_type, channel, value, timestamp_us, relative_s, host_s = unpacked
             rows.append(
                 (
                     event_type.rstrip(b"\0").decode("utf-8"),

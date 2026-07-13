@@ -1,7 +1,11 @@
 import json
+import struct
 import subprocess
 import sys
 import threading
+import time
+
+import pytest
 
 from hf_dm.config import SessionConfig, config_to_dict
 from hf_dm.data.recorder import (
@@ -233,3 +237,75 @@ def test_streamdio_wal_loader_ignores_only_a_truncated_final_record(tmp_path):
 
     assert rows == [("analog_input", 13, 42, 1000, 0.001, rows[0][5])]
     assert trailing_bytes == len(b"partial")
+
+
+def test_streamdio_wal_loader_remains_compatible_with_v1_records(tmp_path):
+    path = tmp_path / "legacy.streamdio.wal"
+    payload = struct.pack(
+        "<24siiQdd",
+        b"camera".ljust(24, b"\0"),
+        -1,
+        -1,
+        1234,
+        0.001234,
+        42.0,
+    )
+    path.write_bytes(b"HFDMSTR1\n" + payload)
+
+    rows, trailing_bytes = load_streamdio_wal(path)
+
+    assert rows == [("camera", -1, -1, 1234, 0.001234, 42.0)]
+    assert trailing_bytes == 0
+
+
+def test_streamdio_wal_crc_rejects_corrupt_complete_tail_record(tmp_path):
+    recorder = _recorder(tmp_path)
+    recorder.log_streamdio_event("analog_input", 13, 1, 1000, 0.001)
+    recorder.log_streamdio_event("analog_input", 13, 2, 2000, 0.002)
+    recorder._close_streamdio_wal()
+    with recorder.streamdio_wal_path.open("r+b") as handle:
+        handle.seek(-8, 2)
+        value = handle.read(1)
+        handle.seek(-1, 1)
+        handle.write(bytes([value[0] ^ 0xFF]))
+
+    rows, trailing_bytes = load_streamdio_wal(recorder.streamdio_wal_path)
+
+    assert len(rows) == 1
+    assert rows[0][2] == 1
+    assert trailing_bytes > 0
+
+
+def test_streamdio_wal_is_periodically_fsynced_during_long_trial(tmp_path):
+    config = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(tmp_path))
+    config.session_export.streamdio_wal_fsync_s = 0.01
+    recorder = SessionRecorder(tmp_path, "S1", "decision_making")
+    recorder.set_export_options(config_to_dict(config)["session_export"])
+    recorder.log_streamdio_event("analog_input", 13, 1, 1000, 0.001)
+    deadline = time.perf_counter() + 0.5
+    while recorder._streamdio_wal_fsync_count == 0 and time.perf_counter() < deadline:
+        time.sleep(0.005)
+
+    recorder._close_streamdio_wal()
+
+    assert recorder._streamdio_wal_fsync_count >= 1
+
+
+def test_streamdio_wal_background_disk_failure_is_prominent(tmp_path, monkeypatch):
+    config = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(tmp_path))
+    config.session_export.streamdio_wal_fsync_s = 0.01
+    recorder = SessionRecorder(tmp_path, "S1", "decision_making")
+    recorder.set_export_options(config_to_dict(config)["session_export"])
+    recorder.log_streamdio_event("analog_input", 13, 1, 1000, 0.001)
+
+    def disk_full():
+        raise OSError(28, "disk full")
+
+    monkeypatch.setattr(recorder, "_sync_streamdio_wal", disk_full)
+    deadline = time.perf_counter() + 0.5
+    while recorder._streamdio_wal_background_error is None and time.perf_counter() < deadline:
+        time.sleep(0.005)
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        recorder.raise_if_background_error()
+    recorder._close_streamdio_wal()

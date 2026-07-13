@@ -93,7 +93,11 @@ def build_host_supervised_decision_fsm(
     elif force_direction == "ccw":
         force_on_action = speaker_relay.act(speaker_relay.ids.ccw_force_on)
         force_off_action = speaker_relay.act(speaker_relay.ids.ccw_force_off)
-    timeout_target = "TimeoutForceOff" if force_off_action is not None else _marker_name("TimeoutNoise")
+    timeout_target = (
+        "TimeoutForceOff"
+        if force_off_action is not None
+        else _marker_name("TimeoutNoise")
+    )
 
     _add_state_marker(
         fsm,
@@ -210,7 +214,11 @@ def build_host_supervised_decision_fsm(
         transitions={"Tup": ">exit", **abort_transition},
         actions=_softcode_action(
             sc.STATE_PUMP_OFF,
-            speaker_relay.act(speaker_relay.ids.pump_off),
+            (
+                speaker_relay.act(speaker_relay.ids.pump_off)
+                if high_reward_enabled
+                else None
+            ),
         ),
     )
     _add_state_marker(
@@ -225,7 +233,11 @@ def build_host_supervised_decision_fsm(
         transitions={"Tup": ">exit", **abort_transition},
         actions=_softcode_action(
             sc.STATE_PUMP_OFF,
-            speaker_relay.act(speaker_relay.ids.pump_off),
+            (
+                speaker_relay.act(speaker_relay.ids.pump_off)
+                if low_reward_enabled
+                else None
+            ),
         ),
     )
     _add_state_marker(
@@ -268,13 +280,30 @@ def build_host_supervised_decision_fsm(
         ),
     )
     _add_state_marker(fsm, speaker_relay, state_name="Abort")
+    abort_after_pump = "AbortForceOff" if force_off_action is not None else "AbortSpeakerOff"
     fsm.add_state(
         name="Abort",
         timer=0.001,
-        transitions={"Tup": ">exit"},
+        transitions={"Tup": abort_after_pump},
         actions=_softcode_action(
             sc.STATE_ABORT,
-            speaker_relay.act(speaker_relay.ids.speaker_gate_off),
+            speaker_relay.act(speaker_relay.ids.pump_off),
         ),
+        comment="Bpod begins the fail-safe shutdown by closing the reward valve.",
+    )
+    if force_off_action is not None:
+        fsm.add_state(
+            name="AbortForceOff",
+            timer=0.001,
+            transitions={"Tup": "AbortSpeakerOff"},
+            actions=force_off_action,
+            comment="Bpod disables the active force channel during abort.",
+        )
+    fsm.add_state(
+        name="AbortSpeakerOff",
+        timer=0.001,
+        transitions={"Tup": ">exit"},
+        actions=speaker_relay.act(speaker_relay.ids.speaker_gate_off),
+        comment="Bpod closes the timeout-noise gate before leaving the FSM.",
     )
     return fsm

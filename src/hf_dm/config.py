@@ -221,6 +221,7 @@ class SessionExportConfig:
     streamdio_chunk_s: float = 0.0
     streamdio_memory_mode: str = "full"
     streamdio_recent_events: int = 50000
+    streamdio_wal_fsync_s: float = 1.0
     source_config_path: str | None = None
     cli_overrides: list[dict[str, Any]] = field(default_factory=list)
 
@@ -662,6 +663,9 @@ class SessionConfig:
                 streamdio_recent_events=int(
                     session_export_raw.get("streamdio_recent_events", 50000)
                 ),
+                streamdio_wal_fsync_s=float(
+                    session_export_raw.get("streamdio_wal_fsync_s", 1.0)
+                ),
                 source_config_path=(
                     str(session_export_raw["source_config_path"])
                     if session_export_raw.get("source_config_path") not in (None, "")
@@ -949,6 +953,12 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
     export = config.session_export
     require(export.layout in {"flat", "mm_hierarchy"}, "session_export.layout", "must be flat or mm_hierarchy", export.layout)
     require(export.streamdio_chunk_s >= 0, "session_export.streamdio_chunk_s", "must be non-negative", export.streamdio_chunk_s)
+    require(
+        export.streamdio_wal_fsync_s > 0,
+        "session_export.streamdio_wal_fsync_s",
+        "must be greater than zero",
+        export.streamdio_wal_fsync_s,
+    )
     require(
         export.streamdio_memory_mode in {"full", "bounded", "rolling", "chunked"},
         "session_export.streamdio_memory_mode",

@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,6 +15,10 @@ from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.hardware_self_test import (
     HardwareSelfTestSession,
     shorten_for_hardware_self_test,
+)
+from hf_dm.safety_interlock import (
+    HardwareSafetyInterlockError,
+    arm_safety_interlock,
 )
 
 
@@ -68,6 +73,18 @@ class FakeDIO:
 
     def close(self) -> None:
         self.ops.append("close")
+
+
+class FailingCleanupRelay(FakeRelay):
+    def task_outputs_off(self) -> dict:
+        self.ops.append("task_outputs_off")
+        raise OSError("StreamDIO output USB disconnected")
+
+
+class FailingCameraDIO(FakeDIO):
+    def stop_camera(self) -> None:
+        self.ops.append("stop_camera")
+        raise OSError("StreamDIO camera USB disconnected")
 
 
 class FakeDisplay:
@@ -230,6 +247,82 @@ def test_cleanup_continues_when_logging_and_audio_shutdown_fail():
     assert session.dio.ops == ["stop_camera", "close"]
     session.bpod.close.assert_called_once_with()
     assert session._closed is True
+
+
+def test_existing_safety_interlock_blocks_before_hardware_connection(tmp_path, monkeypatch):
+    marker = tmp_path / "rig-interlock.json"
+    arm_safety_interlock({"subject_id": "previous"}, marker)
+    session = HFDecisionSession(SessionConfig())
+    session._safety_interlock_path = marker
+    connect_bpod = MagicMock()
+    monkeypatch.setattr("hf_dm.session.controller.connect_bpod_core", connect_bpod)
+
+    with pytest.raises(HardwareSafetyInterlockError, match="startup blocked"):
+        session.connect()
+
+    connect_bpod.assert_not_called()
+
+
+def test_usb_cleanup_failures_latch_interlock_and_continue_all_off_attempts(tmp_path):
+    marker = tmp_path / "rig-interlock.json"
+    session = HFDecisionSession(SessionConfig())
+    session._safety_interlock_path = marker
+    arm_safety_interlock({"subject_id": "S1"}, marker)
+    session._safety_interlock_armed = True
+    session.bpod = MagicMock()
+    session.bpod.is_running = False
+    session.relay = FailingCleanupRelay()
+    session.speaker_relay = FakeRelay()
+    session.dio = FailingCameraDIO()
+
+    session.close()
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["state"] == "cleanup_failed"
+    assert {item["stage"] for item in payload["cleanup_errors"]} == {
+        "task_outputs_off",
+        "camera_triggers_stop",
+    }
+    assert session.relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
+    assert session.speaker_relay.ops == [("speaker_gate", False)]
+    assert session.dio.ops == ["stop_camera", "close"]
+    session.bpod.close.assert_called_once_with()
+
+
+def test_operator_abort_failure_latches_interlock_but_runs_fallback_cleanup(tmp_path):
+    marker = tmp_path / "rig-interlock.json"
+    session = HFDecisionSession(SessionConfig())
+    session._safety_interlock_path = marker
+    arm_safety_interlock({"subject_id": "S1"}, marker)
+    session._safety_interlock_armed = True
+    session.bpod = MagicMock()
+    session.bpod.is_running = True
+    session.bpod.send_softcode.side_effect = OSError("Bpod disconnected during abort")
+    session.relay = FakeRelay()
+    session.dio = FakeDIO()
+
+    session.close()
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert [item["stage"] for item in payload["cleanup_errors"]] == ["bpod_abort"]
+    assert session.relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
+    assert session.dio.ops == ["stop_camera", "close"]
+
+
+def test_verified_hardware_cleanup_clears_armed_interlock(tmp_path):
+    marker = tmp_path / "rig-interlock.json"
+    session = HFDecisionSession(SessionConfig())
+    session._safety_interlock_path = marker
+    arm_safety_interlock({"subject_id": "S1"}, marker)
+    session._safety_interlock_armed = True
+    session.bpod = MagicMock()
+    session.bpod.is_running = False
+    session.relay = FakeRelay()
+    session.dio = FakeDIO()
+
+    session.close()
+
+    assert not marker.exists()
 
 
 def test_preflight_saves_stream_camera_and_cleanup_events(tmp_path):

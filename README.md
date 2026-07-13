@@ -226,6 +226,14 @@ pip install -e /path/to/MM_PyBpod2_andrestrocyte   # StreamDIO + optional sound 
 pip install -e .
 ```
 
+For the exact acquisition/CI environment, install `requirements.lock` first and then install this
+package with `--no-deps`. This prevents transitive dependency drift between validated rig releases.
+
+```bash
+pip install -r requirements.lock
+pip install -e . --no-deps
+```
+
 **Optional extras**
 
 ```bash
@@ -245,6 +253,18 @@ Install the **Teledyne/FLIR Spinnaker SDK** and set `camera.backend: spinnaker`.
 `PySpin` when available and falls back to the Spinnaker C API otherwise. Both configure the verified
 bringup trigger contract (`FrameStart`, `Line0`, rising edge, `TriggerWidth` exposure). With
 `camera.required: true`, the task refuses to run if recording cannot start.
+
+Teledyne distributes `PySpin` separately from PyPI. Install only the `spinnaker_python` wheel whose
+SDK version, operating system, architecture, and CPython tag exactly match the rig (for the installed
+Spinnaker 4.0.0.116 SDK, the vendor Windows wheel is a CPython 3.10 build). Do **not** install the
+unrelated package named `pyspin` from PyPI. Python 3.12 rigs remain fully supported through the
+installed Spinnaker C API fallback.
+
+Session journals and the StreamDIO WAL request durable flushes. Store animal data on a local volume
+that supports `FlushFileBuffers`/`fsync`; unsupported virtual or shared filesystems produce an
+explicit reduced-durability warning. A live session also arms
+`~/.hf_dm/hardware_cleanup_interlock.json`; verified cleanup removes it, while a crash or any failed
+all-off action leaves the next live startup blocked for manual inspection.
 
 ---
 
@@ -322,7 +342,7 @@ hardware opens. Three profiles ship in `configs/`:
 | `integrations` | optional | `mm_soundcard_status`, `mm_alyx_register`, `mm_flir_roi_gui`, `alyx_*` |
 | `welfare` | colony | `subjects_dir` subjects, `water_target_ml`, `append_session_water` |
 | `monitor` | operator GUI | `enabled`, `display_index` 0, sizes, sample rates, `streamdio_status_interval_s` 30, `record_path` |
-| `session_export` | data products | `layout` (`mm_hierarchy`/`flat`), `manifest`, `config_snapshot`, `export_csv_on_finalize`, `export_timeline`, `streamdio_chunk_s`, `streamdio_memory_mode`, `streamdio_recent_events` |
+| `session_export` | data products | `layout` (`mm_hierarchy`/`flat`), `manifest`, `config_snapshot`, `export_csv_on_finalize`, `export_timeline`, `streamdio_chunk_s`, `streamdio_memory_mode`, `streamdio_recent_events`, `streamdio_wal_fsync_s` |
 
 CLI flags and the session-setup dialog can override several of these per run; every override is
 recorded in `session_export.cli_overrides` and the config snapshot.
