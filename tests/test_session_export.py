@@ -664,6 +664,20 @@ def test_validate_session_detects_csv_row_count_mismatch(tmp_path):
     assert any("csv row count mismatch" in error for error in result["errors"])
 
 
+def test_validate_session_accepts_large_recorder_generated_csv_fields(tmp_path):
+    cfg = SessionConfig(subject_id="S1", n_trials=0, results_dir=str(tmp_path))
+    recorder = SessionRecorder(tmp_path, cfg.subject_id, cfg.phase.value)
+    recorder.set_export_options(config_to_dict(cfg)["session_export"])
+    recorder.set_metadata({"config": config_to_dict(cfg)})
+    recorder.log_event("large_diagnostic_result", {"detail": "x" * 200_000})
+    recorder.finalize(_summary())
+
+    bundle = recorder.base_path.with_name(f"{recorder.base_path.name}_bundle")
+    result = validate_session(bundle)
+
+    assert result["valid"], result["errors"]
+
+
 def test_validate_session_detects_force_trace_row_count_mismatch(tmp_path):
     cfg = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(tmp_path))
     recorder = SessionRecorder(tmp_path, cfg.subject_id, cfg.phase.value)

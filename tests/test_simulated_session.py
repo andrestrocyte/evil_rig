@@ -223,6 +223,12 @@ def test_default_balancing_preserves_seeded_trial_record_snapshot(tmp_path):
     assert "git_commit" in provenance
     assert provenance["git_dirty"] in {True, False, None}
     assert provenance["package_version"] == "0.1.0"
+    assert provenance["package_versions"]["bpod-core"] == "0.1.0a12"
+    assert provenance["package_versions"]["numpy"]
+    assert provenance["python_version"]
+    assert provenance["python_executable"]
+    assert provenance["requirements_lock_sha256"]
+    assert provenance["streamdio_driver"]["module"] == "pybpod_streamDIO_module"
     assert header["payload"]["git_commit"] == provenance["git_commit"]
     assert header["payload"]["git_dirty"] == provenance["git_dirty"]
     assert all(trial.reward_volume_ul is None for trial in session.recorder.trials)

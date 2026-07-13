@@ -61,6 +61,13 @@ SEMANTIC_TIMELINE_EVENTS = {
     "video_recording_stopped",
 }
 
+# Diagnostic events can legitimately contain large nested JSON payloads (for
+# example, all cases from a repeated Frame2TTL barcode qualification).  Python's
+# csv module defaults to a roughly 128 KiB field limit, which is smaller than a
+# valid recorder-generated detail_json field.  Keep validation bounded while
+# allowing the largest payloads this application emits.
+_CSV_VALIDATION_FIELD_LIMIT = 64 * 1024 * 1024
+
 
 STREAMDIO_COLUMNS = [
     "event_type",
@@ -2330,6 +2337,7 @@ def _validate_csv_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> li
 
 
 def _csv_row_count(path: Path) -> int:
+    csv.field_size_limit(max(csv.field_size_limit(), _CSV_VALIDATION_FIELD_LIMIT))
     with path.open("r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         return sum(1 for _ in reader)
@@ -2337,6 +2345,7 @@ def _csv_row_count(path: Path) -> int:
 
 def _validate_timeline_csv(path: Path, rel: str) -> list[str]:
     errors: list[str] = []
+    csv.field_size_limit(max(csv.field_size_limit(), _CSV_VALIDATION_FIELD_LIMIT))
     with path.open("r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         fieldnames = reader.fieldnames or []
