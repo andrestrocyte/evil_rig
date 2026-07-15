@@ -57,6 +57,7 @@
 #define DIAG_SYSTEM_RESET 1008
 #define DIAG_CYCLE_TIMING_VIOLATION 1009
 #define DIAG_CYCLE_COUNT_VIOLATION 1010
+#define DIAG_TIMING_HEARTBEAT 1011
 // Debug-only diagnostic events (1100-1199)
 #define DIAG_DEBUG_BASE 1100
 #define DIAG_CYCLE_TIME 1101
@@ -117,7 +118,7 @@ char moduleName[] = "DIO_12Ch_Stream";
 const char* eventNames[] = {"1_Hi", "1_Lo", "2_Hi", "2_Lo", "3_Hi", "3_Lo", "4_Hi", "4_Lo", "5_Hi", "5_Lo",
                       "6_Hi", "6_Lo", "7_Hi", "7_Lo", "8_Hi", "8_Lo", "9_Hi", "9_Lo", "10_Hi", "10_Lo",
                       "11_Hi", "11_Lo", "12_Hi", "12_Lo", "13_Hi", "13_Lo", "14_Hi", "14_Lo"};
-const uint32_t FirmwareVersion = 4;
+const uint32_t FirmwareVersion = 5;
 byte nEventNames = (sizeof(eventNames)/sizeof(char *));
 
 // Pin definitions
@@ -212,6 +213,11 @@ boolean streamingEnabled = false;
 const byte configDiscoveryByte = 222;
 const byte streamingDiscoveryByte = 223;
 volatile bool needsUSB2Processing = false;
+
+// Firmware-origin timing heartbeat. The host records its own receive/dispatch
+// time for the same event, providing independent Teensy and PC clock samples.
+const uint64_t TIMING_HEARTBEAT_PERIOD_US = 100000;
+uint64_t nextTimingHeartbeatUs = 0;
 
 // Timing control
 const int cycle_pin = 33;
@@ -939,6 +945,25 @@ void processCamera() {
   }
 }
 
+void processTimingHeartbeat() {
+  if (!streamingEnabled || nextTimingHeartbeatUs == 0) {
+    return;
+  }
+
+  uint64_t currentTime = getCurrentTimestamp();
+  if (currentTime < nextTimingHeartbeatUs) {
+    return;
+  }
+
+  // Emit the actual Teensy time. If execution skipped more than one period,
+  // advance to the next future deadline rather than creating a catch-up burst;
+  // host QC will identify the missing period from the timestamp gap.
+  streamingEventPut(DIAG_TIMING_HEARTBEAT, currentTime);
+  do {
+    nextTimingHeartbeatUs += TIMING_HEARTBEAT_PERIOD_US;
+  } while (nextTimingHeartbeatUs <= currentTime);
+}
+
 // ========== SERIAL COMMUNICATION ==========
 
 void readSerial1Data() {
@@ -1539,8 +1564,10 @@ void handleUSB2Communication() {
         // Clear the actual buffer memory to prevent corruption
         memset((void*)streamBuf.events, 0, sizeof(streamBuf.events));
 
-        // Set streaming flag
+        // Set streaming flag and schedule the first beat one full period after
+        // the stream-start acknowledgement.
         streamingEnabled = true;
+        nextTimingHeartbeatUs = getCurrentTimestamp() + TIMING_HEARTBEAT_PERIOD_US;
         // Send acknowledgment
 
         PC2.writeByte(1);
@@ -1548,6 +1575,7 @@ void handleUSB2Communication() {
 
       case 'Y': // Stop streaming
         streamingEnabled = false;
+        nextTimingHeartbeatUs = 0;
         PC1.writeByte(1); // write stop acknowledge to PC1 to not interfere with remaining PC2 streaming events.
         break;
 
@@ -1561,6 +1589,7 @@ void handleUSB2Communication() {
       case 'Z': // Disconnect
         PC2Connected = false;
         streamingEnabled = false;
+        nextTimingHeartbeatUs = 0;
         PC2.writeByte(1);
         break;
 
@@ -1859,6 +1888,7 @@ void cycleTimerISR() {
   processAnalogInput();
   processOutputs();    // ~5-15µs
   processCamera();     // ~2-5µs
+  processTimingHeartbeat();
   processSpeakerNoise();
   readSerial1Data();
   processSerial1Commands();

@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from hf_dm.config import MonitorConfig
+from hf_dm.timing_heartbeat import (
+    TIMING_HEARTBEAT_EVENT_TYPE,
+    TimingHeartbeatThresholds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -379,6 +383,17 @@ class OperatorMonitorState:
         self.frame2ttl_decodes: deque[dict[str, Any]] = deque(maxlen=self.trial_history)
         self.bpod_state_marker_events: deque[dict[str, Any]] = deque()
         self.bpod_state_latest_marker: dict[str, Any] = {}
+        self.timing_heartbeat_count = 0
+        self.timing_heartbeat_expected_s = 0.1
+        self.timing_heartbeat_first_module_s: float | None = None
+        self.timing_heartbeat_first_pc_s: float | None = None
+        self.timing_heartbeat_last_module_s: float | None = None
+        self.timing_heartbeat_last_pc_s: float | None = None
+        self.timing_heartbeat_module_interval_s: float | None = None
+        self.timing_heartbeat_pc_interval_s: float | None = None
+        self.timing_heartbeat_cumulative_delta_s: float | None = None
+        self.timing_heartbeat_rate_error_ppm: float | None = None
+        self.timing_heartbeat_status = "waiting"
         self.pump_active = False
         self.noise_active = False
         self.last_update_mono_s = time.perf_counter()
@@ -405,6 +420,9 @@ class OperatorMonitorState:
             frame2ttl = payload.get("frame2ttl")
             if isinstance(frame2ttl, dict):
                 self.frame2ttl_info.update(frame2ttl)
+            heartbeat = payload.get("timing_heartbeat")
+            if isinstance(heartbeat, dict) and heartbeat.get("period_ms") is not None:
+                self.timing_heartbeat_expected_s = float(heartbeat["period_ms"]) / 1000.0
         elif event_type == "session_summary":
             self.summary.update(payload)
             self.current_phase = "finished"
@@ -482,6 +500,8 @@ class OperatorMonitorState:
             marker["mono_s"] = now
             self.bpod_state_marker_events.append(marker)
             self.bpod_state_latest_marker = marker
+        elif event_type == TIMING_HEARTBEAT_EVENT_TYPE:
+            self._update_timing_heartbeat(payload)
         elif event_type == "pump":
             state = bool(payload.get("active", payload.get("state", False)))
             self.pump_active = state
@@ -502,6 +522,75 @@ class OperatorMonitorState:
             self.last_task_frame_mono_s = now
 
         self.prune(now)
+
+    def _update_timing_heartbeat(self, payload: dict[str, Any]) -> None:
+        module_us = _optional_int(payload.get("module_timestamp_us"))
+        pc_s = _optional_float(payload.get("host_perf_counter_s"))
+        if module_us is None or pc_s is None:
+            self.timing_heartbeat_status = "invalid"
+            return
+        module_s = module_us / 1_000_000.0
+        if self.timing_heartbeat_first_module_s is None:
+            self.timing_heartbeat_first_module_s = module_s
+            self.timing_heartbeat_first_pc_s = pc_s
+        if self.timing_heartbeat_last_module_s is not None:
+            self.timing_heartbeat_module_interval_s = (
+                module_s - self.timing_heartbeat_last_module_s
+            )
+        if self.timing_heartbeat_last_pc_s is not None:
+            self.timing_heartbeat_pc_interval_s = pc_s - self.timing_heartbeat_last_pc_s
+        self.timing_heartbeat_last_module_s = module_s
+        self.timing_heartbeat_last_pc_s = pc_s
+        self.timing_heartbeat_count += 1
+        if (
+            self.timing_heartbeat_first_module_s is not None
+            and self.timing_heartbeat_first_pc_s is not None
+        ):
+            self.timing_heartbeat_cumulative_delta_s = (
+                (pc_s - self.timing_heartbeat_first_pc_s)
+                - (module_s - self.timing_heartbeat_first_module_s)
+            )
+        if self.timing_heartbeat_pc_interval_s is None:
+            self.timing_heartbeat_status = "waiting"
+            return
+        limits = TimingHeartbeatThresholds()
+        pc_interval_error = abs(
+            self.timing_heartbeat_pc_interval_s - self.timing_heartbeat_expected_s
+        )
+        module_interval_error = abs(
+            (self.timing_heartbeat_module_interval_s or 0.0)
+            - self.timing_heartbeat_expected_s
+        )
+        grades = [
+            _threshold_grade(
+                module_interval_error,
+                limits.module_interval_pass_error_s,
+                limits.module_interval_warn_error_s,
+            ),
+            _threshold_grade(
+                pc_interval_error,
+                limits.pc_interval_p99_pass_error_s,
+                limits.pc_interval_p99_warn_error_s,
+            ),
+        ]
+        first_module_s = self.timing_heartbeat_first_module_s
+        module_elapsed_s = 0.0 if first_module_s is None else module_s - first_module_s
+        if module_elapsed_s >= limits.rate_min_span_s:
+            self.timing_heartbeat_rate_error_ppm = abs(
+                (self.timing_heartbeat_cumulative_delta_s or 0.0)
+                / module_elapsed_s
+                * 1_000_000.0
+            )
+            grades.append(
+                _threshold_grade(
+                    self.timing_heartbeat_rate_error_ppm,
+                    limits.rate_pass_error_ppm,
+                    limits.rate_warn_error_ppm,
+                )
+            )
+        self.timing_heartbeat_status = (
+            "FAIL" if "FAIL" in grades else "WARN" if "WARN" in grades else "PASS"
+        )
 
     def _update_lick_input_state(self, payload: dict[str, Any], *, now: float, source: str) -> None:
         channel = _optional_int(payload.get("channel"))
@@ -628,6 +717,14 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _threshold_grade(value: float, pass_limit: float, warn_limit: float) -> str:
+    if value <= pass_limit:
+        return "PASS"
+    if value <= warn_limit:
+        return "WARN"
+    return "FAIL"
 
 
 def _optional_str(value: Any) -> str | None:
@@ -1181,6 +1278,17 @@ class _MonitorWindow:
             ),
             ("Pump", "ON" if self.state.pump_active else "off"),
             ("Noise", "ON" if self.state.noise_active else "off"),
+            (
+                "100 ms QC",
+                (
+                    f"{self.state.timing_heartbeat_status}  "
+                    f"PC {self.state.timing_heartbeat_pc_interval_s * 1000.0:.1f} ms  "
+                    f"Δ {self.state.timing_heartbeat_cumulative_delta_s * 1000.0:+.1f} ms"
+                    if self.state.timing_heartbeat_pc_interval_s is not None
+                    and self.state.timing_heartbeat_cumulative_delta_s is not None
+                    else f"{self.state.timing_heartbeat_status} ({self.state.timing_heartbeat_count})"
+                ),
+            ),
         ]
         yy = iy
         line_step = max(13, min(20, ih // max(1, len(status_lines))))

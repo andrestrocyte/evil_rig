@@ -40,6 +40,15 @@ def _finalized_session(tmp_path, trials):
     recorder = SessionRecorder(tmp_path, "S1", "decision_making")
     recorder.set_export_options(config_to_dict(config)["session_export"])
     recorder.set_metadata({"config": config_to_dict(config)})
+    for index in range(1, 4):
+        recorder.log_streamdio_event(
+            "timing_heartbeat",
+            None,
+            None,
+            index * 100_000,
+            index * 0.1,
+            host_perf_counter_s=100.0 + index * 0.1,
+        )
     for trial in trials:
         recorder.add_trial(trial)
     recorder.finalize(
@@ -65,13 +74,21 @@ def test_session_qc_writes_one_result_per_metric_for_bundle_and_npz(tmp_path):
     npz_report = evaluate_session_qc(recorder.base_path.with_suffix(".npz"), write=False)
 
     assert report["overall_status"] == "PASS"
-    assert len(report["metrics"]) == 5
+    assert len(report["metrics"]) == 13
     assert {metric["name"] for metric in report["metrics"]} == {
         "responded_rate",
         "matched_rate_responded",
         "mean_response_time_s",
         "choice_loop_stall_count",
         "choice_loop_max_frame_s",
+        "streamdio_heartbeat_count",
+        "streamdio_estimated_missed_pulses",
+        "streamdio_teensy_interval_max_abs_error_s",
+        "streamdio_pc_interval_p99_abs_error_s",
+        "streamdio_pc_interval_max_abs_error_s",
+        "streamdio_pc_delivery_detrended_max_abs_s",
+        "streamdio_teensy_nonmonotonic_intervals",
+        "streamdio_pc_nonmonotonic_intervals",
     }
     output = bundle / "session.qc.json"
     assert output.exists()

@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from hf_dm.config import SessionConfig, TrainingPhase
+from hf_dm.data.session_export import session_bundle_dir
 from hf_dm.fsm import softcodes as sc
 from hf_dm.fsm.runtime import TrialRuntime
 from hf_dm.hardware.bringup_constants import FRAME2TTL_INPUT_CHANNEL
@@ -74,7 +75,14 @@ def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
         for event in session.recorder.streamdio_events
     )
     assert any(event[0] == "bpod_state" for event in session.recorder.streamdio_events)
+    heartbeat_rows = [
+        event
+        for event in session.recorder.streamdio_events
+        if event[0] == "timing_heartbeat"
+    ]
+    assert len(heartbeat_rows) >= 3
     assert "bpod_state_marker" in event_types
+    assert event_types.count("timing_heartbeat") == len(heartbeat_rows)
     assert event_types.count("iti_start") == 3
     assert event_types.count("iti_end") == 3
     speaker_states = [operation[1] for operation in session.speaker_relay.ops]
@@ -84,9 +92,21 @@ def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
     with np.load(session.recorder.base_path.with_suffix(".npz"), allow_pickle=True) as data:
         assert "trials_json" in data.files
         assert "events_json" in data.files
+        assert "timing_heartbeat_qc_json" in data.files
         first_trial = json.loads(str(data["trials_json"][0]))
         assert "lick_timestamps_us" in first_trial
         assert "camera_ttl_timestamps_us" in first_trial
+        heartbeat_qc = json.loads(str(data["timing_heartbeat_qc_json"][0]))
+        assert heartbeat_qc["overall_status"] == "PASS"
+        assert heartbeat_qc["heartbeat_count"] == len(heartbeat_rows)
+    bundle = session_bundle_dir(
+        session.recorder.base_path,
+        layout=config.session_export.layout,
+    )
+    heartbeat_csv = bundle / "exports" / "streamdio_timing_heartbeat.csv"
+    heartbeat_qc_path = bundle / "exports" / "streamdio_timing_qc.json"
+    assert heartbeat_csv.exists()
+    assert json.loads(heartbeat_qc_path.read_text(encoding="utf-8"))["overall_status"] == "PASS"
     timeout_states = [
         row["state"]
         for row in session.recorder.bpod_trials[2]["events"]
@@ -344,9 +364,10 @@ def test_extracted_runners_preserve_trial_records_and_event_stream(tmp_path):
         # Simulated StreamDIO inputs arrive on the same callback thread as live
         # inputs. Their order relative to host-render/log events is deliberately
         # not a scheduler contract.
-        "lick_edge",
-        "lick",
-    }
+            "lick_edge",
+            "lick",
+            "timing_heartbeat",
+        }
     stable_event_stream = [
         event.event_type
         for event in session.recorder.events

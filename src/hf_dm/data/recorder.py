@@ -24,6 +24,10 @@ from typing import Any, Literal
 import numpy as np
 
 from hf_dm.durable_io import fsync_best_effort
+from hf_dm.timing_heartbeat import (
+    analyze_timing_heartbeats,
+    timing_heartbeat_qc_summary,
+)
 
 Direction = Literal["cw", "ccw"]
 Choice = Literal["cw", "ccw", "timeout", "centering"]
@@ -594,6 +598,8 @@ class SessionRecorder:
         value: int | None,
         timestamp_us: int,
         relative_time_s: float,
+        *,
+        host_perf_counter_s: float | None = None,
     ) -> None:
         """Append one raw StreamDIO event without expensive per-sample object logging."""
         # The first WAL failure is raised to the StreamDIO callback and latched.
@@ -608,7 +614,11 @@ class SessionRecorder:
             -1 if value is None else int(value),
             int(timestamp_us),
             float(relative_time_s),
-            time.perf_counter(),
+            (
+                time.perf_counter()
+                if host_perf_counter_s is None
+                else float(host_perf_counter_s)
+            ),
         )
         try:
             self._append_streamdio_wal(row)
@@ -648,6 +658,12 @@ class SessionRecorder:
         final_streamdio_events = self._streamdio_rows_for_finalize()
         self._discard_partial_streamdio_chunks()
         streamdio_arr = self._streamdio_rows_to_structured(final_streamdio_events)
+        timing_heartbeat_qc = timing_heartbeat_qc_summary(
+            analyze_timing_heartbeats(
+                final_streamdio_events,
+                session_events=self.events,
+            )
+        )
 
         npz_error: str | None = None
         try:
@@ -684,6 +700,10 @@ class SessionRecorder:
                     [json.dumps(self.metadata, default=str)],
                     dtype=object,
                 ),
+                timing_heartbeat_qc_json=np.array(
+                    [json.dumps(timing_heartbeat_qc, default=str)],
+                    dtype=object,
+                ),
             )
         except OSError as exc:
             npz_error = f"{type(exc).__name__}: {exc}"
@@ -716,6 +736,7 @@ class SessionRecorder:
                 "memory_mode": self._streamdio_memory_mode,
                 "counts_by_type": dict(sorted(streamdio_counts.items())),
                 "data_location": "NPZ array: streamdio_events",
+                "timing_heartbeat_qc": timing_heartbeat_qc,
             },
             "fsm_definitions": [
                 {"fsm_name": name, "fsm_json": fsm_json}

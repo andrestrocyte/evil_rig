@@ -67,7 +67,8 @@ The signed evidence must establish:
   StreamDIO reset, and emergency-stop cases;
 - all-off de-energization times for the same failure cases;
 - a soak at least twice the configured worst-case session duration, with zero overruns/drops and
-  passing session validation/QC;
+  passing session validation/QC, including the firmware-v5 100 ms StreamDIO heartbeat's missed-pulse,
+  PC-delivery-jitter, and accumulated PC-versus-Teensy clock-rate checks;
 - approved welfare limits matching the config.
 
 Every evidence item needs an operator, measurement time, instrument or artifact identifier where
@@ -144,7 +145,9 @@ The Cursor findings concerning WAL coverage, choice/timeout reconciliation, bloc
 timeout-gate simulation, deterministic barcode timestamps, barcode capacity, NPZ payload width, ITI
 use, chunk retries, fsync caching, and fail-open cleanup are resolved. Host-clock simulation remains
 an intentional limitation: it validates semantics, not Bpod clock drift, USB latency, display timing,
-or loaded-rig deadlines. Those measurements belong in the physical certificate.
+or loaded-rig deadlines. Those measurements belong in the physical certificate. Live sessions do
+record an always-on, dual-timestamp 100 ms StreamDIO heartbeat to quantify StreamDIO-to-PC delivery
+and accumulated relative clock drift; it does not replace independent Bpod/display measurements.
 
 `bpod-core` is the correct low-level dependency: it is a lean, typed Bpod FSM interface whose own
 project page lists configuration, calibration, data management, GUI, and module support as non-goals.

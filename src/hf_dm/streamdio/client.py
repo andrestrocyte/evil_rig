@@ -29,8 +29,19 @@ from hf_dm.hardware.bringup_constants import (
     STREAMDIO_CAP_TOUCH_DIGITIZER_FIRMWARE_VERSION,
     STREAMDIO_DIO_INPUT_EVENT_BASE,
     STREAMDIO_DIO_OUTPUT_EVENT_BASE,
+    STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE,
+    STREAMDIO_TIMING_HEARTBEAT_FIRMWARE_VERSION,
 )
 from hf_dm.hardware.discovery import resolve_streamdio_ports
+from hf_dm.timing_heartbeat import TIMING_HEARTBEAT_EVENT_TYPE
+
+
+class _TimingHeartbeatLogFilter(logging.Filter):
+    """Suppress only MM_PyBpod2's per-heartbeat WARNING log line."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return f"Diagnostic event {STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE} " not in message
 
 
 def _uint12(value: int) -> int:
@@ -49,7 +60,15 @@ class StreamDIOClient:
         # ArCOM logger can emit byte-level DEBUG messages. Both streams can stall
         # the task/display loop even though experiment data are already retained
         # by StreamDIO and this session recorder.
-        logging.getLogger("pybpod_streamDIO_module.stream_dio_protocol").setLevel(logging.WARNING)
+        driver_logger = logging.getLogger(
+            "pybpod_streamDIO_module.stream_dio_protocol"
+        )
+        driver_logger.setLevel(logging.WARNING)
+        if not any(
+            isinstance(item, _TimingHeartbeatLogFilter)
+            for item in driver_logger.filters
+        ):
+            driver_logger.addFilter(_TimingHeartbeatLogFilter())
         logging.getLogger("pybpodapi.com.arcom").setLevel(logging.WARNING)
         try:
             from pybpod_streamDIO_module.stream_dio_protocol import StreamDIOProtocol
@@ -121,8 +140,15 @@ class StreamDIOClient:
         if self._dio is None:
             raise RuntimeError("StreamDIO not connected")
         with self._config_lock:
+            firmware_version = int(self._dio.module_info.get("firmware_version", 0))
+            if firmware_version < STREAMDIO_TIMING_HEARTBEAT_FIRMWARE_VERSION:
+                raise RuntimeError(
+                    "StreamDIO firmware does not emit the required 100 ms timing "
+                    f"heartbeat. Found firmware version {firmware_version}; expected "
+                    f"{STREAMDIO_TIMING_HEARTBEAT_FIRMWARE_VERSION} or newer. Flash "
+                    "firmware/Module_DIO_streeaming_100us_cycle before running a task."
+                )
             if LICK_INPUT_CHANNEL in {int(channel) for channel in lick_channels}:
-                firmware_version = int(self._dio.module_info.get("firmware_version", 0))
                 if firmware_version < STREAMDIO_CAP_TOUCH_DIGITIZER_FIRMWARE_VERSION:
                     raise RuntimeError(
                         "StreamDIO firmware does not include the cap-touch digitizer. "
@@ -235,6 +261,16 @@ class StreamDIOClient:
         timestamp_us: int,
         relative_time: float,
     ) -> None:
+        host_mono_s = time.perf_counter()
+        host_wall_s = time.time()
+        if (
+            event_type == "diagnostic"
+            and channel is not None
+            and int(channel) == STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE
+        ):
+            event_type = TIMING_HEARTBEAT_EVENT_TYPE
+            channel = None
+            value = None
         if event_type == "dio_output" and channel is not None and value is not None:
             channel_i = int(channel)
             value_i = int(value)
@@ -242,7 +278,6 @@ class StreamDIOClient:
                 self._output_states[channel_i] = value_i
                 self._output_sequences[channel_i] += 1
                 sequence = self._output_sequences[channel_i]
-                host_mono_s = time.perf_counter()
                 self._output_events[channel_i] = (
                     value_i,
                     int(timestamp_us),
@@ -264,7 +299,15 @@ class StreamDIOClient:
                 )
                 self._output_condition.notify_all()
         if self._callback is not None:
-            self._callback(event_type, channel, value, timestamp_us, relative_time)
+            self._callback(
+                event_type,
+                channel,
+                value,
+                timestamp_us,
+                relative_time,
+                host_perf_counter_s=host_mono_s,
+                host_wall_time_s=host_wall_s,
+            )
 
     def set_output_channel(
         self,

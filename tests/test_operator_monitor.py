@@ -230,6 +230,58 @@ def test_operator_monitor_state_tracks_trials_events_and_recent_frames():
     assert state.outcomes[-1]["chosen_shape"] == "star"
 
 
+def test_operator_monitor_tracks_live_100_ms_heartbeat_and_accumulated_delta():
+    state = OperatorMonitorState(history_s=10.0, trial_history=3)
+    state.apply(
+        {
+            "type": "session_info",
+            "payload": {"timing_heartbeat": {"period_ms": 100.0}},
+        }
+    )
+    state.apply(
+        {
+            "type": "timing_heartbeat",
+            "payload": {
+                "module_timestamp_us": 100_000,
+                "host_perf_counter_s": 50.0,
+            },
+        }
+    )
+    state.apply(
+        {
+            "type": "timing_heartbeat",
+            "payload": {
+                "module_timestamp_us": 200_000,
+                "host_perf_counter_s": 50.101,
+            },
+        }
+    )
+
+    assert state.timing_heartbeat_count == 2
+    assert state.timing_heartbeat_status == "PASS"
+    assert state.timing_heartbeat_module_interval_s == 0.1
+    assert abs(state.timing_heartbeat_pc_interval_s - 0.101) < 1e-12
+    assert abs(state.timing_heartbeat_cumulative_delta_s - 0.001) < 1e-12
+
+
+def test_operator_monitor_grades_accumulated_clock_drift_as_rate_after_ten_seconds():
+    state = OperatorMonitorState(history_s=10.0, trial_history=3)
+    for index in range(101):
+        state.apply(
+            {
+                "type": "timing_heartbeat",
+                "payload": {
+                    "module_timestamp_us": index * 100_000,
+                    "host_perf_counter_s": 50.0 + index * 0.10005,
+                },
+            }
+        )
+
+    assert state.timing_heartbeat_status == "WARN"
+    assert abs(state.timing_heartbeat_rate_error_ppm - 500.0) < 1e-6
+    assert abs(state.timing_heartbeat_cumulative_delta_s - 0.005) < 1e-9
+
+
 def test_choice_history_is_a_rolling_ten_and_replaces_trial_updates():
     state = OperatorMonitorState(history_s=10.0, trial_history=12)
 
