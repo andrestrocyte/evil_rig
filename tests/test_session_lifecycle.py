@@ -224,6 +224,29 @@ def test_raw_streamdio_events_accept_camera_none_fields_and_log_licks(tmp_path):
     assert [event.event_type for event in session.recorder.events].count("lick") == 1
 
 
+def test_timing_heartbeat_preserves_teensy_and_earliest_pc_timestamps(tmp_path):
+    session = HFDecisionSession(SessionConfig())
+    session.recorder = SessionRecorder(tmp_path, "S1", "dm")
+
+    session._handle_streamdio_event(
+        "timing_heartbeat",
+        None,
+        None,
+        100_000,
+        0.1,
+        host_perf_counter_s=1234.5,
+        host_wall_time_s=1_700_000_000.25,
+    )
+
+    raw = session.recorder.streamdio_events[-1]
+    assert raw == ("timing_heartbeat", -1, -1, 100_000, 0.1, 1234.5)
+    semantic = session.recorder.events[-1]
+    assert semantic.event_type == "timing_heartbeat"
+    assert semantic.payload["module_timestamp_us"] == 100_000
+    assert semantic.payload["host_perf_counter_s"] == 1234.5
+    assert semantic.payload["host_wall_time_s"] == 1_700_000_000.25
+
+
 def test_streamdio_status_snapshot_is_bounded_debug_data_and_stream_summary(tmp_path):
     session = HFDecisionSession(SessionConfig())
     session.recorder = SessionRecorder(tmp_path, "S1", "dm")

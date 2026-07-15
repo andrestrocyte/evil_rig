@@ -165,10 +165,10 @@ def test_session_finalize_writes_manifest_snapshot_and_exports(tmp_path):
         {
             "config": config_to_dict(cfg),
             "task_summary": {"modality": "force"},
-            "streamdio_module_info": {"firmware_version": 4},
+            "streamdio_module_info": {"firmware_version": 5},
         }
     )
-    recorder.register_stream("streamdio", {"type": "streamdio", "module_info": {"firmware_version": 4}})
+    recorder.register_stream("streamdio", {"type": "streamdio", "module_info": {"firmware_version": 5}})
     recorder.log_event("trial_start", {"trial_index": 1})
     recorder.log_event("bpod_state_marker", {"trial_index": 1, "state_name": "ChoiceWindow"})
     recorder.log_event("lick", {"trial_index": 1, "channel": 14, "timestamp_us": 4000})
@@ -179,6 +179,15 @@ def test_session_finalize_writes_manifest_snapshot_and_exports(tmp_path):
     recorder.log_streamdio_event("analog_input", 13, 42, 1000, 0.001)
     recorder.log_streamdio_event("camera", None, None, 2000, 0.002)
     recorder.log_streamdio_event("dio_input", 5, 1, 3000, 0.003)
+    for index in range(1, 4):
+        recorder.log_streamdio_event(
+            "timing_heartbeat",
+            None,
+            None,
+            index * 100_000,
+            index * 0.1,
+            host_perf_counter_s=10.0 + index * 0.1,
+        )
     recorder.log_fsm_definition("test_fsm", {"states": ["ChoiceWindow"]})
     recorder.log_bpod_trial(1, [{"type": "StateStart", "state": "ChoiceWindow"}])
     recorder.add_trial(_trial())
@@ -200,6 +209,8 @@ def test_session_finalize_writes_manifest_snapshot_and_exports(tmp_path):
     assert (bundle / "exports" / "licks.csv").exists()
     assert (bundle / "exports" / "synchronized_timeline.csv").exists()
     assert (bundle / "exports" / "alignment_anchors.json").exists()
+    assert (bundle / "exports" / "streamdio_timing_heartbeat.csv").exists()
+    assert (bundle / "exports" / "streamdio_timing_qc.json").exists()
     assert (bundle / "exports" / "soundcard_status.json").exists()
     assert (bundle / "exports" / "stream_summaries.json").exists()
     assert (bundle / "bpod_exports" / "bpod_trials_flat.csv").exists()
@@ -216,6 +227,7 @@ def test_session_finalize_writes_manifest_snapshot_and_exports(tmp_path):
     assert manifest["counts"]["frames"] == 0
     assert manifest["counts"]["force_samples"] == 1
     assert manifest["counts"]["frame2ttl_edges"] == 1
+    assert manifest["counts"]["timing_heartbeats"] == 3
     assert manifest["counts"]["bpod_trial_rows"] == 1
     assert manifest["clock_alignment"]["model"] == (
         "target_s = slope * source_s + intercept"
@@ -247,9 +259,10 @@ def test_session_finalize_writes_manifest_snapshot_and_exports(tmp_path):
     )
     assert soundcard["device_id"] == "sim"
     assert soundcard["continuous_playback_active"] is True
-    assert manifest["streamdio"]["firmware_version"] == 4
+    assert manifest["streamdio"]["firmware_version"] == 5
+    assert manifest["streamdio"]["timing_heartbeat_qc"]["overall_status"] == "PASS"
     assert manifest["stream_summaries"]["streamdio"]["type"] == "streamdio"
-    assert manifest["recorder_stats"]["max_streamdio_events_in_memory"] == 3
+    assert manifest["recorder_stats"]["max_streamdio_events_in_memory"] == 6
     assert manifest["recorder_stats"]["bundle_artifact_count"] == len(
         manifest["artifacts"]
     )
@@ -490,6 +503,7 @@ def test_validate_session_detects_manifest_count_mismatch(tmp_path):
     manifest["counts"]["frames"] += 1
     manifest["counts"]["force_samples"] += 1
     manifest["counts"]["frame2ttl_edges"] += 1
+    manifest["counts"]["timing_heartbeats"] += 1
     manifest["counts"]["bpod_trial_rows"] += 1
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -509,6 +523,10 @@ def test_validate_session_detects_manifest_count_mismatch(tmp_path):
     assert any("manifest count force_samples mismatch" in error for error in result["errors"])
     assert any(
         "manifest count frame2ttl_edges mismatch" in error
+        for error in result["errors"]
+    )
+    assert any(
+        "manifest count timing_heartbeats mismatch" in error
         for error in result["errors"]
     )
     assert any(

@@ -43,7 +43,11 @@ class CapTouchDiagnosticState:
         value: int | None,
         timestamp_us: int,
         relative_time_s: float,
+        *,
+        host_perf_counter_s: float | None = None,
+        host_wall_time_s: float | None = None,
     ) -> None:
+        del host_perf_counter_s, host_wall_time_s
         channel_i = None if channel is None else int(channel)
         value_i = None if value is None else int(value)
         with self.lock:

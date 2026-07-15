@@ -21,6 +21,11 @@ import yaml
 
 from hf_dm.hardware.bringup_constants import FORCE_ANALOG_CHANNEL, FRAME2TTL_INPUT_CHANNEL
 from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
+from hf_dm.timing_heartbeat import (
+    TIMING_HEARTBEAT_EVENT_TYPE,
+    analyze_timing_heartbeats,
+    timing_heartbeat_qc_summary,
+)
 
 
 SEMANTIC_TIMELINE_EVENTS = {
@@ -48,6 +53,7 @@ SEMANTIC_TIMELINE_EVENTS = {
     "white_noise_end",
     "bpod_state_marker",
     "frame2ttl_edge",
+    TIMING_HEARTBEAT_EVENT_TYPE,
     "frame2ttl_barcode_start",
     "frame2ttl_barcode_end",
     "frame2ttl_barcode_decode",
@@ -102,6 +108,20 @@ STREAMDIO_COLUMNS = [
     "module_timestamp_us",
     "relative_time_s",
     "host_perf_counter_s",
+]
+
+TIMING_HEARTBEAT_COLUMNS = [
+    "sequence",
+    "teensy_timestamp_us",
+    "driver_relative_time_s",
+    "teensy_elapsed_s",
+    "teensy_interval_s",
+    "pc_perf_counter_s",
+    "pc_wall_time_s",
+    "pc_elapsed_s",
+    "pc_interval_s",
+    "pc_minus_teensy_interval_s",
+    "pc_minus_teensy_elapsed_s",
 ]
 
 TIMELINE_COLUMNS = [
@@ -244,6 +264,7 @@ def validate_session(path: Path | str) -> dict[str, Any]:
     errors.extend(_validate_config_provenance(manifest, manifest_path.parent))
     errors.extend(_validate_manifest_flags(manifest, manifest_path.parent))
     errors.extend(_validate_manifest_counts(manifest, manifest_path.parent))
+    errors.extend(_validate_timing_heartbeat_consistency(manifest, manifest_path.parent))
     errors.extend(_validate_continuous_stream_index(manifest, manifest_path.parent))
     errors.extend(_validate_recorder_stats(manifest))
     return {
@@ -297,6 +318,26 @@ def make_session_bundle(
     streamdio_rows = [_streamdio_to_dict(row) for row in streamdio_events]
 
     written: list[Path] = []
+    timing_heartbeat_report = analyze_timing_heartbeats(
+        streamdio_rows,
+        session_events=event_dicts,
+    )
+    timing_heartbeat_samples = list(timing_heartbeat_report.get("samples") or [])
+    timing_heartbeat_summary = timing_heartbeat_qc_summary(timing_heartbeat_report)
+    timing_heartbeat_csv = exports_dir / "streamdio_timing_heartbeat.csv"
+    timing_heartbeat_qc_path = exports_dir / "streamdio_timing_qc.json"
+    timing_heartbeat_summary.update(
+        {
+            "timestamps_artifact": "exports/streamdio_timing_heartbeat.csv",
+            "qc_artifact": "exports/streamdio_timing_qc.json",
+        }
+    )
+    _write_timing_heartbeat_csv(timing_heartbeat_csv, timing_heartbeat_samples)
+    _atomic_write_text(
+        timing_heartbeat_qc_path,
+        json.dumps(timing_heartbeat_summary, indent=2),
+    )
+    written.extend([timing_heartbeat_csv, timing_heartbeat_qc_path])
     config_snapshot = None
     if bool(options.get("config_snapshot", True)):
         config_snapshot = bundle_dir / "config.snapshot.yaml"
@@ -428,6 +469,7 @@ def make_session_bundle(
             "bundle_artifact_count": _existing_artifact_count(artifact_paths),
             "bundle_artifact_bytes": _artifact_bytes(artifact_paths),
         },
+        timing_heartbeat_qc=timing_heartbeat_summary,
     )
     if bool(options.get("manifest", True)):
         _atomic_write_text(manifest_path, json.dumps(manifest, indent=2))
@@ -460,6 +502,7 @@ def make_session_bundle(
                 "bundle_artifact_count": _existing_artifact_count(artifact_paths),
                 "bundle_artifact_bytes": _artifact_bytes(artifact_paths),
             },
+            timing_heartbeat_qc=timing_heartbeat_summary,
         )
         if bool(options.get("manifest", True)):
             _atomic_write_text(manifest_path, json.dumps(manifest, indent=2))
@@ -643,6 +686,17 @@ def _write_streamdio_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
+def _write_timing_heartbeat_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
+    """Write the complete dual-clock heartbeat trace, including an empty header."""
+
+    with _atomic_text_handle(path, newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=TIMING_HEARTBEAT_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name) for name in TIMING_HEARTBEAT_COLUMNS})
+    return path
+
+
 def _write_streamdio_subset_csv(
     path: Path,
     rows: list[dict[str, Any]],
@@ -743,7 +797,10 @@ def _timeline_rows(
         rows.append(
             {
                 "session_mono_s": _relative(event_mono_s, event_start),
-                "wall_time_s": payload.get("wall_time_s", event.get("wall_time_s")),
+                "wall_time_s": payload.get(
+                    "host_wall_time_s",
+                    payload.get("wall_time_s", event.get("wall_time_s")),
+                ),
                 "module_timestamp_us": payload.get(
                     "module_timestamp_us", payload.get("timestamp_us")
                 ),
@@ -1020,6 +1077,7 @@ def _manifest(
     artifacts: list[Path],
     options: dict[str, Any],
     recorder_stats: dict[str, Any],
+    timing_heartbeat_qc: dict[str, Any],
 ) -> dict[str, Any]:
     counts_by_type: dict[str, int] = {}
     for row in streamdio_rows:
@@ -1086,6 +1144,10 @@ def _manifest(
             "session_events_by_type": dict(sorted(event_counts.items())),
             "licks": event_counts.get("lick", 0),
             "camera_ttls": counts_by_type.get("camera", 0),
+            "timing_heartbeats": counts_by_type.get(
+                TIMING_HEARTBEAT_EVENT_TYPE,
+                0,
+            ),
             "frames": frame_count,
             "force_samples": force_sample_count,
             "frame2ttl_edges": sum(
@@ -1102,6 +1164,7 @@ def _manifest(
             "firmware_version": (
                 streamdio_info.get("firmware_version") if isinstance(streamdio_info, dict) else None
             ),
+            "timing_heartbeat_qc": timing_heartbeat_qc,
         },
         "stream_summaries": metadata.get("stream_summaries") or {},
         "video": video_summary,
@@ -1134,20 +1197,30 @@ def _clock_alignment(
 
     for event in events:
         event_type = str(event.get("event_type", ""))
-        if event_type not in {"bpod_state_marker", "frame2ttl_edge"}:
+        if event_type not in {
+            "bpod_state_marker",
+            "frame2ttl_edge",
+            TIMING_HEARTBEAT_EVENT_TYPE,
+        }:
             continue
         payload = event.get("payload") or {}
         record_perf_s = _finite_float(event.get("monotonic_s"))
         payload_perf_s = _finite_float(payload.get("host_perf_counter_s"))
         perf_s = payload_perf_s if payload_perf_s is not None else record_perf_s
-        wall_s = _finite_float(payload.get("wall_time_s", event.get("wall_time_s")))
+        wall_s = _finite_float(
+            payload.get(
+                "host_wall_time_s",
+                payload.get("wall_time_s", event.get("wall_time_s")),
+            )
+        )
         module_us = _finite_float(
             payload.get("module_timestamp_us", payload.get("timestamp_us"))
         )
         module_s = None if module_us is None else module_us / 1_000_000.0
         wall_perf_s = (
             payload_perf_s
-            if payload.get("wall_time_s") is not None
+            if payload.get("host_wall_time_s") is not None
+            or payload.get("wall_time_s") is not None
             else record_perf_s
         )
         if wall_perf_s is not None and wall_s is not None:
@@ -1159,9 +1232,11 @@ def _clock_alignment(
 
     frame2ttl_channel = _frame2ttl_channel(metadata)
     for row in streamdio_rows:
-        if row.get("event_type") != "dio_input":
-            continue
-        if _optional_int(row.get("channel")) != frame2ttl_channel:
+        row_event_type = row.get("event_type")
+        if row_event_type == "dio_input":
+            if _optional_int(row.get("channel")) != frame2ttl_channel:
+                continue
+        elif row_event_type != TIMING_HEARTBEAT_EVENT_TYPE:
             continue
         module_us = _finite_float(row.get("module_timestamp_us"))
         perf_s = _finite_float(row.get("host_perf_counter_s"))
@@ -1414,6 +1489,8 @@ def _event_source(event_type: str) -> str:
         return "frame2ttl"
     if event_type == "bpod_state_marker":
         return "bpod_streamdio_marker"
+    if event_type == TIMING_HEARTBEAT_EVENT_TYPE:
+        return "streamdio_teensy"
     if event_type in {"pump_start", "pump_end", "output_actual", "force_on", "force_off"}:
         return "outputs"
     if event_type.startswith("white_noise"):
@@ -1745,6 +1822,13 @@ def _validate_manifest_counts(manifest: dict[str, Any], bundle_dir: Path) -> lis
                 "manifest count streamdio_events",
                 counts.get("streamdio_events"),
                 len(streamdio_rows),
+                npz_rel,
+            )
+            _append_count_mismatch(
+                errors,
+                "manifest count timing_heartbeats",
+                counts.get("timing_heartbeats"),
+                streamdio_counts.get(TIMING_HEARTBEAT_EVENT_TYPE, 0),
                 npz_rel,
             )
             _append_mapping_mismatch(
@@ -2113,6 +2197,29 @@ def _validate_npz_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> li
             if missing:
                 errors.append(f"primary npz missing arrays: {rel}: {missing}")
                 return errors
+            if "timing_heartbeat_qc_json" in files:
+                try:
+                    npz_qc = json.loads(str(data["timing_heartbeat_qc_json"][0]))
+                except Exception as exc:
+                    errors.append(
+                        f"primary npz invalid timing_heartbeat_qc_json: "
+                        f"{rel}: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    manifest_qc = (manifest.get("streamdio") or {}).get(
+                        "timing_heartbeat_qc"
+                    )
+                    if isinstance(manifest_qc, dict):
+                        for field in (
+                            "overall_status",
+                            "heartbeat_count",
+                            "interval_count",
+                            "estimated_missed_pulses",
+                        ):
+                            if npz_qc.get(field) != manifest_qc.get(field):
+                                errors.append(
+                                    f"primary npz timing heartbeat {field} mismatch: {rel}"
+                                )
             counts = manifest.get("counts") or {}
             trial_count = counts.get("trials")
             if trial_count is not None and len(data["trials"]) != int(trial_count):
@@ -2142,6 +2249,8 @@ def _validate_json_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> l
         return _validate_debug_events_recent_json(payload, rel, manifest)
     if _relative_matches(rel, "exports/rig_preflight_report.json"):
         return _validate_rig_preflight_report_json(payload, rel, manifest)
+    if _relative_matches(rel, "exports/streamdio_timing_qc.json"):
+        return _validate_timing_heartbeat_qc_json(payload, rel, manifest)
     if not isinstance(payload, dict):
         return []
     if _relative_matches(rel, "bpod_data/bpod_trials.json"):
@@ -2375,6 +2484,9 @@ def _validate_csv_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> li
         expected = _optional_int(counts.get("camera_ttls"))
     elif _relative_matches(rel, "exports/frame2ttl_edges.csv"):
         expected = _optional_int(counts.get("frame2ttl_edges"))
+    elif _relative_matches(rel, "exports/streamdio_timing_heartbeat.csv"):
+        expected = _optional_int(counts.get("timing_heartbeats"))
+        errors.extend(_validate_timing_heartbeat_csv_header(path, rel))
     elif _relative_matches(rel, "exports/licks.csv"):
         event_counts = counts.get("session_events_by_type") or {}
         expected = _optional_int(event_counts.get("lick") or 0) or 0
@@ -2431,6 +2543,134 @@ def _validate_timeline_csv(path: Path, rel: str) -> list[str]:
                     errors.append(
                         f"timeline csv invalid detail_json: {rel}:{row_index}: {exc.msg}"
                     )
+    return errors
+
+
+def _validate_timing_heartbeat_consistency(
+    manifest: dict[str, Any],
+    bundle_dir: Path,
+) -> list[str]:
+    declared = (manifest.get("streamdio") or {}).get("timing_heartbeat_qc")
+    if declared is None:
+        return []
+    if not isinstance(declared, dict):
+        return ["manifest timing heartbeat QC is not an object"]
+    npz_path, rel = _primary_npz_path(manifest, bundle_dir)
+    if npz_path is None or not npz_path.exists():
+        return ["timing heartbeat QC cannot be verified without primary NPZ"]
+    try:
+        rows = _load_npz_streamdio(npz_path)
+    except Exception as exc:
+        return [
+            f"timing heartbeat QC source unreadable: {rel}: "
+            f"{type(exc).__name__}: {exc}"
+        ]
+    actual = timing_heartbeat_qc_summary(analyze_timing_heartbeats(rows))
+    errors: list[str] = []
+    for field in (
+        "overall_status",
+        "heartbeat_count",
+        "interval_count",
+        "estimated_missed_pulses",
+        "first_teensy_timestamp_us",
+        "last_teensy_timestamp_us",
+        "teensy_span_s",
+        "first_pc_perf_counter_s",
+        "last_pc_perf_counter_s",
+        "pc_span_s",
+        "final_pc_minus_teensy_elapsed_s",
+        "max_abs_pc_minus_teensy_elapsed_s",
+        "pc_vs_teensy_rate_error_ppm",
+        "statistics",
+        "clock_fit",
+        "thresholds",
+        "metrics",
+    ):
+        if declared.get(field) != actual.get(field):
+            errors.append(f"timing heartbeat QC does not match raw StreamDIO data: {field}")
+    return errors
+
+
+def _validate_timing_heartbeat_csv_header(path: Path, rel: str) -> list[str]:
+    try:
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            fieldnames = csv.DictReader(handle).fieldnames or []
+    except Exception as exc:
+        return [f"timing heartbeat csv unreadable: {rel}: {type(exc).__name__}: {exc}"]
+    missing = [name for name in TIMING_HEARTBEAT_COLUMNS if name not in fieldnames]
+    return [] if not missing else [f"timing heartbeat csv missing columns: {rel}: {missing}"]
+
+
+def _validate_timing_heartbeat_qc_json(
+    payload: Any,
+    rel: str,
+    manifest: dict[str, Any],
+) -> list[str]:
+    if not isinstance(payload, dict):
+        return [f"timing heartbeat QC is not an object: {rel}"]
+    errors: list[str] = []
+    if payload.get("schema_version") != 1:
+        errors.append(f"timing heartbeat QC schema mismatch: {rel}")
+    if payload.get("kind") != "hf_dm_streamdio_timing_heartbeat_qc":
+        errors.append(f"timing heartbeat QC kind mismatch: {rel}")
+    if payload.get("event_type") != TIMING_HEARTBEAT_EVENT_TYPE:
+        errors.append(f"timing heartbeat QC event type mismatch: {rel}")
+    if payload.get("overall_status") not in {"PASS", "WARN", "FAIL"}:
+        errors.append(f"timing heartbeat QC invalid overall_status: {rel}")
+    if payload.get("timestamps_artifact") != "exports/streamdio_timing_heartbeat.csv":
+        errors.append(f"timing heartbeat QC timestamps artifact mismatch: {rel}")
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, list) or not metrics:
+        errors.append(f"timing heartbeat QC missing metrics: {rel}")
+    else:
+        required_metrics = {
+            "heartbeat_count",
+            "estimated_missed_pulses",
+            "teensy_interval_max_abs_error_s",
+            "pc_interval_p99_abs_error_s",
+            "pc_interval_max_abs_error_s",
+            "pc_delivery_detrended_max_abs_s",
+            "pc_vs_teensy_rate_error_ppm",
+            "teensy_nonmonotonic_intervals",
+            "pc_nonmonotonic_intervals",
+        }
+        names = {
+            str(metric.get("name"))
+            for metric in metrics
+            if isinstance(metric, dict)
+        }
+        missing = sorted(required_metrics - names)
+        if missing:
+            errors.append(f"timing heartbeat QC missing metric names: {rel}: {missing}")
+        for index, metric in enumerate(metrics):
+            if not isinstance(metric, dict):
+                errors.append(f"timing heartbeat QC metric is not an object: {rel}:{index}")
+                continue
+            if metric.get("status") not in {"PASS", "WARN", "FAIL", "N/A"}:
+                errors.append(f"timing heartbeat QC metric status invalid: {rel}:{index}")
+    heartbeat_count = _optional_int(payload.get("heartbeat_count"))
+    manifest_count = _optional_int((manifest.get("counts") or {}).get("timing_heartbeats"))
+    if heartbeat_count is None:
+        errors.append(f"timing heartbeat QC invalid heartbeat_count: {rel}")
+    elif manifest_count is not None and heartbeat_count != manifest_count:
+        errors.append(
+            f"timing heartbeat QC count mismatch: {rel}: "
+            f"{heartbeat_count} != {manifest_count}"
+        )
+    manifest_qc = (manifest.get("streamdio") or {}).get("timing_heartbeat_qc")
+    if not isinstance(manifest_qc, dict):
+        errors.append(f"manifest missing timing heartbeat QC object: {rel}")
+    else:
+        for field in (
+            "overall_status",
+            "heartbeat_count",
+            "interval_count",
+            "estimated_missed_pulses",
+            "first_teensy_timestamp_us",
+            "last_teensy_timestamp_us",
+        ):
+            if payload.get(field) != manifest_qc.get(field):
+                errors.append(f"manifest timing heartbeat {field} mismatch: {rel}")
     return errors
 
 

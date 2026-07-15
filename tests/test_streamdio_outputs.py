@@ -1,14 +1,17 @@
+import logging
 import threading
 from collections import defaultdict, deque
 
 import pytest
 
+import hf_dm.streamdio.client as client_module
 from hf_dm.hardware.bringup_constants import (
     CAP_TOUCH_INPUT_PIN,
     FRAME2TTL_INPUT_CHANNEL,
     FORCE_ANALOG_CHANNEL,
     FORCE_ANALOG_PIN,
     LICK_INPUT_CHANNEL,
+    STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE,
 )
 from hf_dm.streamdio.client import StreamDIOClient
 from hf_dm.streamdio.outputs import StreamDIOOutputs
@@ -45,7 +48,7 @@ class FakeProtocol:
     def __init__(self) -> None:
         self.client = None
         self.module_info = {
-            "firmware_version": 4,
+            "firmware_version": 5,
             "n_input_channels": 14,
             "n_output_channels": 13,
         }
@@ -189,9 +192,10 @@ def test_streamdio_close_surfaces_errors_after_attempting_every_stage():
     assert client.raw is None
 
 
-def test_rotary_force_config_requires_cap_touch_digitizer_firmware():
+def test_rotary_force_config_requires_cap_touch_digitizer_firmware(monkeypatch):
     client = _client()
     client.raw.module_info["firmware_version"] = 2
+    monkeypatch.setattr(client_module, "STREAMDIO_TIMING_HEARTBEAT_FIRMWARE_VERSION", 2)
 
     try:
         client.configure_rotary_and_force(lick_channels=(LICK_INPUT_CHANNEL,))
@@ -213,6 +217,63 @@ def test_rotary_force_config_accepts_digitizer_firmware():
     assert enabled[LICK_INPUT_CHANNEL - 1]
     assert enabled[FRAME2TTL_INPUT_CHANNEL - 1]
     assert client.raw.configured["analog_input"]["channel"] == FORCE_ANALOG_CHANNEL
+
+
+def test_rotary_force_config_requires_timing_heartbeat_firmware():
+    client = _client()
+    client.raw.module_info["firmware_version"] = 4
+
+    with pytest.raises(RuntimeError, match="100 ms timing heartbeat"):
+        client.configure_rotary_and_force(lick_channels=())
+
+
+def test_firmware_heartbeat_is_normalized_and_gets_pc_receive_timestamps():
+    client = _client()
+    received = []
+
+    def callback(event_type, channel, value, timestamp_us, relative_time_s, **timestamps):
+        received.append(
+            (event_type, channel, value, timestamp_us, relative_time_s, timestamps)
+        )
+
+    client._callback = callback
+    client._dispatch_event(
+        "diagnostic",
+        STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE,
+        None,
+        100_000,
+        0.1,
+    )
+
+    event = received[0]
+    assert event[:5] == ("timing_heartbeat", None, None, 100_000, 0.1)
+    assert event[5]["host_perf_counter_s"] > 0
+    assert event[5]["host_wall_time_s"] > 0
+
+
+def test_streamdio_driver_log_filter_suppresses_only_timing_heartbeat():
+    heartbeat = logging.LogRecord(
+        "pybpod_streamDIO_module.stream_dio_protocol",
+        logging.WARNING,
+        __file__,
+        1,
+        "Diagnostic event 1011 at 123456 us",
+        (),
+        None,
+    )
+    fault = logging.LogRecord(
+        "pybpod_streamDIO_module.stream_dio_protocol",
+        logging.WARNING,
+        __file__,
+        1,
+        "Diagnostic event 1001 at 123456 us",
+        (),
+        None,
+    )
+
+    log_filter = client_module._TimingHeartbeatLogFilter()
+    assert not log_filter.filter(heartbeat)
+    assert log_filter.filter(fault)
 
 
 def test_cap_touch_analog_diagnostic_streams_touch_channel_instead_of_force():
@@ -249,7 +310,7 @@ def test_module_status_collects_driver_status_snapshots():
     assert status["config_port"] == "COM_CONFIG"
     assert status["stream_port"] == "COM_STREAM"
     assert status["streaming_active"]
-    assert status["module_info"]["firmware_version"] == 4
+    assert status["module_info"]["firmware_version"] == 5
     assert status["analog_input_status"]["channel"] == FORCE_ANALOG_CHANNEL
     assert status["speaker_status"]["pin"] == 27
 

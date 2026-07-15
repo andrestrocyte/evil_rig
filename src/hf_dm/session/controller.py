@@ -53,6 +53,8 @@ from hf_dm.hardware.bringup_constants import (
     STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION,
     STREAMDIO_STATE_MARKER_IDS,
     STREAMDIO_STATE_MARKER_NAMES,
+    STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE,
+    STREAMDIO_TIMING_HEARTBEAT_PERIOD_US,
 )
 from hf_dm.monitor import OperatorMonitor
 from hf_dm.safety_interlock import (
@@ -74,6 +76,7 @@ from hf_dm.valve_calibration import (
 from hf_dm.streamdio.client import StreamDIOClient
 from hf_dm.streamdio.outputs import StreamDIOOutputs
 from hf_dm.streamdio.wheel import Direction, WheelAccumulator
+from hf_dm.timing_heartbeat import TIMING_HEARTBEAT_EVENT_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +251,13 @@ class HFDecisionSession:
                 "force_channel": FORCE_ANALOG_CHANNEL,
                 "lick_channels": list(self.config.licks.channels),
                 "frame2ttl_channels": self._frame2ttl_input_channels(),
+                "timing_heartbeat": {
+                    "event_type": TIMING_HEARTBEAT_EVENT_TYPE,
+                    "event_code": STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE,
+                    "period_us": STREAMDIO_TIMING_HEARTBEAT_PERIOD_US,
+                    "origin": "streamdio_teensy",
+                    "pc_timestamp": "callback_perf_counter",
+                },
             },
         )
         self._configure_monitor_record_path()
@@ -855,6 +865,10 @@ class HFDecisionSession:
                 "lick_high_only": self.config.licks.high_only,
                 "lick_inputs": self._lick_input_descriptors(),
                 "frame2ttl": self._frame2ttl_descriptor(),
+                "timing_heartbeat": {
+                    "period_ms": STREAMDIO_TIMING_HEARTBEAT_PERIOD_US / 1000.0,
+                    "origin": "streamdio_teensy",
+                },
                 "cap_touch_power": {
                     "channel": self.config.licks.power_output_channel,
                     "pin": (
@@ -1374,7 +1388,18 @@ class HFDecisionSession:
         value: int | None,
         timestamp_us: int,
         relative_time: float,
+        *,
+        host_perf_counter_s: float | None = None,
+        host_wall_time_s: float | None = None,
     ) -> None:
+        event_host_mono_s = (
+            time.perf_counter()
+            if host_perf_counter_s is None
+            else float(host_perf_counter_s)
+        )
+        event_host_wall_s = (
+            time.time() if host_wall_time_s is None else float(host_wall_time_s)
+        )
         if self.recorder is not None:
             self.recorder.log_streamdio_event(
                 event_type,
@@ -1382,11 +1407,23 @@ class HFDecisionSession:
                 value,
                 timestamp_us,
                 relative_time,
+                host_perf_counter_s=event_host_mono_s,
             )
         normalized_channel = -1 if channel is None else int(channel)
         normalized_value = -1 if value is None else int(value)
-        event_host_mono_s = time.perf_counter()
-        event_host_wall_s = time.time()
+        if event_type == TIMING_HEARTBEAT_EVENT_TYPE and self.recorder is not None:
+            payload = {
+                "module_timestamp_us": int(timestamp_us),
+                "relative_time_s": float(relative_time),
+                "host_perf_counter_s": event_host_mono_s,
+                "host_wall_time_s": event_host_wall_s,
+                "expected_interval_s": (
+                    STREAMDIO_TIMING_HEARTBEAT_PERIOD_US / 1_000_000.0
+                ),
+                "origin": "streamdio_teensy",
+            }
+            self.recorder.log_event(TIMING_HEARTBEAT_EVENT_TYPE, payload)
+            self._publish_monitor(TIMING_HEARTBEAT_EVENT_TYPE, payload)
         if self._is_frame2ttl_edge(event_type, normalized_channel):
             self._record_frame2ttl_edge(
                 normalized_value,

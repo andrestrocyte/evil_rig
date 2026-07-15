@@ -100,6 +100,15 @@ def test_session_journal_is_incremental_and_manifest_validated(tmp_path):
 def test_recover_session_repairs_truncated_tail_and_finalizes(tmp_path):
     recorder = _recorder(tmp_path)
     recorder.log_bpod_trial(1, [{"type": "StateStart", "state": "ChoiceWindow"}])
+    for index in range(1, 4):
+        recorder.log_streamdio_event(
+            "timing_heartbeat",
+            None,
+            None,
+            index * 100_000,
+            index * 0.1,
+            host_perf_counter_s=100.0 + index * 0.1,
+        )
     recorder.add_trial(_trial())
     recorder.close_journal()
     with recorder.journal_path.open("a", encoding="utf-8") as handle:

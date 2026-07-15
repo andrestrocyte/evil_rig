@@ -8,7 +8,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 
@@ -149,6 +149,46 @@ def evaluate_session_qc(
             detail="Worst recorded choice-loop frame duration",
         ),
     ]
+    heartbeat_qc = (
+        (session.get("streamdio") or {}).get("timing_heartbeat_qc")
+        if isinstance(session.get("streamdio"), dict)
+        else None
+    )
+    if isinstance(heartbeat_qc, dict) and isinstance(heartbeat_qc.get("metrics"), list):
+        for heartbeat_metric in heartbeat_qc["metrics"]:
+            if not isinstance(heartbeat_metric, dict):
+                continue
+            status_value = str(heartbeat_metric.get("status"))
+            if status_value not in {"PASS", "WARN", "FAIL"}:
+                continue
+            status = cast(QcStatus, status_value)
+            metrics.append(
+                QcMetric(
+                    name=f"streamdio_{heartbeat_metric.get('name')}",
+                    status=status,
+                    value=(
+                        heartbeat_metric.get("value")
+                        if _finite_number(heartbeat_metric.get("value"))
+                        else None
+                    ),
+                    pass_threshold=heartbeat_metric.get("pass_threshold", 0),
+                    warn_threshold=heartbeat_metric.get("warn_threshold", 0),
+                    comparison=str(heartbeat_metric.get("comparison") or "present"),
+                    detail=str(heartbeat_metric.get("detail") or "StreamDIO timing heartbeat QC"),
+                )
+            )
+    else:
+        metrics.append(
+            QcMetric(
+                name="streamdio_timing_heartbeat_qc_present",
+                status="FAIL",
+                value=0,
+                pass_threshold=1,
+                warn_threshold=1,
+                comparison="present",
+                detail="Finalized session has no integrated StreamDIO timing heartbeat QC",
+            )
+        )
     metadata = session.get("metadata") or {}
     if isinstance(metadata, dict) and isinstance(metadata.get("reward_calibration"), dict):
         event_types = {str(event.get("event_type")) for event in events}
@@ -338,7 +378,15 @@ def _load_npz_session(path: Path) -> dict[str, Any]:
         summary: dict[str, Any] = {}
         if "summary_json" in data.files and len(data["summary_json"]):
             summary = json.loads(str(data["summary_json"][0]))
-    return {"trials": trials, "summary": summary, "metadata": {}}
+        heartbeat_qc: dict[str, Any] | None = None
+        if "timing_heartbeat_qc_json" in data.files and len(data["timing_heartbeat_qc_json"]):
+            heartbeat_qc = json.loads(str(data["timing_heartbeat_qc_json"][0]))
+    return {
+        "trials": trials,
+        "summary": summary,
+        "metadata": {},
+        "streamdio": {"timing_heartbeat_qc": heartbeat_qc},
+    }
 
 
 def _manifest_from_candidate(path: Path) -> Path | None:

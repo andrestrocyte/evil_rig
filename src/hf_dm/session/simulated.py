@@ -27,10 +27,13 @@ from hf_dm.hardware.bringup_constants import (
     PUMP_OUTPUT_CHANNEL,
     STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID,
     STREAMDIO_STATE_MARKER_MESSAGE_IDS,
+    STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE,
+    STREAMDIO_TIMING_HEARTBEAT_PERIOD_US,
 )
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.runners.simulated_bpod import SimulatedBpod
 from hf_dm.streamdio.wheel import Direction, WheelKinematics, _percentile
+from hf_dm.timing_heartbeat import TIMING_HEARTBEAT_EVENT_TYPE
 
 SimChoiceMode = Literal["matched", "opposite", "timeout", "cw", "ccw", "alternate"]
 
@@ -245,10 +248,49 @@ class SimulatedDIO:
             int,
             list[tuple[int, int, int, float, float]],
         ] = {}
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
 
     def start_streaming(self, callback=None) -> None:
+        self.stop_streaming()
         self._callback = callback
         self._stream_start_mono = time.perf_counter()
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name="hf-dm-sim-streamdio-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        period_s = STREAMDIO_TIMING_HEARTBEAT_PERIOD_US / 1_000_000.0
+        sequence = 1
+        while not self._heartbeat_stop.is_set():
+            deadline = self._stream_start_mono + sequence * period_s
+            if self._heartbeat_stop.wait(max(0.0, deadline - time.perf_counter())):
+                return
+            callback = self._callback
+            if callback is not None:
+                callback(
+                    TIMING_HEARTBEAT_EVENT_TYPE,
+                    None,
+                    None,
+                    sequence * STREAMDIO_TIMING_HEARTBEAT_PERIOD_US,
+                    sequence * period_s,
+                    # Deterministic virtual PC receipt clock; live hardware uses
+                    # the actual callback timestamp captured by StreamDIOClient.
+                    host_perf_counter_s=deadline,
+                    host_wall_time_s=time.time(),
+                )
+            sequence += 1
+
+    def stop_streaming(self) -> None:
+        self._heartbeat_stop.set()
+        thread = self._heartbeat_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._heartbeat_thread = None
 
     def start_camera_session(self, frequency_hz: int, exposure_us: int) -> None:
         del exposure_us
@@ -385,6 +427,7 @@ class SimulatedDIO:
         )
 
     def close(self) -> None:
+        self.stop_streaming()
         self.stop_camera()
 
 
@@ -520,6 +563,13 @@ class SimulatedHFDecisionSession(HFDecisionSession):
                 "force_channel": self.config.wheel.force_channel,
                 "lick_channels": list(self.config.licks.channels),
                 "frame2ttl_channels": self._frame2ttl_input_channels(),
+                "timing_heartbeat": {
+                    "event_type": TIMING_HEARTBEAT_EVENT_TYPE,
+                    "event_code": STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE,
+                    "period_us": STREAMDIO_TIMING_HEARTBEAT_PERIOD_US,
+                    "origin": "simulated_streamdio_teensy",
+                    "pc_timestamp": "callback_perf_counter",
+                },
             },
         )
         self._configure_monitor_record_path()

@@ -56,7 +56,8 @@ responsibility:
   reads the StreamDIO event stream, detects the centered choice, and verifies pump/force outputs
   from timestamped `dio_output` events (Bpod FSM actuates via Serial1).
 - **StreamDIO owns the fast, timestamped data stream** — wheel pulses, force ADC, licks, camera
-  TTLs, Frame2TTL edges, and Bpod state markers are all timestamped by one module clock.
+  TTLs, Frame2TTL edges, Bpod state markers, and the permanent 100 ms timing heartbeat are all
+  timestamped by one module clock.
 
 The result is IBL-style rigor (multi-clock logging, screen sync, verified outputs, session bundles,
 QC) on a compact, hardware-specific stack.
@@ -72,11 +73,11 @@ QC) on a compact, hardware-specific stack.
 | **Screen sync** | Frame2TTL v3 photodiode + per-trial pulse-count **barcode** + 1 ms Bpod `*_Pre` state markers |
 | **Verified outputs** | Bpod FSM actuates pump/force via Serial1; each transition must produce a timestamped physical `dio_output` event on StreamDIO |
 | **Video** | Headless Spinnaker (FLIR) recording with per-frame camera + host timestamps; optional offline FFV1 preview |
-| **Multi-clock data** | Wall + monotonic `perf_counter` + StreamDIO module timestamps, with an export-time affine alignment fit |
+| **Multi-clock data** | Wall + monotonic `perf_counter` + StreamDIO module timestamps, with an export-time affine alignment fit and always-on 100 ms Teensy-to-PC heartbeat QC |
 | **Crash safety** | Append-only `session.journal.jsonl`, fsync per completed trial, atomic NPZ/JSON writes, `recover-session` |
 | **Counterbalancing** | Opt-in blocked side balancing + consecutive-run caps (defaults preserve historical Bernoulli draw) |
 | **Calibration & welfare** | Guided valve calibration → µL annotation; per-subject weight/water log |
-| **QC** | `session-qc` PASS/WARN/FAIL on response rate, matched rate, RT, and loop stalls |
+| **QC** | `session-qc` PASS/WARN/FAIL on response rate, matched rate, RT, loop stalls, missed 100 ms heartbeats, delivery jitter, and accumulated PC-versus-Teensy clock lag |
 | **Operator monitor** | Separate-process GUI: camera preview, task mirror, FSM state, force/wheel traces, lick/pump/noise rails |
 | **Validation** | Semantic config validation, no-trial preflight, and typed `name/status/detail/hint` diagnostic results |
 | **CI** | Ruff + mypy + hardware-free pytest on Windows and Linux |
@@ -543,6 +544,7 @@ NPZ/JSON — the StreamDIO/force/camera/task loops never append CSV rows in the 
 │   ├── streamdio_events.csv  force_trace.csv  camera_ttl.csv
 │   ├── frame2ttl_edges.csv  licks.csv  trials_summary.csv  events.csv
 │   ├── synchronized_timeline.csv  alignment_anchors.json
+│   ├── streamdio_timing_heartbeat.csv  streamdio_timing_qc.json
 │   ├── monitor_telemetry.jsonl       # when monitor record_path: auto
 │   ├── rig_preflight_report.json     # after rig-preflight
 │   └── alyx_registration.json        # when integrations.mm_alyx_register: true
@@ -564,7 +566,8 @@ triggers).
   count/timestamps, camera-TTL interval QC, Frame2TTL barcode/edge summary, choice-loop frame stats.
 - **Exact Bpod rows** for every trial (JSON + NPZ `bpod_trials_json`).
 - **Raw `streamdio_events`** (NPZ): every wheel/direction edge, force sample, camera TTL, lick,
-  module timestamp, and high-resolution host timestamp.
+  timing heartbeat, module timestamp, and high-resolution host timestamp. Firmware v5 emits the
+  heartbeat every 100,000 us; the PC timestamps that same callback immediately.
 - **Semantic events:** `session_start`, `trial_start`, `stimulus_on`, `force_on`, `choice_detected`,
   `feedback_on`, `frame2ttl_*`, `pump_start`, `pump_end`, `output_actual`, `lick`, `white_noise_*`,
   cleanup, `trial_end`, `session_end`.
@@ -678,7 +681,11 @@ validator. The marker is removed only after primary writes and exports succeed.
 
 **Session QC.** `hf-dm session-qc` writes `session.qc.json` with PASS/WARN/FAIL for response rate,
 matched rate, response time, choice-loop stalls, and worst frame duration. Calibrated sessions also
-require a successful subject-water log event.
+require a successful subject-water log event. The permanent StreamDIO heartbeat adds missed-pulse,
+Teensy-period, PC-delivery-jitter, detrended backlog, and accumulated PC-versus-Teensy clock-rate
+checks. Its full dual-clock samples and automatic QC are always exported as
+`exports/streamdio_timing_heartbeat.csv` and `exports/streamdio_timing_qc.json`; the operator monitor
+shows the live interval and cumulative difference.
 
 **Validation.** `hf-dm validate-session` checks manifest paths/sizes/SHA256, source-config
 provenance, NPZ schemas/counts, StreamDIO chunk NPZs and their index, CSV row counts (incl. Bpod
