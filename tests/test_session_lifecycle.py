@@ -13,7 +13,11 @@ from hf_dm.hardware.bringup_constants import (
     LICK_INPUT_CHANNEL,
     PUMP_OUTPUT_CHANNEL,
 )
-from hf_dm.session.controller import HFDecisionSession, HardwareCleanupError
+from hf_dm.session.controller import (
+    STREAMDIO_HEARTBEAT_STALL_TIMEOUT_S,
+    HFDecisionSession,
+    HardwareCleanupError,
+)
 from hf_dm.session.hardware_self_test import (
     HardwareSelfTestSession,
     shorten_for_hardware_self_test,
@@ -245,6 +249,84 @@ def test_timing_heartbeat_preserves_teensy_and_earliest_pc_timestamps(tmp_path):
     assert semantic.payload["module_timestamp_us"] == 100_000
     assert semantic.payload["host_perf_counter_s"] == 1234.5
     assert semantic.payload["host_wall_time_s"] == 1_700_000_000.25
+    assert session._last_streamdio_heartbeat_mono_s == 1234.5
+
+
+@pytest.mark.parametrize(
+    ("error", "thread_alive", "save_errors", "reason"),
+    [
+        ("camera disconnected", True, 0, "capture_error: camera disconnected"),
+        (None, False, 0, "capture_thread_not_alive"),
+        (None, True, 2, "frame_save_errors: 2"),
+    ],
+)
+def test_required_camera_runtime_failure_is_raised(
+    error,
+    thread_alive,
+    save_errors,
+    reason,
+):
+    session = HFDecisionSession(SessionConfig(), run_mode="bench")
+    session.recorder = MagicMock()
+    session.camera_recorder = SimpleNamespace(
+        error=error,
+        _thread=SimpleNamespace(is_alive=lambda: thread_alive),
+        _save_errors=save_errors,
+        _c_backend=None,
+    )
+
+    with pytest.raises(RuntimeError, match=reason):
+        session._check_recorder_health()
+
+    session.recorder.log_event.assert_called_once_with(
+        "required_camera_unhealthy",
+        {"required": True, "reasons": [reason]},
+    )
+
+
+def test_camera_runtime_supervision_is_disabled_in_simulation():
+    session = HFDecisionSession(SessionConfig(), run_mode="simulation")
+    session.camera_recorder = SimpleNamespace(
+        error="simulated failure",
+        _thread=SimpleNamespace(is_alive=lambda: False),
+    )
+
+    session._check_recorder_health()
+
+
+def test_required_camera_recorder_cannot_disappear():
+    session = HFDecisionSession(SessionConfig(), run_mode="bench")
+    session.recorder = MagicMock()
+
+    with pytest.raises(RuntimeError, match="recorder_missing"):
+        session._check_recorder_health()
+
+
+def test_streamdio_heartbeat_stall_raises_without_hardware_poll(monkeypatch):
+    config = SessionConfig()
+    config.camera.required = False
+    session = HFDecisionSession(config, run_mode="bench")
+    session.recorder = MagicMock()
+    session._streamdio_streaming_started_mono_s = 10.0
+    monkeypatch.setattr(
+        "hf_dm.session.controller.time.perf_counter",
+        lambda: 10.0 + STREAMDIO_HEARTBEAT_STALL_TIMEOUT_S - 0.01,
+    )
+    session._check_recorder_health()
+
+    monkeypatch.setattr(
+        "hf_dm.session.controller.time.perf_counter",
+        lambda: 10.0 + STREAMDIO_HEARTBEAT_STALL_TIMEOUT_S + 0.01,
+    )
+    with pytest.raises(RuntimeError, match="StreamDIO timing heartbeat stalled"):
+        session._check_recorder_health()
+
+    session.recorder.log_event.assert_called_once()
+    event_type, payload = session.recorder.log_event.call_args.args
+    assert event_type == "streamdio_heartbeat_stalled"
+    assert payload["age_s"] > STREAMDIO_HEARTBEAT_STALL_TIMEOUT_S
+    assert payload["timeout_s"] == STREAMDIO_HEARTBEAT_STALL_TIMEOUT_S
+    assert payload["heartbeat_seen"] is False
 
 
 def test_streamdio_status_snapshot_is_bounded_debug_data_and_stream_summary(tmp_path):
@@ -529,10 +611,10 @@ def test_connect_failure_before_relay_keeps_interlock_latched(tmp_path, monkeypa
 
     with pytest.raises(OSError, match="Bpod unavailable"):
         session.connect()
-    with pytest.raises(HardwareCleanupError) as caught:
-        session.close()
 
-    assert {item["stage"] for item in caught.value.errors} == {
+    assert session._closed is True
+    assert isinstance(session._last_cleanup_error, HardwareCleanupError)
+    assert {item["stage"] for item in session._last_cleanup_error.errors} == {
         "task_outputs_off_unavailable"
     }
     payload = json.loads(marker.read_text(encoding="utf-8"))
@@ -590,7 +672,6 @@ def test_partial_connect_camera_failure_retains_emergency_all_off_path(tmp_path,
 
     with pytest.raises(RuntimeError, match="camera initialization failed"):
         session.connect()
-    session.close()
 
     assert relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
     assert dio.ops == ["open", "configure", "stop_camera", "close"]
@@ -599,6 +680,31 @@ def test_partial_connect_camera_failure_retains_emergency_all_off_path(tmp_path,
     assert not marker.exists()
     status = json.loads(marker.with_name(f"{marker.name}.status").read_text(encoding="utf-8"))
     assert status["state"] == "verified_safe"
+
+
+def test_camera_is_owned_before_start_failure_and_can_be_stopped(monkeypatch):
+    session = HFDecisionSession(SessionConfig(), run_mode="bench")
+    session.recorder = MagicMock()
+    camera = MagicMock(backend="spinnaker")
+
+    def fail_after_acquisition():
+        assert session.camera_recorder is camera
+        raise OSError("camera start failed after acquisition")
+
+    camera.start.side_effect = fail_after_acquisition
+    camera.stop.return_value = {"capture_error": "camera start failed after acquisition"}
+    monkeypatch.setattr(
+        "hf_dm.session.controller.HeadlessSpinnakerRecorder",
+        lambda **_kwargs: camera,
+    )
+
+    with pytest.raises(RuntimeError, match="Required Spinnaker recording could not start"):
+        session._start_optional_video_recording()
+
+    assert session.camera_recorder is camera
+    assert session._stop_optional_video_recording() is None
+    camera.stop.assert_called_once_with()
+    assert session.camera_recorder is None
 
 
 def test_operator_interrupt_during_cleanup_is_deferred_until_all_off_attempts_finish(tmp_path):

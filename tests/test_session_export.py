@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pytest
 import yaml
 
 import hf_dm.data.recorder as recorder_module
@@ -59,6 +60,34 @@ def _summary() -> SessionSummary:
         session_start_wall_s=1.0,
         session_end_wall_s=2.0,
     )
+
+
+def test_primary_npz_write_failure_is_reported_and_keeps_recovery_marker(
+    tmp_path,
+    monkeypatch,
+):
+    recorder = SessionRecorder(tmp_path, "S1", "decision_making")
+    recorder.set_export_options(
+        {
+            "manifest": False,
+            "config_snapshot": False,
+            "export_csv_on_finalize": False,
+            "export_timeline": False,
+        }
+    )
+    recorder.add_trial(_trial())
+
+    def disk_full(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(recorder_module, "_atomic_write_npz", disk_full)
+
+    with pytest.raises(RuntimeError, match="Primary NPZ finalization failed"):
+        recorder.finalize(_summary())
+
+    assert recorder.incomplete_marker_path.exists()
+    sidecar = json.loads(recorder.base_path.with_suffix(".json").read_text(encoding="utf-8"))
+    assert "disk full" in sidecar["npz_error"]
 
 
 def test_trial_record_derives_camera_ttl_interval_stats():
@@ -1459,10 +1488,10 @@ def test_alyx_registration_is_idempotent_on_reexport(tmp_path, monkeypatch):
         return Response()
 
     monkeypatch.setattr("hf_dm.data.alyx_registration.urllib.request.urlopen", urlopen)
+    monkeypatch.setenv("ALYX_TOKEN", "token")
     cfg = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(tmp_path))
     cfg.integrations.mm_alyx_register = True
     cfg.integrations.alyx_api_url = "https://alyx.example.test/api"
-    cfg.integrations.alyx_token = "token"
     recorder = SessionRecorder(tmp_path, cfg.subject_id, cfg.phase.value)
     recorder.set_export_options(config_to_dict(cfg)["session_export"])
     recorder.set_metadata({"config": config_to_dict(cfg), "subject_id": "S1"})

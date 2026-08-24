@@ -58,6 +58,17 @@ def test_session_journal_keeps_writing_after_unsupported_fsync(tmp_path, monkeyp
     assert len(rows) == 3
 
 
+def test_event_payload_is_snapshotted_before_journaling(tmp_path):
+    recorder = SessionRecorder(tmp_path, "S1", "decision")
+    payload = {"nested": {"value": 1}}
+
+    recorder.log_event("immutable", payload)
+    payload["nested"]["value"] = 99
+    recorder.close_journal()
+
+    assert recorder.events[-1].payload == {"nested": {"value": 1}}
+
+
 def test_unsupported_directory_does_not_disable_fsync_for_sibling(tmp_path, monkeypatch):
     first = tmp_path / "first"
     second = tmp_path / "second"

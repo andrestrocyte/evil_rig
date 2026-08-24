@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 940" role="img" aria-labelledby="title desc">
+  <title id="title">evil_rig logo</title>
+  <desc id="desc">A purple, mischievous mouse running in an experiment wheel.</desc>
+  <defs>
+    <linearGradient id="purple" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#a66cff"/><stop offset="1" stop-color="#4c168f"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b77aff"/><stop offset="1" stop-color="#6122aa"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="940" rx="42" fill="#fff"/>
+
+  <!-- Wheel and stand -->
+  <circle cx="400" cy="350" r="286" fill="none" stroke="#0c0712" stroke-width="34"/>
+  <circle cx="400" cy="350" r="264" fill="none" stroke="url(#rim)" stroke-width="18"/>
+  <g stroke="#35105f" stroke-width="13" stroke-linecap="round">
+    <path d="M400 78v48M400 574v48M128 350h48M624 350h48"/>
+    <path d="M208 158l34 34M558 508l34 34M208 542l34-34M558 192l34-34"/>
+    <path d="M148 246l45 17M607 437l45 17M148 454l45-17M607 263l45-17"/>
+    <path d="M296 98l17 45M487 557l17 45M504 98l-17 45M313 557l-17 45"/>
+  </g>
+  <path d="M248 616l-66 130M552 616l66 130M323 618l-27 128M477 618l27 128"
+        fill="none" stroke="#0c0712" stroke-width="28" stroke-linecap="round"/>
+  <path d="M248 616l-66 130M552 616l66 130M323 618l-27 128M477 618l27 128"
+        fill="none" stroke="#6f2db7" stroke-width="14" stroke-linecap="round"/>
+  <path d="M142 746h516" stroke="#0c0712" stroke-width="42" stroke-linecap="round"/>
+  <path d="M155 746h490" stroke="#6523a9" stroke-width="22" stroke-linecap="round"/>
+
+  <!-- Tail and body -->
+  <path d="M565 425c103 6 120-106 65-148-29-22-54 2-37 27 35 52 2 105-43 86"
+        fill="none" stroke="#0c0712" stroke-width="30" stroke-linecap="round"/>
+  <path d="M565 425c103 6 120-106 65-148-29-22-54 2-37 27 35 52 2 105-43 86"
+        fill="none" stroke="#8d4ad1" stroke-width="14" stroke-linecap="round"/>
+  <ellipse cx="450" cy="414" rx="143" ry="154" transform="rotate(-16 450 414)"
+           fill="url(#purple)" stroke="#0c0712" stroke-width="24"/>
+  <path d="M454 498c-11 66-50 100-89 127 69 10 123-22 151-75"
+        fill="url(#purple)" stroke="#0c0712" stroke-width="22" stroke-linejoin="round"/>
+
+  <!-- Head, ears and muzzle -->
+  <circle cx="316" cy="294" r="119" fill="url(#purple)" stroke="#0c0712" stroke-width="24"/>
+  <circle cx="247" cy="203" r="62" fill="#7431b7" stroke="#0c0712" stroke-width="22"/>
+  <circle cx="376" cy="189" r="76" fill="#7534b9" stroke="#0c0712" stroke-width="22"/>
+  <circle cx="378" cy="190" r="40" fill="#a66bd0"/>
+  <path d="M214 304c-57 16-74 50-23 68 58 20 146 6 190-42-64 19-112 7-167-26z"
+        fill="#7130b3" stroke="#0c0712" stroke-width="22" stroke-linejoin="round"/>
+  <ellipse cx="177" cy="325" rx="28" ry="22" fill="#0c0712"/>
+
+  <!-- Evil eyes and grin -->
+  <ellipse cx="286" cy="282" rx="34" ry="47" fill="#fff"/>
+  <ellipse cx="350" cy="281" rx="34" ry="47" fill="#fff"/>
+  <ellipse cx="296" cy="291" rx="10" ry="16" fill="#d7193f"/>
+  <ellipse cx="341" cy="291" rx="10" ry="16" fill="#d7193f"/>
+  <path d="M253 239l56 35M377 240l-50 34" fill="none" stroke="#0c0712" stroke-width="18" stroke-linecap="round"/>
+  <path d="M259 347c48 31 100 24 138-16-19 56-88 78-138 16z"
+        fill="#fff" stroke="#0c0712" stroke-width="12" stroke-linejoin="round"/>
+  <path d="M364 352l17 35 21-49" fill="#fff" stroke="#0c0712" stroke-width="10" stroke-linejoin="round"/>
+
+  <!-- Paws and foot -->
+  <path d="M469 530c39 3 65 15 87 43-43 11-73 7-99-10" fill="#6b28aa" stroke="#0c0712" stroke-width="20"/>
+  <path d="M238 462h239" stroke="#0c0712" stroke-width="24" stroke-linecap="round"/>
+  <path d="M247 462h222" stroke="#7130b3" stroke-width="11" stroke-linecap="round"/>
+  <g fill="#7d39bd" stroke="#0c0712" stroke-width="15">
+    <ellipse cx="280" cy="454" rx="41" ry="32" transform="rotate(14 280 454)"/>
+    <ellipse cx="405" cy="454" rx="41" ry="32" transform="rotate(14 405 454)"/>
+  </g>
+
+  <text x="400" y="875" text-anchor="middle" font-family="Arial, Helvetica, sans-serif"
+        font-size="112" font-weight="800" letter-spacing="2" fill="#0c0712">evil_rig</text>
+</svg>

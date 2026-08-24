@@ -225,11 +225,23 @@ class StreamDIOClient:
         with self._config_lock:
             if not self._dio.start_camera_triggers(frequency=frequency_hz, exposure_us=exposure_us):
                 raise RuntimeError("Failed to start camera triggers on StreamDIO")
+            status = self._dio._streamdio_get_equipment_status()
+            if (
+                not isinstance(status, dict)
+                or not bool(status.get("camera_enabled"))
+                or int(status.get("camera_frequency", -1)) != int(frequency_hz)
+                or int(status.get("camera_exposure_us", -1)) != int(exposure_us)
+            ):
+                raise RuntimeError(f"Unexpected camera trigger status after start: {status}")
 
     def stop_camera(self) -> None:
         if self._dio is not None:
             with self._config_lock:
-                self._dio.stop_camera_triggers()
+                if not self._dio.stop_camera_triggers():
+                    raise RuntimeError("Failed to stop camera triggers on StreamDIO")
+                status = self._dio._streamdio_get_equipment_status()
+                if not isinstance(status, dict) or bool(status.get("camera_enabled", True)):
+                    raise RuntimeError(f"Camera triggers remained enabled after stop: {status}")
 
     def start_streaming(self, callback: Callable[..., None] | None = None) -> None:
         if self._dio is None:

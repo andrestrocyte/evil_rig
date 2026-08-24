@@ -13,7 +13,7 @@ from typing import Any, Literal, cast
 import numpy as np
 
 from hf_dm.data.session_export import session_bundle_dir
-from hf_dm.durable_io import fsync_best_effort
+from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
 
 QcStatus = Literal["PASS", "WARN", "FAIL"]
 
@@ -190,6 +190,61 @@ def evaluate_session_qc(
             )
         )
     metadata = session.get("metadata") or {}
+    camera_config = (
+        (metadata.get("config") or {}).get("camera")
+        if isinstance(metadata, dict)
+        else None
+    )
+    if (
+        isinstance(camera_config, dict)
+        and bool(camera_config.get("required", False))
+        and metadata.get("run_mode") != "simulation"
+    ):
+        video_stops = [
+            event
+            for event in events
+            if event.get("event_type") == "video_recording_stopped"
+        ]
+        video_errors = any(
+            event.get("event_type")
+            in {"video_recording_error", "required_camera_unhealthy"}
+            for event in events
+        )
+        video_summary = (
+            dict(video_stops[-1].get("payload") or {}) if video_stops else {}
+        )
+        frames_saved = max(0, _int_or(video_summary.get("frames_saved"), 0))
+        capture_error = video_summary.get("capture_error") or video_summary.get(
+            "cleanup_error"
+        )
+        capture_stats = video_summary.get("capture_stats") or {}
+        save_errors = (
+            max(0, _int_or(capture_stats.get("save_errors"), 1))
+            if isinstance(capture_stats, dict)
+            else 1
+        )
+        camera_ok = (
+            bool(video_stops)
+            and frames_saved > 0
+            and not video_errors
+            and not capture_error
+            and save_errors == 0
+        )
+        metrics.append(
+            QcMetric(
+                name="required_camera_recording",
+                status="PASS" if camera_ok else "FAIL",
+                value=frames_saved,
+                pass_threshold=1,
+                warn_threshold=1,
+                comparison=">=",
+                detail=(
+                    "Required camera stopped cleanly with saved frames"
+                    if camera_ok
+                    else "Required camera has no clean, non-empty recording"
+                ),
+            )
+        )
     if isinstance(metadata, dict) and isinstance(metadata.get("reward_calibration"), dict):
         event_types = {str(event.get("event_type")) for event in events}
         water_logged = "subject_water_logged" in event_types
@@ -361,6 +416,13 @@ def _finite_number(value: Any) -> bool:
     )
 
 
+def _int_or(value: Any, default: int) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _load_npz_session(path: Path) -> dict[str, Any]:
     with np.load(path, allow_pickle=True) as data:
         if "trials_json" in data.files:
@@ -447,5 +509,6 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             fsync_best_effort(handle, path=temporary)
         os.replace(temporary, path)
+        fsync_directory_best_effort(path.parent)
     finally:
         temporary.unlink(missing_ok=True)

@@ -605,47 +605,62 @@ class _SpinnakerCRecorder:
         self._check("spinCameraGetNodeMap", self._camera, ctypes.byref(node_map))
         # Match the verified bringup: StreamDIO drives Line0 FrameStart TTLs and
         # the TTL pulse width controls camera exposure.
-        self._set_enum(node_map, "TriggerMode", "Off")
-        self._set_enum(node_map, "AcquisitionMode", "Continuous")
-        self._set_bool(node_map, "AcquisitionFrameRateEnable", False)
-        self._set_enum(node_map, "ExposureAuto", "Off")
+        self._set_enum(node_map, "TriggerMode", "Off", required=True)
+        self._set_enum(node_map, "AcquisitionMode", "Continuous", required=True)
+        self._set_bool(node_map, "AcquisitionFrameRateEnable", False, required=True)
+        self._set_enum(node_map, "ExposureAuto", "Off", required=True)
         self._set_float(node_map, "ExposureTime", self._exposure_us)
-        self._set_enum(node_map, "ExposureMode", "TriggerWidth")
+        self._set_enum(node_map, "ExposureMode", "TriggerWidth", required=True)
         self._apply_roi(node_map)
-        self._set_enum(node_map, "PixelFormat", self._pixel_format)
+        self._set_enum(node_map, "PixelFormat", self._pixel_format, required=True)
         if self._gain_db is not None:
             self._set_enum(node_map, "GainAuto", "Off")
             self._set_float(node_map, "Gain", self._gain_db)
         if self._gamma is not None:
             self._set_bool(node_map, "GammaEnable", True)
             self._set_float(node_map, "Gamma", self._gamma)
-        self._set_enum(node_map, "TriggerSelector", "FrameStart")
-        self._set_enum(node_map, "TriggerSource", "Line0")
-        self._set_enum(node_map, "TriggerActivation", "RisingEdge")
+        self._set_enum(node_map, "TriggerSelector", "FrameStart", required=True)
+        self._set_enum(node_map, "TriggerSource", "Line0", required=True)
+        self._set_enum(node_map, "TriggerActivation", "RisingEdge", required=True)
         self._set_float(node_map, "TriggerDelay", 9.0)
-        self._set_enum(node_map, "TriggerMode", "On")
+        self._set_enum(node_map, "TriggerMode", "On", required=True)
 
     def _get_node(self, node_map: ctypes.c_void_p, name: str) -> ctypes.c_void_p | None:
         node = ctypes.c_void_p()
         result = self._fn["spinNodeMapGetNode"](node_map, name.encode(), ctypes.byref(node))
         return node if result == 0 and node.value else None
 
-    def _set_enum(self, node_map: ctypes.c_void_p, name: str, entry_name: str) -> None:
+    def _set_enum(
+        self,
+        node_map: ctypes.c_void_p,
+        name: str,
+        entry_name: str,
+        *,
+        required: bool = False,
+    ) -> None:
+        def failed(reason: str) -> None:
+            if required:
+                raise RuntimeError(f"Required Spinnaker enum {name}={entry_name}: {reason}")
+
         node = self._get_node(node_map, name)
         if node is None:
+            failed("node unavailable")
             return
         entry = ctypes.c_void_p()
         if self._fn["spinEnumerationGetEntryByName"](
             node,
             entry_name.encode(),
             ctypes.byref(entry),
-        ) != 0:
+        ) != 0 or not entry.value:
+            failed("entry unavailable")
             return
         value = ctypes.c_int64()
         if self._fn["spinEnumerationEntryGetIntValue"](entry, ctypes.byref(value)) != 0:
+            failed("entry unreadable")
             return
         result = self._fn["spinEnumerationSetIntValue"](node, value)
         if result != 0:
+            failed(f"set failed with Spinnaker error {result}")
             logger.debug("Could not set Spinnaker enum %s=%s (%d)", name, entry_name, result)
 
     def _set_float(self, node_map: ctypes.c_void_p, name: str, value: float) -> None:
@@ -676,12 +691,26 @@ class _SpinnakerCRecorder:
             if value is not None:
                 self._set_int(node_map, node_name, max(0, int(value)))
 
-    def _set_bool(self, node_map: ctypes.c_void_p, name: str, value: bool) -> None:
+    def _set_bool(
+        self,
+        node_map: ctypes.c_void_p,
+        name: str,
+        value: bool,
+        *,
+        required: bool = False,
+    ) -> None:
         node = self._get_node(node_map, name)
         if node is None:
+            if required:
+                raise RuntimeError(f"Required Spinnaker bool {name}={value}: node unavailable")
             return
         result = self._fn["spinBooleanSetValue"](node, 1 if value else 0)
         if result != 0:
+            if required:
+                raise RuntimeError(
+                    f"Required Spinnaker bool {name}={value}: "
+                    f"set failed with Spinnaker error {result}"
+                )
             logger.debug("Could not set Spinnaker bool %s=%s (%d)", name, value, result)
 
     def _capture_loop(self) -> None:
@@ -1091,17 +1120,19 @@ class HeadlessSpinnakerRecorder:
         PySpin = self._pyspin
         nodemap = self._camera.GetNodeMap()
 
-        self._set_pyspin_enum(nodemap, "TriggerMode", "Off")
+        self._set_pyspin_enum(nodemap, "TriggerMode", "Off", required=True)
         self._camera.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)
 
-        if PySpin.IsWritable(self._camera.AcquisitionFrameRateEnable):
-            self._camera.AcquisitionFrameRateEnable.SetValue(False)
+        if not PySpin.IsWritable(self._camera.AcquisitionFrameRateEnable):
+            raise RuntimeError("Required PySpin AcquisitionFrameRateEnable is not writable")
+        self._camera.AcquisitionFrameRateEnable.SetValue(False)
 
-        if PySpin.IsWritable(self._camera.ExposureAuto):
-            self._camera.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
+        if not PySpin.IsWritable(self._camera.ExposureAuto):
+            raise RuntimeError("Required PySpin ExposureAuto is not writable")
+        self._camera.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
         if PySpin.IsWritable(self._camera.ExposureTime):
             self._camera.ExposureTime.SetValue(float(self._exposure_us))
-        self._set_pyspin_enum(nodemap, "ExposureMode", "TriggerWidth")
+        self._set_pyspin_enum(nodemap, "ExposureMode", "TriggerWidth", required=True)
         self._apply_pyspin_roi(nodemap)
 
         if self._gain_db is not None and PySpin.IsWritable(self._camera.GainAuto):
@@ -1115,28 +1146,43 @@ class HeadlessSpinnakerRecorder:
             self._camera.Gamma.SetValue(float(self._gamma))
 
         pixel_node = PySpin.CEnumerationPtr(nodemap.GetNode("PixelFormat"))
-        if PySpin.IsAvailable(pixel_node) and PySpin.IsWritable(pixel_node):
-            pixel_entry = pixel_node.GetEntryByName(self._pixel_format)
-            if PySpin.IsAvailable(pixel_entry) and PySpin.IsReadable(pixel_entry):
-                pixel_node.SetIntValue(pixel_entry.GetValue())
-            else:
-                logger.warning("Pixel format '%s' unavailable, keeping camera default", self._pixel_format)
-        self._set_pyspin_enum(nodemap, "TriggerSelector", "FrameStart")
-        self._set_pyspin_enum(nodemap, "TriggerSource", "Line0")
-        self._set_pyspin_enum(nodemap, "TriggerActivation", "RisingEdge")
+        if not PySpin.IsAvailable(pixel_node) or not PySpin.IsWritable(pixel_node):
+            raise RuntimeError("Required PySpin PixelFormat node is unavailable or unwritable")
+        pixel_entry = pixel_node.GetEntryByName(self._pixel_format)
+        if not PySpin.IsAvailable(pixel_entry) or not PySpin.IsReadable(pixel_entry):
+            raise RuntimeError(f"Required PySpin PixelFormat {self._pixel_format!r} is unavailable")
+        pixel_node.SetIntValue(pixel_entry.GetValue())
+        self._set_pyspin_enum(nodemap, "TriggerSelector", "FrameStart", required=True)
+        self._set_pyspin_enum(nodemap, "TriggerSource", "Line0", required=True)
+        self._set_pyspin_enum(nodemap, "TriggerActivation", "RisingEdge", required=True)
         trigger_delay = PySpin.CFloatPtr(nodemap.GetNode("TriggerDelay"))
         if PySpin.IsAvailable(trigger_delay) and PySpin.IsWritable(trigger_delay):
             trigger_delay.SetValue(9.0)
-        self._set_pyspin_enum(nodemap, "TriggerMode", "On")
+        self._set_pyspin_enum(nodemap, "TriggerMode", "On", required=True)
 
-    def _set_pyspin_enum(self, nodemap: Any, node_name: str, entry_name: str) -> None:
+    def _set_pyspin_enum(
+        self,
+        nodemap: Any,
+        node_name: str,
+        entry_name: str,
+        *,
+        required: bool = False,
+    ) -> None:
         PySpin = self._pyspin
-        node = PySpin.CEnumerationPtr(nodemap.GetNode(node_name))
-        if not PySpin.IsAvailable(node) or not PySpin.IsWritable(node):
-            return
-        entry = node.GetEntryByName(entry_name)
-        if PySpin.IsAvailable(entry) and PySpin.IsReadable(entry):
+        try:
+            node = PySpin.CEnumerationPtr(nodemap.GetNode(node_name))
+            if not PySpin.IsAvailable(node) or not PySpin.IsWritable(node):
+                raise RuntimeError("node unavailable or unwritable")
+            entry = node.GetEntryByName(entry_name)
+            if not PySpin.IsAvailable(entry) or not PySpin.IsReadable(entry):
+                raise RuntimeError("entry unavailable or unreadable")
             node.SetIntValue(entry.GetValue())
+        except Exception as exc:
+            if required:
+                raise RuntimeError(
+                    f"Required PySpin enum {node_name}={entry_name}: {exc}"
+                ) from exc
+            return
 
     def _set_pyspin_int(self, nodemap: Any, node_name: str, value: int) -> None:
         PySpin = self._pyspin
@@ -1233,4 +1279,3 @@ class HeadlessSpinnakerRecorder:
                 self._preview_count += 1
         except Exception:
             logger.debug("Could not emit PySpin preview frame", exc_info=True)
-

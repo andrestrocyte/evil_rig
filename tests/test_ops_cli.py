@@ -385,6 +385,7 @@ def test_ops_cli_rig_preflight_writes_report_and_refreshes_manifest(
                 f"results_dir: {tmp_path.as_posix()}",
                 "camera:",
                 "  record_video: false",
+                "  required: false",
                 "monitor:",
                 "  enabled: false",
             ]

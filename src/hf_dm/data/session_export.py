@@ -618,8 +618,18 @@ def _write_config_snapshot(path: Path, metadata: dict[str, Any]) -> None:
         try:
             source_bytes = source_path.read_bytes()
             snapshot["source_config_sha256"] = hashlib.sha256(source_bytes).hexdigest()
-            snapshot["source_config_yaml"] = source_bytes.decode("utf-8", errors="replace")
-        except OSError as exc:
+            source_text = source_bytes.decode("utf-8", errors="replace")
+            source_payload = yaml.safe_load(source_text) or {}
+            integrations = (
+                source_payload.get("integrations")
+                if isinstance(source_payload, dict)
+                else None
+            )
+            if isinstance(integrations, dict) and integrations.get("alyx_token"):
+                snapshot["source_config_yaml_omitted"] = "contained alyx_token"
+            else:
+                snapshot["source_config_yaml"] = source_text
+        except (OSError, yaml.YAMLError) as exc:
             snapshot["source_config_error"] = f"{type(exc).__name__}: {exc}"
     with _atomic_text_handle(path, newline="\n") as handle:
         handle.write(yaml.safe_dump(snapshot, sort_keys=False))

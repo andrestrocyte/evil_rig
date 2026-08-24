@@ -62,6 +62,7 @@ def _summary(recorder, *, reason="completed"):
 
 def _recorder(tmp_path):
     config = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(tmp_path))
+    config.camera.required = False
     config.session_export.layout = "flat"
     recorder = SessionRecorder(tmp_path, "S1", "decision_making")
     recorder.set_export_options(config_to_dict(config)["session_export"])

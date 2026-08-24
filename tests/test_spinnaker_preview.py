@@ -1,3 +1,4 @@
+import ctypes
 import threading
 import sys
 import types
@@ -7,6 +8,7 @@ import pytest
 from hf_dm.camera.spinnaker import (
     HeadlessSpinnakerRecorder,
     _PreviewDispatcher,
+    _SpinnakerCRecorder,
     _downsample_pgm_file_preview,
 )
 from hf_dm.camera.spinnaker import _capture_stats
@@ -140,3 +142,69 @@ def test_spinnaker_does_not_teardown_sdk_while_capture_thread_is_alive():
 
     with pytest.raises(TimeoutError, match="capture thread did not stop"):
         recorder.stop()
+
+
+@pytest.mark.parametrize("failure", ["node", "entry", "read", "set"])
+def test_spinnaker_c_required_enums_fail_closed(failure):
+    recorder = object.__new__(_SpinnakerCRecorder)
+    recorder._get_node = lambda _node_map, _name: (
+        None if failure == "node" else ctypes.c_void_p(1)
+    )
+
+    def get_entry(_node, _name, entry_pointer):
+        if failure == "entry":
+            return 1
+        ctypes.cast(entry_pointer, ctypes.POINTER(ctypes.c_void_p)).contents.value = 2
+        return 0
+
+    def read_entry(_entry, value_pointer):
+        if failure == "read":
+            return 1
+        ctypes.cast(value_pointer, ctypes.POINTER(ctypes.c_int64)).contents.value = 3
+        return 0
+
+    recorder._fn = {
+        "spinEnumerationGetEntryByName": get_entry,
+        "spinEnumerationEntryGetIntValue": read_entry,
+        "spinEnumerationSetIntValue": lambda _node, _value: 1 if failure == "set" else 0,
+    }
+
+    with pytest.raises(RuntimeError, match="Required Spinnaker enum TriggerMode=On"):
+        recorder._set_enum(ctypes.c_void_p(), "TriggerMode", "On", required=True)
+    recorder._set_enum(ctypes.c_void_p(), "PixelFormat", "Mono8")
+
+
+@pytest.mark.parametrize("failure", ["node", "entry", "read", "set"])
+def test_pyspin_required_enums_fail_closed(failure):
+    class Entry:
+        available = failure != "entry"
+        readable = failure != "entry"
+
+        def GetValue(self):
+            if failure == "read":
+                raise RuntimeError("read failed")
+            return 3
+
+    class Node:
+        available = failure != "node"
+        writable = failure != "node"
+
+        def GetEntryByName(self, _name):
+            return Entry()
+
+        def SetIntValue(self, _value):
+            if failure == "set":
+                raise RuntimeError("set failed")
+
+    recorder = object.__new__(HeadlessSpinnakerRecorder)
+    recorder._pyspin = types.SimpleNamespace(
+        CEnumerationPtr=lambda node: node,
+        IsAvailable=lambda node: node.available,
+        IsWritable=lambda node: node.writable,
+        IsReadable=lambda entry: entry.readable,
+    )
+    nodemap = types.SimpleNamespace(GetNode=lambda _name: Node())
+
+    with pytest.raises(RuntimeError, match="Required PySpin enum TriggerMode=On"):
+        recorder._set_pyspin_enum(nodemap, "TriggerMode", "On", required=True)
+    recorder._set_pyspin_enum(nodemap, "PixelFormat", "Mono8")

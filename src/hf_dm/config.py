@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+import re
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -13,10 +14,14 @@ import yaml
 from hf_dm.hardware.bringup_constants import (
     BringupPorts,
     CAP_TOUCH_POWER_OUTPUT_CHANNEL,
+    DEFAULT_BPOD_SERIAL_CHANNEL,
     DEFAULT_BAUDRATE,
+    DIRECTION_INPUT_CHANNEL,
     FRAME2TTL_INPUT_CHANNEL,
     FRAME2TTL_INPUT_PIN,
+    FORCE_ANALOG_CHANNEL,
     LICK_INPUT_CHANNEL,
+    PULSE_INPUT_CHANNEL,
     SPEAKER_NOISE_SAMPLE_INTERVAL_US,
 )
 from hf_dm.streamdio.wheel import WheelKinematics
@@ -174,7 +179,6 @@ class IntegrationConfig:
     mm_alyx_register: bool = False
     mm_flir_roi_gui: bool = False
     alyx_api_url: str | None = None
-    alyx_token: str | None = None
     alyx_project: str | None = None
     alyx_user: str | None = None
     alyx_timeout_s: float = 5.0
@@ -278,7 +282,16 @@ class SessionConfig:
     @staticmethod
     def from_yaml(path: Path | str) -> SessionConfig:
         path = Path(path)
-        raw: dict[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if loaded is None:
+            raw: dict[str, Any] = {}
+        elif isinstance(loaded, dict):
+            raw = loaded
+        else:
+            raise ConfigValidationError(
+                [ConfigValidationIssue("<root>", "must be a YAML mapping", loaded)]
+            )
+        _validate_raw_config(raw)
         phase = TrainingPhase(raw.get("phase", TrainingPhase.DECISION_MAKING.value))
         ports_raw = raw.get("ports", {})
         ports = BringupPorts(
@@ -345,6 +358,11 @@ class SessionConfig:
                 wheel_radius_mm=float(wheel_raw.get("wheel_radius_mm", 31.5)),
                 encoder_ticks_per_rev=int(wheel_raw.get("encoder_ticks_per_rev", 1024)),
                 gain_deg_per_mm=float(wheel_raw.get("gain_deg_per_mm", 4.0)),
+                pulse_channel=int(wheel_raw.get("pulse_channel", PULSE_INPUT_CHANNEL)),
+                direction_channel=int(
+                    wheel_raw.get("direction_channel", DIRECTION_INPUT_CHANNEL)
+                ),
+                force_channel=int(wheel_raw.get("force_channel", FORCE_ANALOG_CHANNEL)),
             ),
             display=DisplayConfig(
                 width=(
@@ -598,11 +616,6 @@ class SessionConfig:
                     if integrations_raw.get("alyx_api_url") not in (None, "")
                     else None
                 ),
-                alyx_token=(
-                    str(integrations_raw["alyx_token"])
-                    if integrations_raw.get("alyx_token") not in (None, "")
-                    else None
-                ),
                 alyx_project=(
                     str(integrations_raw["alyx_project"])
                     if integrations_raw.get("alyx_project") not in (None, "")
@@ -766,6 +779,117 @@ class ConfigValidationError(ValueError):
         super().__init__(f"Invalid session configuration: {details}")
 
 
+def _validate_raw_config(raw: dict[str, Any]) -> None:
+    """Reject misspelled fields and YAML values that Python would coerce silently."""
+
+    aliases = {"session_design": "task", "cap_touch": "licks"}
+    section_types = {
+        "ports": BringupPorts,
+        "wheel": WheelKinematics,
+        "display": DisplayConfig,
+        "frame2ttl": Frame2TTLConfig,
+        "timing": TimingConfig,
+        "reward": RewardConfig,
+        "task": TaskDesignConfig,
+        "licks": LickConfig,
+        "speaker": SpeakerConfig,
+        "engagement": EngagementConfig,
+        "camera": CameraConfig,
+        "video": VideoExportConfig,
+        "integrations": IntegrationConfig,
+        "welfare": WelfareConfig,
+        "animal_use": AnimalUseConfig,
+        "monitor": MonitorConfig,
+        "session_export": SessionExportConfig,
+    }
+    issues: list[ConfigValidationIssue] = []
+    allowed_top = {item.name for item in fields(SessionConfig)} | set(aliases)
+    for key in sorted(set(raw) - allowed_top, key=str):
+        issues.append(ConfigValidationIssue(str(key), "unknown field", raw[key]))
+
+    for alias, canonical in aliases.items():
+        if alias in raw and canonical in raw:
+            issues.append(
+                ConfigValidationIssue(
+                    alias,
+                    f"cannot be used together with {canonical}",
+                    raw[alias],
+                )
+            )
+
+    for source_name in (*section_types, *aliases):
+        if source_name not in raw:
+            continue
+        value = raw[source_name]
+        if not isinstance(value, dict):
+            issues.append(
+                ConfigValidationIssue(source_name, "must be a YAML mapping", value)
+            )
+            continue
+        canonical = aliases.get(source_name, source_name)
+        config_type = section_types[canonical]
+        allowed = {item.name for item in fields(config_type)}
+        if canonical == "licks":
+            allowed.add("digital_channels")  # documented legacy alias
+        for key in sorted(set(value) - allowed, key=str):
+            secret = canonical == "integrations" and key == "alyx_token"
+            issues.append(
+                ConfigValidationIssue(
+                    f"{source_name}.{key}",
+                    "set ALYX_TOKEN in the environment" if secret else "unknown field",
+                    "<redacted>" if secret else value[key],
+                )
+            )
+
+        if canonical == "licks" and {"channels", "digital_channels"} <= set(value):
+            issues.append(
+                ConfigValidationIssue(
+                    f"{source_name}.digital_channels",
+                    "cannot be used together with channels",
+                    value["digital_channels"],
+                )
+            )
+
+        defaults = config_type()
+        bool_fields = {
+            item.name
+            for item in fields(config_type)
+            if isinstance(getattr(defaults, item.name), bool)
+        }
+        if canonical == "video":
+            bool_fields.add("record_video")
+        for key in sorted(bool_fields & set(value)):
+            item = value[key]
+            if item is not None and type(item) is not bool:
+                issues.append(
+                    ConfigValidationIssue(
+                        f"{source_name}.{key}",
+                        "must be a YAML boolean (true/false), not a quoted value",
+                        item,
+                    )
+                )
+
+    raw_camera = raw.get("camera")
+    raw_video = raw.get("video")
+    camera_record_video = raw_camera.get("record_video") if isinstance(raw_camera, dict) else None
+    video_record_video = raw_video.get("record_video") if isinstance(raw_video, dict) else None
+    if (
+        camera_record_video is not None
+        and video_record_video is not None
+        and camera_record_video != video_record_video
+    ):
+        issues.append(
+            ConfigValidationIssue(
+                "video.record_video",
+                "contradicts camera.record_video",
+                video_record_video,
+            )
+        )
+
+    if issues:
+        raise ConfigValidationError(issues)
+
+
 def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssue]:
     """Return semantic configuration failures before any hardware is opened."""
     issues: list[ConfigValidationIssue] = []
@@ -777,7 +901,15 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
     def finite(value: Any) -> bool:
         return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
-    require(bool(str(config.subject_id).strip()), "subject_id", "must not be empty", config.subject_id)
+    subject_id = str(config.subject_id).strip()
+    require(
+        subject_id == str(config.subject_id)
+        and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", subject_id))
+        and subject_id not in {".", ".."},
+        "subject_id",
+        "must be a non-empty path-safe identifier",
+        config.subject_id,
+    )
     require(config.n_trials > 0, "n_trials", "must be greater than zero", config.n_trials)
     require(bool(str(config.results_dir).strip()), "results_dir", "must not be empty", config.results_dir)
     require(
@@ -795,11 +927,16 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
         config.centering_threshold_deg,
     )
 
-    require(config.ports.baudrate > 0, "ports.baudrate", "must be greater than zero", config.ports.baudrate)
     require(
-        config.ports.bpod_serial_channel > 0,
+        config.ports.baudrate == DEFAULT_BAUDRATE,
+        "ports.baudrate",
+        f"must remain {DEFAULT_BAUDRATE} for the specified Bpod/StreamDIO hardware",
+        config.ports.baudrate,
+    )
+    require(
+        config.ports.bpod_serial_channel == DEFAULT_BPOD_SERIAL_CHANNEL,
         "ports.bpod_serial_channel",
-        "must be one-based and greater than zero",
+        f"must remain {DEFAULT_BPOD_SERIAL_CHANNEL} for the specified Bpod module port",
         config.ports.bpod_serial_channel,
     )
     for field_name in ("bpod_port", "dio_config_port", "dio_stream_port"):
@@ -825,15 +962,18 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
         "must be finite and greater than zero",
         wheel.gain_deg_per_mm,
     )
-    require(
-        wheel.pulse_channel != wheel.direction_channel,
-        "wheel.direction_channel",
-        "must differ from wheel.pulse_channel",
-        wheel.direction_channel,
-    )
-    for field_name in ("pulse_channel", "direction_channel", "force_channel"):
+    for field_name, expected in (
+        ("pulse_channel", PULSE_INPUT_CHANNEL),
+        ("direction_channel", DIRECTION_INPUT_CHANNEL),
+        ("force_channel", FORCE_ANALOG_CHANNEL),
+    ):
         value = getattr(wheel, field_name)
-        require(value > 0, f"wheel.{field_name}", "must be greater than zero", value)
+        require(
+            value == expected,
+            f"wheel.{field_name}",
+            f"must remain {expected} for the specified StreamDIO wiring",
+            value,
+        )
 
     display = config.display
     for field_name in ("distance_mm", "pixel_size_mm", "choice_distance_deg"):
@@ -864,8 +1004,18 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
             require(value > 0, f"display.{field_name}", "must be greater than zero", value)
 
     frame2ttl = config.frame2ttl
-    require(frame2ttl.input_channel > 0, "frame2ttl.input_channel", "must be greater than zero", frame2ttl.input_channel)
-    require(frame2ttl.input_pin > 0, "frame2ttl.input_pin", "must be greater than zero", frame2ttl.input_pin)
+    require(
+        frame2ttl.input_channel == FRAME2TTL_INPUT_CHANNEL,
+        "frame2ttl.input_channel",
+        f"must remain {FRAME2TTL_INPUT_CHANNEL} for the specified StreamDIO wiring",
+        frame2ttl.input_channel,
+    )
+    require(
+        frame2ttl.input_pin == FRAME2TTL_INPUT_PIN,
+        "frame2ttl.input_pin",
+        f"must remain {FRAME2TTL_INPUT_PIN} for the specified StreamDIO wiring",
+        frame2ttl.input_pin,
+    )
     require(frame2ttl.patch_size_px > 0, "frame2ttl.patch_size_px", "must be greater than zero", frame2ttl.patch_size_px)
     require(frame2ttl.patch_margin_px >= 0, "frame2ttl.patch_margin_px", "must be non-negative", frame2ttl.patch_margin_px)
     require(
@@ -989,18 +1139,21 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
     )
 
     lick_channels = tuple(config.licks.channels)
-    require(bool(lick_channels), "licks.channels", "must contain at least one input", lick_channels)
-    require(len(set(lick_channels)) == len(lick_channels), "licks.channels", "must not contain duplicates", lick_channels)
-    for channel in lick_channels:
-        require(channel > 0, "licks.channels", "all channels must be greater than zero", channel)
-    if frame2ttl.enabled:
-        require(
-            frame2ttl.input_channel not in lick_channels,
-            "frame2ttl.input_channel",
-            "must not overlap a lick input channel",
-            frame2ttl.input_channel,
-        )
-
+    require(
+        lick_channels == (LICK_INPUT_CHANNEL,),
+        "licks.channels",
+        f"must remain [{LICK_INPUT_CHANNEL}] for the specified cap-touch wiring",
+        lick_channels,
+    )
+    require(
+        config.licks.power_output_channel == CAP_TOUCH_POWER_OUTPUT_CHANNEL,
+        "licks.power_output_channel",
+        (
+            f"must remain {CAP_TOUCH_POWER_OUTPUT_CHANNEL} for the specified "
+            "cap-touch power wiring"
+        ),
+        config.licks.power_output_channel,
+    )
     speaker = config.speaker
     require(speaker.sample_interval_us > 0, "speaker.sample_interval_us", "must be greater than zero", speaker.sample_interval_us)
     require(finite(speaker.frequency_hz) and speaker.frequency_hz > 0, "speaker.frequency_hz", "must be finite and greater than zero", speaker.frequency_hz)
@@ -1027,6 +1180,19 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
     require(camera.acquisition_timeout_ms > 0, "camera.acquisition_timeout_ms", "must be greater than zero", camera.acquisition_timeout_ms)
     require(bool(str(camera.backend).strip()), "camera.backend", "must not be empty", camera.backend)
     require(bool(str(camera.save_dir).strip()), "camera.save_dir", "must not be empty", camera.save_dir)
+    if camera.required:
+        require(
+            camera.record_video,
+            "camera.record_video",
+            "must be true when camera.required is true",
+            camera.record_video,
+        )
+        require(
+            camera.backend == "spinnaker",
+            "camera.backend",
+            "must be spinnaker when camera.required is true",
+            camera.backend,
+        )
     require(
         (camera.roi_width is None) == (camera.roi_height is None),
         "camera.roi_width/roi_height",

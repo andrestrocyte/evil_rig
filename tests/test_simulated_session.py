@@ -89,7 +89,7 @@ def test_simulated_session_runs_choice_timeout_and_cleanup(tmp_path):
     assert True in speaker_states
     assert speaker_states.index(True) < speaker_states.index(False, speaker_states.index(True))
     assert len(session.recorder.bpod_trials) == 3
-    with np.load(session.recorder.base_path.with_suffix(".npz"), allow_pickle=True) as data:
+    with np.load(session.recorder.base_path.with_suffix(".npz"), allow_pickle=False) as data:
         assert "trials_json" in data.files
         assert "events_json" in data.files
         assert "timing_heartbeat_qc_json" in data.files
@@ -129,6 +129,7 @@ def test_choice_candidate_loses_cleanly_when_bpod_timeout_wins(tmp_path):
     os.environ["SDL_VIDEODRIVER"] = "dummy"
     config = SessionConfig(n_trials=1, results_dir=str(tmp_path))
     config.camera.record_video = False
+    config.camera.required = False
     config.camera.save_dir = str(tmp_path / "videos")
     shorten_for_simulation(config)
     config.timing.choice_timeout_s = 0.20
@@ -164,6 +165,7 @@ def test_softcode_output_observation_is_nonblocking_and_never_actuates(
     os.environ["SDL_VIDEODRIVER"] = "dummy"
     config = SessionConfig(n_trials=1, results_dir=str(tmp_path))
     config.camera.record_video = False
+    config.camera.required = False
     shorten_for_simulation(config)
     session = SimulatedHFDecisionSession(config, SimulationOptions(choice_mode="timeout"))
     session.connect()
@@ -207,6 +209,7 @@ def test_default_balancing_preserves_seeded_trial_record_snapshot(tmp_path):
     os.environ["SDL_VIDEODRIVER"] = "dummy"
     config = SessionConfig(n_trials=6, random_seed=23, results_dir=str(tmp_path))
     config.camera.record_video = False
+    config.camera.required = False
     config.camera.save_dir = str(tmp_path / "videos")
     shorten_for_simulation(config)
     session = SimulatedHFDecisionSession(
@@ -247,7 +250,7 @@ def test_default_balancing_preserves_seeded_trial_record_snapshot(tmp_path):
     header = json.loads(session.recorder.journal_path.read_text(encoding="utf-8").splitlines()[0])
     assert "git_commit" in provenance
     assert provenance["git_dirty"] in {True, False, None}
-    assert provenance["package_version"] == "0.1.0"
+    assert provenance["package_version"] == "0.1.1"
     installed_bpod_core = provenance["package_versions"]["bpod-core"]
     lock_text = (Path(__file__).resolve().parents[1] / "requirements.lock").read_text(
         encoding="utf-8"
@@ -268,6 +271,7 @@ def test_extracted_runners_preserve_trial_records_and_event_stream(tmp_path):
     os.environ["SDL_VIDEODRIVER"] = "dummy"
     config = SessionConfig(n_trials=3, random_seed=23, results_dir=str(tmp_path))
     config.camera.record_video = False
+    config.camera.required = False
     config.frame2ttl.enabled = False
     shorten_for_simulation(config)
     session = SimulatedHFDecisionSession(
@@ -470,6 +474,7 @@ def test_simulated_session_annotates_reward_volume_without_changing_pump_time(tm
     )
     config = SessionConfig(n_trials=3, random_seed=23, results_dir=str(tmp_path / "sessions"))
     config.camera.record_video = False
+    config.camera.required = False
     config.reward.calibration_path = str(calibration_path)
     config.welfare.subjects_dir = str(tmp_path / "subjects")
     shorten_for_simulation(config)
