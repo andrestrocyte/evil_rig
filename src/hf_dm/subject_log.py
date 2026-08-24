@@ -12,7 +12,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from hf_dm.durable_io import fsync_best_effort
+from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
 
 _LOG_LOCK = threading.RLock()
 
@@ -114,6 +114,7 @@ def append_subject_entry(
             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
             handle.flush()
             fsync_best_effort(handle, path=path)
+        fsync_directory_best_effort(path.parent)
     return {"path": str(path), "entry": row, "appended": True}
 
 

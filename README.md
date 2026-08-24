@@ -1,9 +1,9 @@
-# Head-Fixed Decision-Making Bpod Task (`hf_dm`)
+# evil_rig — Head-Fixed Decision-Making (`hf_dm`)
 
-![Cartoon mouse choosing between low- and high-effort wheel directions](assets/hf-dm-experiment-cartoon.png)
+![evil_rig: a purple mouse running in an experiment wheel](assets/evil_rig_logo.svg)
 
-[![CI](https://github.com/andrestrocyte/bpod-hf-dm/actions/workflows/ci.yml/badge.svg)](https://github.com/andrestrocyte/bpod-hf-dm/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-%E2%89%A53.10-blue.svg)](https://www.python.org/)
+[![CI](https://github.com/andrestrocyte/evil_rig/actions/workflows/ci.yml/badge.svg)](https://github.com/andrestrocyte/evil_rig/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 
 A **head-fixed, effort-based decision-making task** for mice, built on
@@ -217,27 +217,23 @@ same discovery logic as the screen task.
 
 ## Installation
 
-**Requirements:** Python ≥ 3.10 (CI and `requirements.lock` use **3.12**), a Windows rig (same as the
-bringups) for live hardware, Bpod State Machine 2+. Tests and simulation are hardware-free and
-cross-platform.
+**Requirements:** Python 3.12, a Windows rig (same as the bringups) for live hardware, and Bpod
+State Machine 2+. Tests and simulation are hardware-free and cross-platform.
 
-```bash
-cd /path/to/bpod-hf-dm
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+On the rig, install the locked environment from PowerShell:
 
-pip install -e /path/to/bpod-core
-pip install -e /path/to/MM_PyBpod2_andrestrocyte   # StreamDIO + optional sound module
-pip install -e .
+```powershell
+cd C:\path\to\evil_rig
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.lock
+python -m pip install --no-deps "MM-PybBod2 @ git+https://github.com/andrestrocyte/MM_PyBpod2.git@a176c0e38520a4f29554198ae30711a08546d75d"
+python -m pip install -e . --no-deps
 ```
 
-For the exact acquisition/CI environment, install `requirements.lock` first and then install this
-package with `--no-deps`. This prevents transitive dependency drift between validated rig releases.
-
-```bash
-pip install -r requirements.lock
-pip install -e . --no-deps
-```
+The MM commit above contains neutral, port-free settings and only its StreamDIO dependency is used;
+rig ports still come from `configs/*.yaml`. Deploy from this checkout with an editable install: the
+checkout remains the source of the rig profiles, firmware, and operator documentation.
 
 **Optional extras**
 
@@ -310,7 +306,7 @@ python -m hf_dm.cli --config configs/dm_50.yaml --confirm-animal-use
 ## Configuration reference
 
 Configs are YAML, loaded by `SessionConfig.from_yaml`. Every field is validated semantically before
-hardware opens. Three profiles ship in `configs/`:
+hardware opens. Four profiles ship in `configs/`:
 
 | Profile | Phase | Trials | Notable settings |
 |---------|-------|--------|------------------|
@@ -770,4 +766,4 @@ tests/                      # hardware-free pytest suite
 
 ## License
 
-[MIT](#license)
+[MIT](LICENSE)

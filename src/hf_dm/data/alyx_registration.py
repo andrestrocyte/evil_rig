@@ -60,18 +60,25 @@ def register_alyx_session(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     api_url = str(config.get("alyx_api_url") or os.environ.get("ALYX_API_URL") or "")
-    token = str(config.get("alyx_token") or os.environ.get("ALYX_TOKEN") or "")
+    token = str(os.environ.get("ALYX_TOKEN") or "")
     project = config.get("alyx_project") or os.environ.get("ALYX_PROJECT")
     user = config.get("alyx_user") or os.environ.get("ALYX_USER")
     timeout_s = float(config.get("alyx_timeout_s") or 5.0)
     if not api_url or not token:
         return {
             "status": "skipped",
-            "reason": "missing ALYX_API_URL/ALYX_TOKEN or integrations.alyx_* config",
+            "reason": "missing ALYX_API_URL/ALYX_TOKEN (tokens are environment-only)",
             "created_wall_time_s": time.time(),
         }
 
     endpoint = _sessions_endpoint(api_url)
+    if not endpoint.lower().startswith("https://"):
+        return {
+            "status": "error",
+            "endpoint": endpoint,
+            "error": "Alyx credentials require an HTTPS endpoint",
+            "created_wall_time_s": time.time(),
+        }
     payload = {
         "subject": metadata.get("subject_id") or summary.get("subject_id"),
         "phase": metadata.get("phase") or summary.get("phase"),

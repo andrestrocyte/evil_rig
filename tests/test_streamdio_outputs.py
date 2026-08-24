@@ -55,6 +55,9 @@ class FakeProtocol:
         self.output_states = {}
         self.speaker_enabled = False
         self.speaker_samples = 0
+        self.camera_enabled = False
+        self.camera_frequency = 30
+        self.camera_exposure_us = 10_000
         self.configured = None
         self._config_arcom = FakeArCOM()
 
@@ -90,6 +93,23 @@ class FakeProtocol:
         del sample_interval_us
         self.speaker_enabled = enabled
         return True
+
+    def start_camera_triggers(self, frequency: int, exposure_us: int) -> bool:
+        self.camera_enabled = True
+        self.camera_frequency = frequency
+        self.camera_exposure_us = exposure_us
+        return True
+
+    def stop_camera_triggers(self) -> bool:
+        self.camera_enabled = False
+        return True
+
+    def _streamdio_get_equipment_status(self) -> dict:
+        return {
+            "camera_enabled": self.camera_enabled,
+            "camera_frequency": self.camera_frequency,
+            "camera_exposure_us": self.camera_exposure_us,
+        }
 
     def get_speaker_status(self) -> dict:
         if self.speaker_enabled:
@@ -142,6 +162,27 @@ def test_output_command_requires_matching_firmware_event():
     assert transition["channel"] == 1
     assert transition["state"] == 1
     assert transition["module_timestamp_us"] == 1234
+
+
+def test_camera_start_and_stop_require_fresh_firmware_status():
+    client = _client()
+
+    client.start_camera_session(frequency_hz=30, exposure_us=10_000)
+    client.stop_camera()
+
+    assert client.raw.camera_enabled is False
+
+
+def test_camera_start_rejects_mismatched_firmware_status():
+    client = _client()
+    client.raw._streamdio_get_equipment_status = lambda: {
+        "camera_enabled": True,
+        "camera_frequency": 20,
+        "camera_exposure_us": 10_000,
+    }
+
+    with pytest.raises(RuntimeError, match="Unexpected camera trigger status"):
+        client.start_camera_session(frequency_hz=30, exposure_us=10_000)
 
 
 def test_passive_output_observer_accepts_event_that_arrived_before_wait():

@@ -79,6 +79,10 @@ from hf_dm.streamdio.wheel import Direction, WheelAccumulator
 from hf_dm.timing_heartbeat import TIMING_HEARTBEAT_EVENT_TYPE
 
 logger = logging.getLogger(__name__)
+STREAMDIO_HEARTBEAT_STALL_TIMEOUT_S = max(
+    0.5,
+    5.0 * STREAMDIO_TIMING_HEARTBEAT_PERIOD_US / 1_000_000.0,
+)
 
 
 class HardwareCleanupError(RuntimeError):
@@ -141,6 +145,8 @@ class HFDecisionSession:
         self._latest_streamdio_module_status: dict | None = None
         self._cap_touch_status_snapshot_count = 0
         self._latest_cap_touch_status: dict | None = None
+        self._streamdio_streaming_started_mono_s: float | None = None
+        self._last_streamdio_heartbeat_mono_s: float | None = None
         self._safety_interlock_path = safety_interlock_path()
         self._safety_interlock_armed = False
         self.runtime_provenance: dict[str, object] = {}
@@ -183,6 +189,16 @@ class HFDecisionSession:
             )
 
     def connect(self) -> None:
+        try:
+            self._connect_hardware()
+        except BaseException:
+            try:
+                self.close(raise_on_error=False)
+            except BaseException:
+                logger.critical("Partial hardware connection cleanup crashed", exc_info=True)
+            raise
+
+    def _connect_hardware(self) -> None:
         self._closed = False
         self._require_live_barcode_capacity()
         self.runtime_provenance = capture_runtime_provenance()
@@ -283,7 +299,9 @@ class HFDecisionSession:
                     ),
                 },
             )
+        self._last_streamdio_heartbeat_mono_s = None
         self.dio.start_streaming(callback=self._handle_streamdio_event)
+        self._streamdio_streaming_started_mono_s = time.perf_counter()
         self._start_output_verifier()
         self.recorder.log_event("streamdio_streaming_started", {})
         baseline = self._run_all_off()
@@ -593,6 +611,53 @@ class HFDecisionSession:
     def _check_recorder_health(self) -> None:
         if self.recorder is not None:
             self.recorder.raise_if_background_error()
+        if (
+            self.run_mode != "simulation"
+            and self.config.camera.required
+            and self.config.camera.backend == "spinnaker"
+        ):
+            camera = self.camera_recorder
+            reasons = []
+            if camera is None:
+                reasons.append("recorder_missing")
+            else:
+                backend = getattr(camera, "_c_backend", None)
+                capture = camera if backend is None else backend
+                thread = getattr(capture, "_thread", None)
+                error = getattr(camera, "error", None)
+                save_errors = int(getattr(capture, "_save_errors", 0))
+                if error:
+                    reasons.append(f"capture_error: {error}")
+                if thread is not None and not thread.is_alive():
+                    reasons.append("capture_thread_not_alive")
+                if save_errors:
+                    reasons.append(f"frame_save_errors: {save_errors}")
+            if reasons:
+                payload = {"required": True, "reasons": reasons}
+                self._safe_log_event("required_camera_unhealthy", payload)
+                raise RuntimeError(
+                    "Required Spinnaker camera became unhealthy during acquisition: "
+                    + ", ".join(reasons)
+                )
+
+        heartbeat_start = self._streamdio_streaming_started_mono_s
+        if heartbeat_start is None:
+            return
+        last_heartbeat = self._last_streamdio_heartbeat_mono_s
+        heartbeat_age_s = time.perf_counter() - (
+            heartbeat_start if last_heartbeat is None else last_heartbeat
+        )
+        if heartbeat_age_s > STREAMDIO_HEARTBEAT_STALL_TIMEOUT_S:
+            payload = {
+                "age_s": heartbeat_age_s,
+                "timeout_s": STREAMDIO_HEARTBEAT_STALL_TIMEOUT_S,
+                "heartbeat_seen": last_heartbeat is not None,
+            }
+            self._safe_log_event("streamdio_heartbeat_stalled", payload)
+            raise RuntimeError(
+                "StreamDIO timing heartbeat stalled for "
+                f"{heartbeat_age_s:.3f} s (limit {STREAMDIO_HEARTBEAT_STALL_TIMEOUT_S:.3f} s)"
+            )
 
     def _show_black_with_recorder_health(self, duration_s: float) -> None:
         """Keep the display responsive while promptly surfacing durability faults."""
@@ -1411,6 +1476,8 @@ class HFDecisionSession:
             )
         normalized_channel = -1 if channel is None else int(channel)
         normalized_value = -1 if value is None else int(value)
+        if event_type == TIMING_HEARTBEAT_EVENT_TYPE:
+            self._last_streamdio_heartbeat_mono_s = event_host_mono_s
         if event_type == TIMING_HEARTBEAT_EVENT_TYPE and self.recorder is not None:
             payload = {
                 "module_timestamp_us": int(timestamp_us),
@@ -1817,8 +1884,8 @@ class HFDecisionSession:
                     1.0 / max(1.0, float(self.config.monitor.camera_fps))
                 ),
             )
-            session_dir = recorder.start()
             self.camera_recorder = recorder
+            session_dir = recorder.start()
             self.recorder.register_stream(
                 "spinnaker_video",
                 {

@@ -36,6 +36,7 @@ def _trial(index, *, responded=True, matched=True, response_time_s=1.0, stalls=0
 
 def _finalized_session(tmp_path, trials):
     config = SessionConfig(subject_id="S1", n_trials=len(trials), results_dir=str(tmp_path))
+    config.camera.required = False
     config.session_export.layout = "flat"
     recorder = SessionRecorder(tmp_path, "S1", "decision_making")
     recorder.set_export_options(config_to_dict(config)["session_export"])
@@ -114,6 +115,30 @@ def test_session_qc_distinguishes_warn_and_fail(tmp_path):
 
     assert warning["overall_status"] == "WARN"
     assert failing["overall_status"] == "FAIL"
+
+
+def test_required_camera_error_cannot_pass_qc(tmp_path):
+    recorder = _finalized_session(tmp_path, [_trial(1)])
+    sidecar = recorder.base_path.with_suffix(".json")
+    session = json.loads(sidecar.read_text(encoding="utf-8"))
+    session["metadata"]["config"]["camera"]["required"] = True
+    session["events"].append(
+        {
+            "wall_time_s": 1.0,
+            "monotonic_s": 1.0,
+            "event_type": "video_recording_error",
+            "payload": {"error": "disk full"},
+        }
+    )
+    sidecar.write_text(json.dumps(session), encoding="utf-8")
+
+    report = evaluate_session_qc(sidecar, write=False)
+    camera = next(
+        metric for metric in report["metrics"] if metric["name"] == "required_camera_recording"
+    )
+
+    assert camera["status"] == "FAIL"
+    assert report["overall_status"] == "FAIL"
 
 
 def test_mean_response_time_excludes_timeouts(tmp_path):

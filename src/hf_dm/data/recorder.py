@@ -23,7 +23,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from hf_dm.durable_io import fsync_best_effort
+from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
 from hf_dm.timing_heartbeat import (
     analyze_timing_heartbeats,
     timing_heartbeat_qc_summary,
@@ -173,6 +173,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
             handle.flush()
             fsync_best_effort(handle, path=temporary)
         os.replace(temporary, path)
+        fsync_directory_best_effort(path.parent)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -188,6 +189,7 @@ def _atomic_write_npz(path: Path, **arrays: Any) -> None:
             handle.flush()
             fsync_best_effort(handle, path=temporary)
         os.replace(temporary, path)
+        fsync_directory_best_effort(path.parent)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -522,11 +524,12 @@ class SessionRecorder:
         self.log_event("fsm_definition_added", {"fsm_name": fsm_name})
 
     def log_event(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
+        payload_snapshot = json.loads(json.dumps(payload or {}, default=str))
         event = SessionEvent(
             wall_time_s=time.time(),
             monotonic_s=time.perf_counter(),
             event_type=event_type,
-            payload=payload or {},
+            payload=payload_snapshot,
         )
         self.events.append(event)
         self._journal_append("event", asdict(event))
@@ -674,35 +677,35 @@ class SessionRecorder:
                 streamdio_events=streamdio_arr,
                 bpod_trials_json=np.array(
                     [json.dumps(trial) for trial in self.bpod_trials],
-                    dtype=object,
+                    dtype=str,
                 ),
                 trials_json=np.array(
                     [json.dumps(asdict(trial), default=str) for trial in self.trials],
-                    dtype=object,
+                    dtype=str,
                 ),
                 events_json=np.array(
                     [json.dumps(asdict(event), default=str) for event in self.events],
-                    dtype=object,
+                    dtype=str,
                 ),
                 debug_events_json=np.array(
                     [json.dumps(asdict(event), default=str) for event in self.debug_events],
-                    dtype=object,
+                    dtype=str,
                 ),
                 fsm_definitions_json=np.array(
                     [
                         json.dumps({"fsm_name": name, "fsm_json": fsm_json}, default=str)
                         for name, fsm_json in self.fsm_definitions.items()
                     ],
-                    dtype=object,
+                    dtype=str,
                 ),
-                summary_json=np.array([json.dumps(asdict(summary))], dtype=object),
+                summary_json=np.array([json.dumps(asdict(summary))], dtype=str),
                 session_metadata_json=np.array(
                     [json.dumps(self.metadata, default=str)],
-                    dtype=object,
+                    dtype=str,
                 ),
                 timing_heartbeat_qc_json=np.array(
                     [json.dumps(timing_heartbeat_qc, default=str)],
-                    dtype=object,
+                    dtype=str,
                 ),
             )
         except OSError as exc:
@@ -823,10 +826,16 @@ class SessionRecorder:
             try:
                 self._incomplete_marker_path.unlink(missing_ok=True)
                 self._streamdio_wal_path.unlink(missing_ok=True)
+                fsync_directory_best_effort(self.base_path.parent)
             except OSError:
                 pass
         self._finalized = True
-        return json_path if npz_error is not None else npz_path
+        if npz_error is not None:
+            raise RuntimeError(
+                "Primary NPZ finalization failed; recovery journal and StreamDIO WAL "
+                f"were retained: {npz_error}"
+            )
+        return npz_path
 
     def _append_session_water_log(self, summary: SessionSummary) -> None:
         config = self.metadata.get("config")
@@ -1180,8 +1189,6 @@ class SessionRecorder:
         return rows
 
     def _trials_to_structured(self) -> np.ndarray:
-        if not self.trials:
-            return np.array([], dtype=object)
         dtype = [
             ("trial_index", "i4"),
             ("phase", "U24"),
@@ -1240,6 +1247,8 @@ class SessionRecorder:
             ("frame2ttl_first_ttl_relative_time_s", "f8"),
             ("frame2ttl_first_ttl_latency_from_bpod_s", "f8"),
         ]
+        if not self.trials:
+            return np.array([], dtype=dtype)
         rows = []
         for t in self.trials:
             rows.append(

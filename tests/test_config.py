@@ -1,9 +1,12 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
+
 from hf_dm.config import (
     ConfigValidationError,
     SessionConfig,
+    config_to_dict,
     config_validation_issues,
     validate_session_config,
 )
@@ -291,6 +294,8 @@ def test_video_export_config_loads_from_yaml():
         path = Path(tmp) / "config.yaml"
         path.write_text(
             """
+camera:
+  required: false
 video:
   record_video: false
   export_spinnaker_summary: true
@@ -311,6 +316,82 @@ video:
     assert config.video.preview_video_fps == 12.5
 
 
+def test_yaml_rejects_unknown_fields_and_quoted_booleans():
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text(
+            """
+camrea:
+  required: true
+camera:
+  required: "false"
+""",
+            encoding="utf-8",
+        )
+
+        try:
+            SessionConfig.from_yaml(path)
+        except ConfigValidationError as exc:
+            fields = {issue.field for issue in exc.issues}
+        else:
+            raise AssertionError("invalid YAML configuration was accepted")
+
+    assert "camrea" in fields
+    assert "camera.required" in fields
+
+
+@pytest.mark.parametrize(
+    ("text", "field"),
+    [
+        ("camera: invalid\n", "camera"),
+        ("video: [invalid]\n", "video"),
+        ("licks:\n  channels: [14]\n  digital_channels: [14]\n", "licks.digital_channels"),
+        (
+            "camera:\n  record_video: true\nvideo:\n  record_video: false\n",
+            "video.record_video",
+        ),
+    ],
+)
+def test_yaml_rejects_ambiguous_or_non_mapping_sections(tmp_path, text, field):
+    path = tmp_path / "invalid.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigValidationError) as caught:
+        SessionConfig.from_yaml(path)
+
+    assert field in {issue.field for issue in caught.value.issues}
+
+
+def test_required_camera_must_use_local_spinnaker_recording():
+    config = SessionConfig()
+    config.camera.record_video = False
+    config.camera.backend = "external"
+
+    fields = {issue.field for issue in config_validation_issues(config)}
+
+    assert {"camera.record_video", "camera.backend"} <= fields
+
+
+def test_yaml_cannot_hide_nonstandard_hardware_channels(tmp_path):
+    path = tmp_path / "wrong-wiring.yaml"
+    path.write_text("wheel:\n  pulse_channel: 9\n", encoding="utf-8")
+
+    with pytest.raises(ConfigValidationError, match="wheel.pulse_channel"):
+        SessionConfig.from_yaml(path)
+
+
+def test_subject_id_cannot_escape_session_root():
+    config = SessionConfig(subject_id="../outside")
+
+    assert "subject_id" in {issue.field for issue in config_validation_issues(config)}
+
+
+def test_effective_config_never_serializes_alyx_token():
+    config = SessionConfig()
+
+    assert "alyx_token" not in config_to_dict(config)["integrations"]
+
+
 def test_integrations_config_loads_from_yaml():
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "config.yaml"
@@ -321,7 +402,6 @@ integrations:
   mm_alyx_register: true
   mm_flir_roi_gui: false
   alyx_api_url: https://alyx.example.test/api
-  alyx_token: secret
   alyx_project: hf_dm
   alyx_user: rig
   alyx_timeout_s: 2.5
@@ -335,7 +415,22 @@ integrations:
     assert config.integrations.mm_alyx_register
     assert not config.integrations.mm_flir_roi_gui
     assert config.integrations.alyx_api_url == "https://alyx.example.test/api"
-    assert config.integrations.alyx_token == "secret"
+    assert not hasattr(config.integrations, "alyx_token")
     assert config.integrations.alyx_project == "hf_dm"
     assert config.integrations.alyx_user == "rig"
     assert config.integrations.alyx_timeout_s == 2.5
+
+
+def test_alyx_token_is_rejected_in_yaml():
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text("integrations:\n  alyx_token: secret\n", encoding="utf-8")
+
+        try:
+            SessionConfig.from_yaml(path)
+        except ConfigValidationError as exc:
+            fields = {issue.field for issue in exc.issues}
+        else:
+            raise AssertionError("YAML credential was accepted")
+
+    assert "integrations.alyx_token" in fields
