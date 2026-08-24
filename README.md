@@ -1,6 +1,6 @@
 # evil_rig — Head-Fixed Decision-Making (`hf_dm`)
 
-![evil_rig: a purple mouse running in an experiment wheel](assets/evil_rig_logo.svg)
+![evil_rig: an illustrated evil purple mouse emerging from a restraint tunnel to turn a LEGO-style decision wheel](assets/evil_rig_logo.png)
 
 [![CI](https://github.com/andrestrocyte/evil_rig/actions/workflows/ci.yml/badge.svg)](https://github.com/andrestrocyte/evil_rig/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
