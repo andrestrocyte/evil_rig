@@ -35,8 +35,6 @@ from hf_dm.hardware.bringup_constants import (
 from hf_dm.hardware.discovery import resolve_streamdio_ports
 from hf_dm.timing_heartbeat import TIMING_HEARTBEAT_EVENT_TYPE
 
-logger = logging.getLogger(__name__)
-
 
 class _TimingHeartbeatLogFilter(logging.Filter):
     """Suppress only MM_PyBpod2's per-heartbeat WARNING log line."""
@@ -228,8 +226,6 @@ class StreamDIOClient:
             if not self._dio.start_camera_triggers(frequency=frequency_hz, exposure_us=exposure_us):
                 raise RuntimeError("Failed to start camera triggers on StreamDIO")
             status = self._camera_trigger_status()
-            if status is None:
-                return
             if (
                 not isinstance(status, dict)
                 or not bool(status.get("camera_enabled"))
@@ -244,25 +240,17 @@ class StreamDIOClient:
                 if not self._dio.stop_camera_triggers():
                     raise RuntimeError("Failed to stop camera triggers on StreamDIO")
                 status = self._camera_trigger_status()
-                if status is None:
-                    return
                 if not isinstance(status, dict) or bool(status.get("camera_enabled", True)):
                     raise RuntimeError(f"Camera triggers remained enabled after stop: {status}")
 
-    def _camera_trigger_status(self) -> Any | None:
-        """Read back the firmware equipment status, or None on drivers without it.
-
-        The read-back is a verification layer on top of the boolean returned by
-        start/stop, so older MM_PyBpod2 driver builds that lack the status probe
-        degrade to the unverified behavior instead of failing the session.
-        """
+    def _camera_trigger_status(self) -> Any:
+        """Read back firmware state, failing closed if the pinned probe is unavailable."""
         status_probe = getattr(self._dio, "_streamdio_get_equipment_status", None)
         if not callable(status_probe):
-            logger.warning(
+            raise RuntimeError(
                 "StreamDIO driver has no equipment status probe; "
-                "skipping camera trigger verification"
+                "camera trigger verification is required"
             )
-            return None
         return status_probe()
 
     def start_streaming(self, callback: Callable[..., None] | None = None) -> None:

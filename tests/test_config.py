@@ -392,18 +392,12 @@ def test_lick_channel_cannot_shadow_wheel_inputs():
     assert "licks.channels[0]" in fields
 
 
-def test_conflict_free_rewiring_is_accepted(tmp_path):
+def test_conflict_free_rewiring_is_rejected_for_fixed_rig(tmp_path):
     path = tmp_path / "rewired.yaml"
     path.write_text("wheel:\n  pulse_channel: 9\n", encoding="utf-8")
 
-    config = SessionConfig.from_yaml(path)
-
-    assert config.wheel.pulse_channel == 9
-    assert not [
-        issue
-        for issue in config_validation_issues(config)
-        if issue.field.startswith("wheel.")
-    ]
+    with pytest.raises(ConfigValidationError, match="wheel.pulse_channel"):
+        SessionConfig.from_yaml(path)
 
 
 def test_subject_id_cannot_escape_session_root():

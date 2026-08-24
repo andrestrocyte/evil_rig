@@ -141,6 +141,31 @@ def test_required_camera_error_cannot_pass_qc(tmp_path):
     assert report["overall_status"] == "FAIL"
 
 
+def test_required_camera_missing_save_error_count_fails_closed(tmp_path):
+    recorder = _finalized_session(tmp_path, [_trial(1)])
+    sidecar = recorder.base_path.with_suffix(".json")
+    session = json.loads(sidecar.read_text(encoding="utf-8"))
+    session["metadata"]["config"]["camera"]["required"] = True
+    session["metadata"]["run_mode"] = "bench"
+    session["events"].append(
+        {
+            "wall_time_s": 1.0,
+            "monotonic_s": 1.0,
+            "event_type": "video_recording_stopped",
+            "payload": {"frames_saved": 10, "capture_stats": {}},
+        }
+    )
+    sidecar.write_text(json.dumps(session), encoding="utf-8")
+
+    report = evaluate_session_qc(sidecar, write=False)
+    camera = next(
+        metric for metric in report["metrics"] if metric["name"] == "required_camera_recording"
+    )
+
+    assert camera["status"] == "FAIL"
+    assert report["overall_status"] == "FAIL"
+
+
 def test_mean_response_time_excludes_timeouts(tmp_path):
     recorder = _finalized_session(
         tmp_path,

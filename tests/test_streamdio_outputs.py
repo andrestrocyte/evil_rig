@@ -183,12 +183,14 @@ class LegacyProtocolWithoutStatusProbe:
         return True
 
 
-def test_camera_verification_degrades_gracefully_without_status_probe():
+def test_camera_verification_fails_closed_without_status_probe():
     client = _client()
     client._dio = LegacyProtocolWithoutStatusProbe()
 
-    client.start_camera_session(frequency_hz=30, exposure_us=10_000)
-    client.stop_camera()
+    with pytest.raises(RuntimeError, match="status probe"):
+        client.start_camera_session(frequency_hz=30, exposure_us=10_000)
+    with pytest.raises(RuntimeError, match="status probe"):
+        client.stop_camera()
 
 
 def test_camera_start_rejects_mismatched_firmware_status():
