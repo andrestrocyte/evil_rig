@@ -417,8 +417,10 @@ def _finite_number(value: Any) -> bool:
 
 
 def _int_or(value: Any, default: int) -> int:
+    if value is None:
+        return default
     try:
-        return int(value or 0)
+        return int(value)
     except (TypeError, ValueError, OverflowError):
         return default
 

@@ -208,3 +208,40 @@ def test_pyspin_required_enums_fail_closed(failure):
     with pytest.raises(RuntimeError, match="Required PySpin enum TriggerMode=On"):
         recorder._set_pyspin_enum(nodemap, "TriggerMode", "On", required=True)
     recorder._set_pyspin_enum(nodemap, "PixelFormat", "Mono8")
+
+
+def _bare_headless_recorder() -> HeadlessSpinnakerRecorder:
+    recorder = object.__new__(HeadlessSpinnakerRecorder)
+    recorder._error = None
+    recorder._thread = None
+    recorder._save_errors = 0
+    recorder._c_backend = None
+    return recorder
+
+
+def test_health_reasons_reports_all_failure_modes():
+    recorder = _bare_headless_recorder()
+    assert recorder.health_reasons() == []
+
+    recorder._error = "camera disconnected"
+    recorder._thread = types.SimpleNamespace(is_alive=lambda: False)
+    recorder._save_errors = 2
+
+    assert recorder.health_reasons() == [
+        "capture_error: camera disconnected",
+        "capture_thread_not_alive",
+        "frame_save_errors: 2",
+    ]
+
+
+def test_health_reasons_delegates_to_c_backend():
+    backend = object.__new__(_SpinnakerCRecorder)
+    backend._error = "spin error"
+    backend._thread = None
+    backend._save_errors = 0
+
+    recorder = _bare_headless_recorder()
+    recorder._error = "ignored because backend owns capture"
+    recorder._c_backend = backend
+
+    assert recorder.health_reasons() == ["capture_error: spin error"]

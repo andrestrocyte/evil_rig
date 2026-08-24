@@ -173,6 +173,24 @@ def test_camera_start_and_stop_require_fresh_firmware_status():
     assert client.raw.camera_enabled is False
 
 
+class LegacyProtocolWithoutStatusProbe:
+    """Driver builds predating _streamdio_get_equipment_status."""
+
+    def start_camera_triggers(self, frequency: int, exposure_us: int) -> bool:
+        return True
+
+    def stop_camera_triggers(self) -> bool:
+        return True
+
+
+def test_camera_verification_degrades_gracefully_without_status_probe():
+    client = _client()
+    client._dio = LegacyProtocolWithoutStatusProbe()
+
+    client.start_camera_session(frequency_hz=30, exposure_us=10_000)
+    client.stop_camera()
+
+
 def test_camera_start_rejects_mismatched_firmware_status():
     client = _client()
     client.raw._streamdio_get_equipment_status = lambda: {

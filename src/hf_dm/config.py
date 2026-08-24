@@ -14,7 +14,6 @@ import yaml
 from hf_dm.hardware.bringup_constants import (
     BringupPorts,
     CAP_TOUCH_POWER_OUTPUT_CHANNEL,
-    DEFAULT_BPOD_SERIAL_CHANNEL,
     DEFAULT_BAUDRATE,
     DIRECTION_INPUT_CHANNEL,
     FRAME2TTL_INPUT_CHANNEL,
@@ -927,16 +926,11 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
         config.centering_threshold_deg,
     )
 
+    require(config.ports.baudrate > 0, "ports.baudrate", "must be greater than zero", config.ports.baudrate)
     require(
-        config.ports.baudrate == DEFAULT_BAUDRATE,
-        "ports.baudrate",
-        f"must remain {DEFAULT_BAUDRATE} for the specified Bpod/StreamDIO hardware",
-        config.ports.baudrate,
-    )
-    require(
-        config.ports.bpod_serial_channel == DEFAULT_BPOD_SERIAL_CHANNEL,
+        config.ports.bpod_serial_channel > 0,
         "ports.bpod_serial_channel",
-        f"must remain {DEFAULT_BPOD_SERIAL_CHANNEL} for the specified Bpod module port",
+        "must be one-based and greater than zero",
         config.ports.bpod_serial_channel,
     )
     for field_name in ("bpod_port", "dio_config_port", "dio_stream_port"):
@@ -962,18 +956,9 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
         "must be finite and greater than zero",
         wheel.gain_deg_per_mm,
     )
-    for field_name, expected in (
-        ("pulse_channel", PULSE_INPUT_CHANNEL),
-        ("direction_channel", DIRECTION_INPUT_CHANNEL),
-        ("force_channel", FORCE_ANALOG_CHANNEL),
-    ):
+    for field_name in ("pulse_channel", "direction_channel", "force_channel"):
         value = getattr(wheel, field_name)
-        require(
-            value == expected,
-            f"wheel.{field_name}",
-            f"must remain {expected} for the specified StreamDIO wiring",
-            value,
-        )
+        require(value > 0, f"wheel.{field_name}", "must be greater than zero", value)
 
     display = config.display
     for field_name in ("distance_mm", "pixel_size_mm", "choice_distance_deg"):
@@ -1004,18 +989,8 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
             require(value > 0, f"display.{field_name}", "must be greater than zero", value)
 
     frame2ttl = config.frame2ttl
-    require(
-        frame2ttl.input_channel == FRAME2TTL_INPUT_CHANNEL,
-        "frame2ttl.input_channel",
-        f"must remain {FRAME2TTL_INPUT_CHANNEL} for the specified StreamDIO wiring",
-        frame2ttl.input_channel,
-    )
-    require(
-        frame2ttl.input_pin == FRAME2TTL_INPUT_PIN,
-        "frame2ttl.input_pin",
-        f"must remain {FRAME2TTL_INPUT_PIN} for the specified StreamDIO wiring",
-        frame2ttl.input_pin,
-    )
+    require(frame2ttl.input_channel > 0, "frame2ttl.input_channel", "must be greater than zero", frame2ttl.input_channel)
+    require(frame2ttl.input_pin > 0, "frame2ttl.input_pin", "must be greater than zero", frame2ttl.input_pin)
     require(frame2ttl.patch_size_px > 0, "frame2ttl.patch_size_px", "must be greater than zero", frame2ttl.patch_size_px)
     require(frame2ttl.patch_margin_px >= 0, "frame2ttl.patch_margin_px", "must be non-negative", frame2ttl.patch_margin_px)
     require(
@@ -1139,21 +1114,38 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
     )
 
     lick_channels = tuple(config.licks.channels)
+    require(bool(lick_channels), "licks.channels", "must contain at least one input", lick_channels)
+    require(len(set(lick_channels)) == len(lick_channels), "licks.channels", "must not contain duplicates", lick_channels)
+    for channel in lick_channels:
+        require(channel > 0, "licks.channels", "all channels must be greater than zero", channel)
     require(
-        lick_channels == (LICK_INPUT_CHANNEL,),
-        "licks.channels",
-        f"must remain [{LICK_INPUT_CHANNEL}] for the specified cap-touch wiring",
-        lick_channels,
-    )
-    require(
-        config.licks.power_output_channel == CAP_TOUCH_POWER_OUTPUT_CHANNEL,
+        config.licks.power_output_channel > 0,
         "licks.power_output_channel",
-        (
-            f"must remain {CAP_TOUCH_POWER_OUTPUT_CHANNEL} for the specified "
-            "cap-touch power wiring"
-        ),
+        "must be greater than zero",
         config.licks.power_output_channel,
     )
+
+    # All digital inputs share one StreamDIO DI bank, so any overlap means two
+    # subsystems would consume each other's edges (the analog force channel is
+    # numbered in the separate AI bank and cannot collide).
+    digital_inputs: list[tuple[str, int]] = [
+        ("wheel.pulse_channel", wheel.pulse_channel),
+        ("wheel.direction_channel", wheel.direction_channel),
+        *((f"licks.channels[{i}]", ch) for i, ch in enumerate(lick_channels)),
+    ]
+    if frame2ttl.enabled:
+        digital_inputs.append(("frame2ttl.input_channel", frame2ttl.input_channel))
+    seen_inputs: dict[int, str] = {}
+    for field_name, channel in digital_inputs:
+        if channel in seen_inputs:
+            require(
+                False,
+                field_name,
+                f"conflicts with {seen_inputs[channel]} on StreamDIO digital input {channel}",
+                channel,
+            )
+        else:
+            seen_inputs[channel] = field_name
     speaker = config.speaker
     require(speaker.sample_interval_us > 0, "speaker.sample_interval_us", "must be greater than zero", speaker.sample_interval_us)
     require(finite(speaker.frequency_hz) and speaker.frequency_hz > 0, "speaker.frequency_hz", "must be finite and greater than zero", speaker.frequency_hz)

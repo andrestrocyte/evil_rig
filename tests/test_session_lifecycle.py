@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from hf_dm.camera.spinnaker import HeadlessSpinnakerRecorder
 from hf_dm.config import SessionConfig
 from hf_dm.data.recorder import SessionEvent, SessionRecorder, TrialRecord
 from hf_dm.hardware.bringup_constants import (
@@ -268,12 +269,12 @@ def test_required_camera_runtime_failure_is_raised(
 ):
     session = HFDecisionSession(SessionConfig(), run_mode="bench")
     session.recorder = MagicMock()
-    session.camera_recorder = SimpleNamespace(
-        error=error,
-        _thread=SimpleNamespace(is_alive=lambda: thread_alive),
-        _save_errors=save_errors,
-        _c_backend=None,
-    )
+    camera = object.__new__(HeadlessSpinnakerRecorder)
+    camera._error = error
+    camera._thread = SimpleNamespace(is_alive=lambda: thread_alive)
+    camera._save_errors = save_errors
+    camera._c_backend = None
+    session.camera_recorder = camera
 
     with pytest.raises(RuntimeError, match=reason):
         session._check_recorder_health()
@@ -287,8 +288,7 @@ def test_required_camera_runtime_failure_is_raised(
 def test_camera_runtime_supervision_is_disabled_in_simulation():
     session = HFDecisionSession(SessionConfig(), run_mode="simulation")
     session.camera_recorder = SimpleNamespace(
-        error="simulated failure",
-        _thread=SimpleNamespace(is_alive=lambda: False),
+        health_reasons=lambda: ["capture_error: simulated failure"],
     )
 
     session._check_recorder_health()
