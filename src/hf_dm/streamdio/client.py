@@ -225,7 +225,7 @@ class StreamDIOClient:
         with self._config_lock:
             if not self._dio.start_camera_triggers(frequency=frequency_hz, exposure_us=exposure_us):
                 raise RuntimeError("Failed to start camera triggers on StreamDIO")
-            status = self._dio._streamdio_get_equipment_status()
+            status = self._camera_trigger_status()
             if (
                 not isinstance(status, dict)
                 or not bool(status.get("camera_enabled"))
@@ -239,9 +239,19 @@ class StreamDIOClient:
             with self._config_lock:
                 if not self._dio.stop_camera_triggers():
                     raise RuntimeError("Failed to stop camera triggers on StreamDIO")
-                status = self._dio._streamdio_get_equipment_status()
+                status = self._camera_trigger_status()
                 if not isinstance(status, dict) or bool(status.get("camera_enabled", True)):
                     raise RuntimeError(f"Camera triggers remained enabled after stop: {status}")
+
+    def _camera_trigger_status(self) -> Any:
+        """Read back firmware state, failing closed if the pinned probe is unavailable."""
+        status_probe = getattr(self._dio, "_streamdio_get_equipment_status", None)
+        if not callable(status_probe):
+            raise RuntimeError(
+                "StreamDIO driver has no equipment status probe; "
+                "camera trigger verification is required"
+            )
+        return status_probe()
 
     def start_streaming(self, callback: Callable[..., None] | None = None) -> None:
         if self._dio is None:

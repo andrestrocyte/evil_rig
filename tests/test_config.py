@@ -372,8 +372,28 @@ def test_required_camera_must_use_local_spinnaker_recording():
     assert {"camera.record_video", "camera.backend"} <= fields
 
 
-def test_yaml_cannot_hide_nonstandard_hardware_channels(tmp_path):
-    path = tmp_path / "wrong-wiring.yaml"
+def test_conflicting_digital_input_channels_are_rejected(tmp_path):
+    path = tmp_path / "conflicting-wiring.yaml"
+    path.write_text(
+        "wheel:\n  pulse_channel: 5\nframe2ttl:\n  enabled: true\n  input_channel: 5\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigValidationError, match="frame2ttl.input_channel"):
+        SessionConfig.from_yaml(path)
+
+
+def test_lick_channel_cannot_shadow_wheel_inputs():
+    config = SessionConfig()
+    config.licks.channels = [config.wheel.direction_channel]
+
+    fields = {issue.field for issue in config_validation_issues(config)}
+
+    assert "licks.channels[0]" in fields
+
+
+def test_conflict_free_rewiring_is_rejected_for_fixed_rig(tmp_path):
+    path = tmp_path / "rewired.yaml"
     path.write_text("wheel:\n  pulse_channel: 9\n", encoding="utf-8")
 
     with pytest.raises(ConfigValidationError, match="wheel.pulse_channel"):

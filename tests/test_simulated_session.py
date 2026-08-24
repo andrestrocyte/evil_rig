@@ -250,7 +250,7 @@ def test_default_balancing_preserves_seeded_trial_record_snapshot(tmp_path):
     header = json.loads(session.recorder.journal_path.read_text(encoding="utf-8").splitlines()[0])
     assert "git_commit" in provenance
     assert provenance["git_dirty"] in {True, False, None}
-    assert provenance["package_version"] == "0.1.1"
+    assert provenance["package_version"] == "0.1.2"
     installed_bpod_core = provenance["package_versions"]["bpod-core"]
     lock_text = (Path(__file__).resolve().parents[1] / "requirements.lock").read_text(
         encoding="utf-8"

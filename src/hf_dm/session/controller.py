@@ -617,21 +617,10 @@ class HFDecisionSession:
             and self.config.camera.backend == "spinnaker"
         ):
             camera = self.camera_recorder
-            reasons = []
             if camera is None:
-                reasons.append("recorder_missing")
+                reasons = ["recorder_missing"]
             else:
-                backend = getattr(camera, "_c_backend", None)
-                capture = camera if backend is None else backend
-                thread = getattr(capture, "_thread", None)
-                error = getattr(camera, "error", None)
-                save_errors = int(getattr(capture, "_save_errors", 0))
-                if error:
-                    reasons.append(f"capture_error: {error}")
-                if thread is not None and not thread.is_alive():
-                    reasons.append("capture_thread_not_alive")
-                if save_errors:
-                    reasons.append(f"frame_save_errors: {save_errors}")
+                reasons = list(camera.health_reasons())
             if reasons:
                 payload = {"required": True, "reasons": reasons}
                 self._safe_log_event("required_camera_unhealthy", payload)

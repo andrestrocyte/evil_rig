@@ -1154,6 +1154,28 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
         ),
         config.licks.power_output_channel,
     )
+
+    # All digital inputs share one StreamDIO DI bank, so any overlap means two
+    # subsystems would consume each other's edges (the analog force channel is
+    # numbered in the separate AI bank and cannot collide).
+    digital_inputs: list[tuple[str, int]] = [
+        ("wheel.pulse_channel", wheel.pulse_channel),
+        ("wheel.direction_channel", wheel.direction_channel),
+        *((f"licks.channels[{i}]", ch) for i, ch in enumerate(lick_channels)),
+    ]
+    if frame2ttl.enabled:
+        digital_inputs.append(("frame2ttl.input_channel", frame2ttl.input_channel))
+    seen_inputs: dict[int, str] = {}
+    for field_name, channel in digital_inputs:
+        if channel in seen_inputs:
+            require(
+                False,
+                field_name,
+                f"conflicts with {seen_inputs[channel]} on StreamDIO digital input {channel}",
+                channel,
+            )
+        else:
+            seen_inputs[channel] = field_name
     speaker = config.speaker
     require(speaker.sample_interval_us > 0, "speaker.sample_interval_us", "must be greater than zero", speaker.sample_interval_us)
     require(finite(speaker.frequency_hz) and speaker.frequency_hz > 0, "speaker.frequency_hz", "must be finite and greater than zero", speaker.frequency_hz)

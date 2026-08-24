@@ -358,6 +358,17 @@ class _SpinnakerCRecorder:
     def error(self) -> str | None:
         return self._error
 
+    def health_reasons(self) -> list[str]:
+        """Return why the recorder is unhealthy; an empty list means healthy."""
+        reasons: list[str] = []
+        if self._error:
+            reasons.append(f"capture_error: {self._error}")
+        if self._thread is not None and not self._thread.is_alive():
+            reasons.append("capture_thread_not_alive")
+        if self._save_errors:
+            reasons.append(f"frame_save_errors: {self._save_errors}")
+        return reasons
+
     def _roi_summary(self) -> dict[str, int | None]:
         return {
             "width": self._roi_width,
@@ -923,6 +934,19 @@ class HeadlessSpinnakerRecorder:
         if self._c_backend is not None:
             return self._c_backend.error
         return self._error
+
+    def health_reasons(self) -> list[str]:
+        """Return why the recorder is unhealthy; an empty list means healthy."""
+        if self._c_backend is not None:
+            return self._c_backend.health_reasons()
+        reasons: list[str] = []
+        if self._error:
+            reasons.append(f"capture_error: {self._error}")
+        if self._thread is not None and not self._thread.is_alive():
+            reasons.append("capture_thread_not_alive")
+        if self._save_errors:
+            reasons.append(f"frame_save_errors: {self._save_errors}")
+        return reasons
 
     @property
     def device_info(self) -> dict[str, str | None]:
