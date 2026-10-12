@@ -115,8 +115,16 @@ def diagnostic_result(name: str, session_path: str) -> dict[str, Any] | None:
         "screen_barcodes": ("frame2ttl_barcode_diagnostic_end", "all_match"),
     }
     document = json.loads(Path(session_path).read_text(encoding="utf-8"))
-    alignment = document.get("stream_summaries", {}).get("spinnaker_video", {}).get("trigger_alignment")
-    camera_ok = alignment is None or alignment.get("status") == "PASS"
+    camera = document.get("stream_summaries", {}).get("spinnaker_video", {})
+    alignment = camera.get("trigger_alignment")
+    preview_only_simulation = (
+        document.get("metadata", {}).get("run_mode") == "simulation"
+        and camera.get("backend") == "spinnaker_sim"
+        and camera.get("frames_saved") == 0
+    )
+    camera_ok = alignment is None or alignment.get("status") == "PASS" or (
+        alignment.get("status") == "NOT_APPLICABLE" and preview_only_simulation
+    )
     if name not in expected:
         return None if alignment is None else {"passed": camera_ok, "camera_trigger_alignment": alignment}
     event_type, flag = expected[name]

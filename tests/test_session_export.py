@@ -81,6 +81,36 @@ def test_camera_alignment_uses_full_trigger_count_after_cache_wrap(tmp_path, sav
     assert alignment["frame_count_minus_triggers"] == saved - 3
 
 
+@pytest.mark.parametrize("mode,backend,saved,expected", [
+    ("simulation", "spinnaker_sim", 0, "NOT_APPLICABLE"),
+    ("bench", "spinnaker_sim", 0, "FAIL"),
+    ("animal", "spinnaker_sim", 0, "FAIL"),
+    (None, "spinnaker_sim", 0, "FAIL"),
+    ("simulation", "spinnaker", 0, "FAIL"),
+    ("simulation", "spinnaker_sim", 2, "FAIL"),
+])
+def test_camera_alignment_exempts_only_preview_only_simulation(tmp_path, mode, backend, saved, expected):
+    from hf_dm.operator_app import diagnostic_result
+    recorder = SessionRecorder(tmp_path, "S1", "decision_making")
+    recorder.set_export_options({"manifest": False, "config_snapshot": False,
+                                 "export_csv_on_finalize": False, "export_timeline": False})
+    recorder.set_metadata({"run_mode": mode})
+    recorder.register_stream("spinnaker_video", {"backend": backend, "frames_saved": saved})
+    for timestamp in range(3):
+        recorder.log_streamdio_event("camera", 0, 0, timestamp, timestamp / 1e6)
+    path = recorder.finalize(_summary()).with_suffix(".json")
+    document = json.loads(path.read_text())
+    camera = document["stream_summaries"]["spinnaker_video"]
+    assert camera["frames_saved"] == saved
+    alignment = camera["trigger_alignment"]
+    assert alignment["status"] == expected
+    assert alignment["recorded_triggers"] == 3
+    if expected == "NOT_APPLICABLE":
+        assert alignment["frame_count_minus_triggers"] is None
+        assert "without recording" in alignment["reason"]
+    assert diagnostic_result("session", str(path))["passed"] is (expected == "NOT_APPLICABLE")
+
+
 def test_primary_npz_write_failure_is_reported_and_keeps_recovery_marker(
     tmp_path,
     monkeypatch,

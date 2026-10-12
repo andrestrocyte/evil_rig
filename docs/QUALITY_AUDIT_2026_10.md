@@ -7,12 +7,17 @@ session selection, on-demand diagnostics, cooperative Stop and saved results.
 This audit does not establish that every hardware component is calibrated or
 that the system is bug-free.
 
-Local verification: full suite 534 passed. Ruff and type checks for config,
+Local verification: full suite 544 passed. Ruff and type checks for config,
 recorder, session export, raw I/O, journal I/O and array I/O passed. CI checks
 Windows and Linux; exact-commit results are linked in PR #5.
 
 ## Repairs
 
+- Treat camera frame/trigger alignment as not applicable only for a simulation
+  using the preview-only simulated camera with zero saved images. Previously,
+  the launcher reported failure after a valid ten-trial simulation because it
+  compared synthetic triggers with nonexistent physical images. Keep real camera
+  mismatches failing, and record the simulation exclusion without inventing frames.
 - Direct Mono8 PGM saving removes the slow SDK encoder from acquisition.
   The preview keeps current frames separately from lossless recording. Its target
   is now 15 fps, with cadence preserved under small scheduling jitter.
@@ -162,6 +167,12 @@ Windows and Linux; exact-commit results are linked in PR #5.
 | Preview with raw checkpoints | Host frame age 77 / 88 ms median/p95; receipt-to-save 2.24 / 3.72 ms; maximum backlog growth 0.51 ms, ending -0.81 ms | Host-relative measurements, not calibrated exposure-to-screen latency |
 | Setup workflow | Real launcher opens the setup window with selected optical/StreamDIO settings and E: data path; task buttons disable while it is open and re-enable after Cancel. Missing-certificate consequences group into one action; full report remains available | UI inspection only; no hardware action or certificate creation |
 | Setup cancellation | Actual Tk window remains visible while a simulated child observes Stop and exits; Continue stays disabled, cancellation is logged, and no certificate is created | Simulated child, not a physical driver hang; unit test verifies later diagnostics do not launch after Stop |
+| Operator input checks, 13 October | Optical: 7 high and 7 low edges, all with StreamDIO UART receipt timestamps and original Bpod timestamps. Capacitive: 7 high and 6 low edges. Wheel: both directions in both runs | Two 30-second observations with the operator at the rig. Optical relay send-to-receipt was 0.22–0.65 ms; this excludes Bpod-to-host detection delay and is not physical-edge latency |
+| Camera during operator checks | 917/917 and 914/914 images/triggers, preview host age 76/91 and 73/91 ms median/p95; no incomplete or skipped frames or save errors | Optical run had one acquisition-wait timeout without a count mismatch. Peak host/device backlog changes were 47 and 4 ms and ended near zero. Host age is not calibrated exposure-to-screen latency |
+| Force resistance | After the operator repowered the BMC, the reference immediate-serial method produced ADC peaks of 2,057 CW and 1,635 CCW; the operator confirmed both directions. A final Bpod-timed check recorded 3.0000 s CW and 2.9999 s CCW output pulses and the operator confirmed operation | This mechanism resists manual rotation. In the final timed run, CW ADC stayed zero and CCW peaked at 1,449; operator confirmation and electrical pulse timing do not calibrate force magnitude or explain load differences. All 467 final-run camera triggers had saved images; exports and cleanup passed |
+| Speaker listening check | Five seconds of PC white noise through a Bpod-timed pin-26 gate; operator confirmed audible output. Readback observed gate high, then low after the test and during final cleanup | Requested playback level was 15%; no SPL measurement. Gate readback was polled, so its 4.797 s observed high span is not an exact pulse-width measurement |
+| Reference control parity | FSM builders, serial relay implementation and hardware pin constants are byte-for-byte identical after normalizing line endings | Read-only comparison with `bpod-hf-dm`; all 95 baseline source hashes remain unchanged |
+| Installed launcher simulation | Ten-trial optical and capacitive jobs both complete, record StreamDIO-clock lick events, and pass validation of all 21 exported artifacts per session | Headless simulation; verifies launcher/process/configuration/save integration, not additional physical operation |
 
 Local evidence (recordings are intentionally excluded from Git):
 
@@ -171,6 +182,12 @@ Local evidence (recordings are intentionally excluded from Git):
 - `data/runtime/audit/raw_checkpoint_live_result.json` (live checkpoint counts and camera timing)
 - `data/runtime/audit/setup_gui_result.json`, `launcher_completion.png`, `setup_completion.png` (real Windows UI)
 - `data/runtime/audit/setup_cancel_result.json` (cooperative cancellation through the Tk workflow)
+- `data/runtime/audit/physical_inputs_result.json` (operator beam/touch/wheel checks and camera timing)
+- `data/runtime/audit/force_response_result.json` (separate one-second force pulses and direction-specific ADC response)
+- `data/runtime/audit/force_immediate_result.json` (both ADC responses after BMC repowering; operator confirmed both directions)
+- `data/runtime/audit/force_fsm_loaded_result.json` (final three-second Bpod-timed resistance check; operator confirmed operation)
+- `data/runtime/audit/speaker_listening_result.json` (five-second speaker gate, playback and cleanup; operator confirmed audible output)
+- `data/runtime/audit/launcher_acceptance_result.json` (ten-trial simulation through both launcher sensor selections)
 - `data/runtime/audit/production_timing/result.json`
 - `data/runtime/operator/runs/20261012_212437_904677/result.json` (camera)
 - `data/runtime/operator/runs/20261012_212901_829814/result.json` (complete rig check)
@@ -206,12 +223,21 @@ as failure evidence; use the later checks above for the repaired behavior.
 
 ## Remaining physical work
 
-The unattended tests contained no physical optical-beam, capacitive-touch or
-wheel gestures. The analog force input produced a near-zero unloaded trace;
-its response to load is unverified. A synthetic optical marker already traversed
-Bpod to StreamDIO, but physical beam-edge relay timing still needs a block/unblock
-check. Software cannot establish calibrated force, reward volume or sound level
-without measurements.
+The operator checks on 13 October verified physical optical-beam and capacitive
+transitions, wheel input in both directions, and the physical optical edge relay
+to StreamDIO. The operator confirmed resistance in both directions after
+repowering the BMC and confirmed the final Bpod-timed check worked. Immediate
+serial commands match the reference repo; no force mapping or firmware change
+was needed. The mechanism resists hand rotation rather than moving the wheel
+itself. Force ADC response was observed in both directions during the immediate
+test, but not under controlled, equal loads; final timed-run CW ADC remained zero.
+Known-load force calibration, reward volume and sound level still require
+physical measurements. No calibration or commissioning certificate was inferred
+from these functional checks.
+
+The operator also confirmed the five-second speaker listening check. Further
+work can proceed through automated checks; these completed physical functional
+checks do not need to be repeated merely because an audit continues.
 
 Use the launcher's 20-second input view when someone is at the rig. Retain the
 animal-use commissioning/calibration gate until physical evidence is available.

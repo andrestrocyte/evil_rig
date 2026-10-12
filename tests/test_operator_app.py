@@ -95,6 +95,22 @@ def test_saved_camera_count_mismatch_is_not_reported_as_pass(tmp_path):
     assert diagnostic_result("session", str(path))["passed"] is False
 
 
+@pytest.mark.parametrize("mode,backend,frames", [
+    ("bench", "spinnaker", 0),
+    ("bench", "spinnaker_sim", 0),
+    ("simulation", "spinnaker", 0),
+    ("simulation", "spinnaker_sim", 1),
+])
+def test_camera_not_applicable_cannot_hide_real_recording_failure(tmp_path, mode, backend, frames):
+    import json
+    path = tmp_path / "session.json"
+    path.write_text(json.dumps({"metadata": {"run_mode": mode}, "stream_summaries": {
+        "spinnaker_video": {"backend": backend, "frames_saved": frames,
+                            "trigger_alignment": {"status": "NOT_APPLICABLE"}},
+    }}))
+    assert diagnostic_result("session", str(path))["passed"] is False
+
+
 def test_hung_bpod_reader_never_enters_unbounded_driver_wait():
     release = threading.Event()
     thread = threading.Thread(target=release.wait, daemon=True)

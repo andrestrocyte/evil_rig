@@ -714,13 +714,24 @@ class SessionRecorder:
             # counter, never the rolling cache or the recorder's wall duration.
             triggers = self._streamdio_counts.get("camera", 0)
             frames = int(camera["frames_saved"])
-            alignment = {
+            preview_only_simulation = (
+                self.metadata.get("run_mode") == "simulation"
+                and camera.get("backend") == "spinnaker_sim"
+                and frames == 0
+            )
+            alignment: dict[str, Any] = {
                 "status": "PASS" if frames == triggers and frames > 0 else "FAIL",
                 "recorded_triggers": triggers,
                 "saved_frames": frames,
                 "frame_count_minus_triggers": frames - triggers,
                 "count_source": "streamdio_camera_events",
             }
+            if preview_only_simulation:
+                alignment.update(
+                    status="NOT_APPLICABLE",
+                    frame_count_minus_triggers=None,
+                    reason="Simulated camera provides previews without recording physical images",
+                )
             self.register_stream("spinnaker_video", {**camera, "trigger_alignment": alignment})
             self.log_event("camera_trigger_alignment", alignment)
         self.log_event("session_end", {"end_reason": summary.end_reason})

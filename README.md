@@ -250,6 +250,10 @@ same discovery logic as the screen task.
 
 **Notes**
 
+- The BMC applies resistance while the wheel is turned by hand. Check it by gently
+  turning the wheel during a labelled force interval; a stationary, unloaded ADC
+  reading of zero does not establish whether resistance is enabled. Keep physical
+  force calibration separate from digital output verification.
 - When capacitive touch is selected, its power is held high for the whole session; lick edges on input ch14 are stored both as
   raw module-timestamped events and as explicit `lick` session events.
 - The firmware streams **one** analog input at a time, so force stays on AI13 and the vendored
