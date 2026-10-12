@@ -700,6 +700,12 @@ exports retain the full stream. `dm_200` also writes optional 45-second NPZ chun
 Bounding memory does not require those extra chunks. Finalization writes the raw
 NPZ array in 8,192-row blocks and streams CSV output; validation also reads the
 compressed raw array in blocks. The formats and raw timestamps are unchanged.
+Semantic event arrays and JSON-array members also stream, using at most 4 MiB of
+array data per block (or one row if a single record is larger). Unicode widths,
+field order and values retain the established NumPy representation. The JSON
+sidecar streams its text and shares the already-built event dictionaries with
+cold exports. Validation reads every semantic-array block, checks counts and JSON
+payloads, and rejects truncation, trailing bytes and object/pickle arrays.
 Optional chunk output has a two-block queue. If it falls behind, the complete WAL
 supplies final exports; if its writer cannot finish, recovery files are retained
 instead of publishing a completed session.
@@ -847,7 +853,7 @@ timeline anchors, and stream/module/status consistency.
 ```bash
 pytest                              # hardware-free, headless
 ruff check src tests                # correctness lint
-mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_export.py src/hf_dm/data/raw_stream.py src/hf_dm/data/session_journal.py
+mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_export.py src/hf_dm/data/raw_stream.py src/hf_dm/data/session_journal.py src/hf_dm/data/array_stream.py
 ```
 
 GitHub Actions runs Ruff, the stable-module mypy gate, and the full pytest suite on **Windows and

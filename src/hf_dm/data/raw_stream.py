@@ -12,6 +12,8 @@ import zlib
 
 import numpy as np
 
+from hf_dm.data.array_stream import BlockArray
+
 WAL_MAGIC_V1 = b"HFDMSTR1\n"
 WAL_MAGIC = b"HFDMSTR2\n"
 WAL_PAYLOAD = struct.Struct("<24siiQdd")
@@ -208,7 +210,7 @@ def write_npz(handle: IO[bytes], arrays: dict[str, Any]) -> None:
     with zipfile.ZipFile(handle, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
         for name, array in arrays.items():
             with archive.open(f"{name}.npy", "w", force_zip64=True) as target:
-                if isinstance(array, RawArray):
+                if isinstance(array, (RawArray, BlockArray)):
                     array.write(target)
                 else:
                     np.lib.format.write_array(target, np.asanyarray(array), allow_pickle=True)

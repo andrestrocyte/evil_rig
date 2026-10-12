@@ -9,7 +9,7 @@ import os
 import subprocess
 import time
 from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager, ExitStack
+from contextlib import closing, contextmanager, ExitStack
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -23,6 +23,7 @@ import yaml
 from hf_dm.hardware.bringup_constants import FORCE_ANALOG_CHANNEL, FRAME2TTL_INPUT_CHANNEL
 from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
 from hf_dm.data.raw_stream import FileRows, NpzRows, chunk_number
+from hf_dm.data.array_stream import NpzArray
 from hf_dm.timing_heartbeat import (
     TIMING_HEARTBEAT_EVENT_TYPE,
     analyze_timing_heartbeats,
@@ -2259,6 +2260,42 @@ def _validate_recorder_stats(manifest: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _validate_semantic_arrays(path: Path, rel: str, manifest: dict[str, Any], files: set[str]) -> list[str]:
+    counts = manifest.get("counts") or {}
+    expected_counts = {
+        "trials": counts.get("trials"), "trials_json": counts.get("trials"),
+        "events": counts.get("events"), "events_json": counts.get("events"),
+        "bpod_trials_json": counts.get("bpod_trials"),
+        "debug_events_json": (manifest.get("recorder_stats") or {}).get("debug_event_recent_count"),
+        "summary_json": 1, "session_metadata_json": 1, "timing_heartbeat_qc_json": 1,
+        "fsm_definitions_json": None,
+    }
+    errors: list[str] = []
+    for name, expected in expected_counts.items():
+        if name not in files:
+            continue
+        try:
+            member = NpzArray(path, name)
+            if expected is not None and member.count != int(expected):
+                errors.append(f"primary npz {name} count mismatch: {rel}: {member.count} != {int(expected)}")
+            if name.endswith("_json") and member.dtype.kind != "U":
+                raise ValueError("Expected a Unicode JSON array")
+            required = ({"wall_time_s", "monotonic_s", "event_type", "payload_json"} if name == "events"
+                        else {"trial_index", "phase", "choice"} if name == "trials" else set())
+            if required and not required.issubset(member.dtype.names or ()):
+                raise ValueError(f"Missing fields: {sorted(required - set(member.dtype.names or ()))}")
+            with closing(member.blocks()) as blocks:
+                for block in blocks:
+                    values = block["payload_json"] if name == "events" else block
+                    if name.endswith("_json") or name == "events":
+                        for value in values:
+                            if not isinstance(json.loads(str(value)), dict):
+                                raise ValueError("Expected a JSON object")
+        except Exception as exc:
+            errors.append(f"primary npz {name} unreadable: {rel}: {type(exc).__name__}: {exc}")
+    return errors
+
+
 def _validate_npz_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     required_primary = {
@@ -2276,7 +2313,7 @@ def _validate_npz_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> li
         "streamdio_chunk_"
     )
     try:
-        with np.load(path, allow_pickle=True) as data:
+        with np.load(path, allow_pickle=False) as data:
             files = set(data.files)
             if is_chunk:
                 if "streamdio_events" not in files:
@@ -2286,6 +2323,7 @@ def _validate_npz_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> li
             if missing:
                 errors.append(f"primary npz missing arrays: {rel}: {missing}")
                 return errors
+            errors.extend(_validate_semantic_arrays(path, rel, manifest, files))
             if "timing_heartbeat_qc_json" in files:
                 try:
                     npz_qc = json.loads(str(data["timing_heartbeat_qc_json"][0]))
@@ -2310,12 +2348,6 @@ def _validate_npz_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> li
                                     f"primary npz timing heartbeat {field} mismatch: {rel}"
                                 )
             counts = manifest.get("counts") or {}
-            trial_count = counts.get("trials")
-            if trial_count is not None and len(data["trials"]) != int(trial_count):
-                errors.append(
-                    f"primary npz trial count mismatch: {rel}: "
-                    f"{len(data['trials'])} != {int(trial_count)}"
-                )
             streamdio_count = counts.get("streamdio_events")
             raw_count = len(NpzRows(path))
             if streamdio_count is not None and raw_count != int(streamdio_count):

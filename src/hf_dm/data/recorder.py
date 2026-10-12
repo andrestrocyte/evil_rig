@@ -16,7 +16,7 @@ import threading
 import time
 import zlib
 from collections import Counter, deque
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack, closing
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -28,6 +28,7 @@ from typing import Any, Literal
 import numpy as np
 
 from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
+from hf_dm.data.array_stream import BlockArray, StringArray
 from hf_dm.data.raw_stream import (
     BLOCK_ROWS, RAW_DTYPE, ChunkRows, RawArray, RawRow, WalRows, write_npz,
     WAL_MAGIC as _STREAMDIO_WAL_MAGIC,
@@ -200,13 +201,20 @@ def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
     }
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_write_text(path: Path, text: str | Iterable[str]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
+            if isinstance(text, str):
+                handle.write(text)
+            else:
+                with ExitStack() as stack:
+                    chunks = iter(text)
+                    if close := getattr(chunks, "close", None):
+                        stack.callback(close)
+                    handle.writelines(chunks)
             handle.flush()
             fsync_best_effort(handle, path=temporary)
         os.replace(temporary, path)
@@ -714,7 +722,7 @@ class SessionRecorder:
         json_path = self.base_path.with_suffix(".json")
 
         trials_arr = self._trials_to_structured()
-        events_arr = self._events_to_structured()
+        events_arr = self._event_array()
         final_streamdio_events = self._streamdio_rows_for_finalize()
         self._discard_partial_streamdio_chunks()
         streamdio_arr = RawArray(final_streamdio_events)
@@ -732,29 +740,12 @@ class SessionRecorder:
                 trials=trials_arr,
                 events=events_arr,
                 streamdio_events=streamdio_arr,
-                bpod_trials_json=np.array(
-                    [json.dumps(trial) for trial in self.bpod_trials],
-                    dtype=str,
-                ),
-                trials_json=np.array(
-                    [json.dumps(asdict(trial), default=str) for trial in self.trials],
-                    dtype=str,
-                ),
-                events_json=np.array(
-                    [json.dumps(asdict(event), default=str) for event in self.events],
-                    dtype=str,
-                ),
-                debug_events_json=np.array(
-                    [json.dumps(asdict(event), default=str) for event in self.debug_events],
-                    dtype=str,
-                ),
-                fsm_definitions_json=np.array(
-                    [
-                        json.dumps({"fsm_name": name, "fsm_json": fsm_json}, default=str)
-                        for name, fsm_json in self.fsm_definitions.items()
-                    ],
-                    dtype=str,
-                ),
+                bpod_trials_json=StringArray(self.bpod_trials, json.dumps),
+                trials_json=StringArray(self.trials, lambda trial: json.dumps(asdict(trial), default=str)),
+                events_json=StringArray(self.events, lambda event: json.dumps(asdict(event), default=str)),
+                debug_events_json=StringArray(self.debug_events, lambda event: json.dumps(asdict(event), default=str)),
+                fsm_definitions_json=StringArray(self.fsm_definitions.items(), lambda item: json.dumps(
+                    {"fsm_name": item[0], "fsm_json": item[1]}, default=str)),
                 summary_json=np.array([json.dumps(asdict(summary))], dtype=str),
                 session_metadata_json=np.array(
                     [json.dumps(self.metadata, default=str)],
@@ -774,12 +765,15 @@ class SessionRecorder:
                 pass
 
         streamdio_counts = Counter(self._streamdio_counts)
+        trial_dicts = [asdict(trial) for trial in self.trials]
+        event_dicts = [asdict(event) for event in self.events]
+        debug_event_dicts = [asdict(event) for event in self.debug_events]
         meta = {
             "summary": asdict(summary),
             "metadata": self.metadata,
-            "trials": [asdict(t) for t in self.trials],
-            "events": [asdict(e) for e in self.events],
-            "debug_events_recent": [asdict(e) for e in self.debug_events],
+            "trials": trial_dicts,
+            "events": event_dicts,
+            "debug_events_recent": debug_event_dicts,
             "debug_events": {
                 "ring_capacity": self.debug_events.maxlen,
                 "recent_count": len(self.debug_events),
@@ -806,7 +800,7 @@ class SessionRecorder:
         }
         if npz_error is not None:
             meta["npz_error"] = npz_error
-        _atomic_write_text(json_path, json.dumps(meta, indent=2))
+        _atomic_write_text(json_path, json.JSONEncoder(indent=2).iterencode(meta))
         artifact_bytes = 0
         for path in (npz_path, json_path):
             if path.exists():
@@ -828,9 +822,9 @@ class SessionRecorder:
                     base_path=self.base_path,
                     summary=summary,
                     metadata=self.metadata,
-                    trials=[asdict(trial) for trial in self.trials],
-                    events=[asdict(event) for event in self.events],
-                    debug_events=[asdict(event) for event in self.debug_events],
+                    trials=trial_dicts,
+                    events=event_dicts,
+                    debug_events=debug_event_dicts,
                     streamdio_events=final_streamdio_events,
                     bpod_trials=self.bpod_trials,
                     fsm_definitions=self.fsm_definitions,
@@ -1422,20 +1416,29 @@ class SessionRecorder:
         return np.array(rows, dtype=dtype)
 
     def _events_to_structured(self) -> np.ndarray:
-        payloads = [json.dumps(event.payload) for event in self.events]
-        event_type_chars = max(1, *(len(event.event_type) for event in self.events))
-        payload_chars = max(1, *(len(payload) for payload in payloads))
-        dtype = [
+        # Compatibility helper for callers explicitly requesting an in-memory array.
+        array = self._event_array()
+        return np.array(list(array.iter_rows()), dtype=array.dtype)
+
+    def _event_array(self) -> BlockArray:
+        count = len(self.events)
+        event_type_chars = max(1, max((len(event.event_type) for event in self.events), default=0))
+        payload_chars = max(1, max((len(json.dumps(event.payload)) for event in self.events), default=0))
+        dtype = np.dtype([
             ("wall_time_s", "f8"),
             ("monotonic_s", "f8"),
             ("event_type", f"U{event_type_chars}"),
             ("payload_json", f"U{payload_chars}"),
-        ]
-        rows = [
-            (event.wall_time_s, event.monotonic_s, event.event_type, payload)
-            for event, payload in zip(self.events, payloads, strict=True)
-        ]
-        return np.array(rows, dtype=dtype)
+        ])
+
+        def rows() -> Iterator[tuple[float, float, str, str]]:
+            for event in self.events:
+                payload = json.dumps(event.payload)
+                if len(event.event_type) > event_type_chars or len(payload) > payload_chars:
+                    raise ValueError("Event grew after array sizing; refusing truncation")
+                yield (event.wall_time_s, event.monotonic_s, event.event_type, payload)
+
+        return BlockArray(count, dtype, rows)
 
     def _streamdio_to_structured(self) -> np.ndarray:
         return self._streamdio_rows_to_structured(self.streamdio_events)

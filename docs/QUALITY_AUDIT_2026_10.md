@@ -7,9 +7,9 @@ session selection, on-demand diagnostics, cooperative Stop and saved results.
 This audit does not establish that every hardware component is calibrated or
 that the system is bug-free.
 
-Local verification: full suite 456 passed. Ruff and type checks for config,
-recorder, session export, block I/O and session-journal I/O passed. CI checks
-Windows and Linux; the preceding commit passed all 434 tests on both platforms.
+Local verification: full suite 476 passed. Ruff and type checks for config,
+recorder, session export, raw I/O, journal I/O and array I/O passed. CI checks
+Windows and Linux; the preceding commit passed all 456 tests on both platforms.
 
 ## Repairs
 
@@ -91,6 +91,12 @@ Windows and Linux; the preceding commit passed all 434 tests on both platforms.
   distinct backups; recovery and offline export verify recorded backup checksums.
   Moved sessions use their local evidence. Refuse completed sessions before any
   repair, and detect source-file changes during scanning or replay.
+- Stream structured semantic events and JSON-array NPZ members in byte-bounded
+  blocks, preserving their existing dtypes and values. Detect changed row counts
+  or strings that grow after sizing instead of truncating them. Stream the JSON
+  sidecar text and reuse its event dictionaries for cold exports. Validate full
+  semantic-array contents and counts in blocks, including JSON decoding and ZIP
+  checksums; reject truncated/trailing data and object/pickle arrays.
 
 ## Evidence on this PC
 
@@ -125,6 +131,8 @@ Windows and Linux; the preceding commit passed all 434 tests on both platforms.
 | Journal boundary faults | Missing newline now yields a valid recovery; torn UTF-8 tail recovers; newline-terminated malformed JSON is refused. Missing or altered prior backups stop retries; altered backups cannot become a valid offline re-export | File/process fault injection; not physical storage failure |
 | Journal scan / replay | 50,006 rows produce identical hashes; parser peak RSS 181.7 to 35.5 MiB, scan/consume time 1.18 / 1.13 s | Synthetic journal; this isolates parsing, not total recovery memory |
 | Semantic-event recovery | All 50,000 events and payload values retained exactly; both full recovered bundles validate; total recovery/validation 6.67 / 6.48 s, peak RSS 351.7 / 348.7 MiB | Final semantic-event export dominates peak memory; no large overall memory reduction claimed |
+| Semantic-array and JSON streaming | Same 50,000-event workload now peaks at 141.7 MiB versus 348.7 MiB; full recovery/validation 8.16 versus 6.48 s; every sample value matches the original hash | Synthetic workload; stronger validation and two-pass string sizing add work. Semantic models, timeline analysis and JSON validation still grow with session size |
+| Live recording with semantic streaming | 465 camera triggers = 465 images; 17,302 raw records and 191 semantic events retained; all 25 artifacts validate; no incomplete/save errors, clean cleanup | Fifteen-second observation; one ordinary acquisition wait timeout, with no missing triggered frame |
 
 Local evidence (recordings are intentionally excluded from Git):
 
@@ -153,6 +161,9 @@ Local evidence (recordings are intentionally excluded from Git):
 - `data/runtime/audit/journal_boundaries_before.json` and `journal_boundaries_after.json`
 - `data/runtime/audit/journal_scan_before.json` and `journal_scan_after.json`
 - `data/runtime/audit/journal_recovery_before/benchmark.json` and `journal_recovery_after/benchmark.json`
+- `data/runtime/audit/journal_recovery_streamed/benchmark.json` (NPZ streaming alone: 195.2 MiB)
+- `data/runtime/audit/journal_recovery_streamed_json/benchmark.json` (NPZ plus JSON streaming: 141.7 MiB)
+- `data/runtime/audit/event_export_result.json` (live recording and stronger array validation)
 
 The earlier rig check at `20261012_211459_030909` incorrectly reported overall
 success despite only four of six barcode matches. The earlier Stop check at
@@ -174,8 +185,9 @@ This does not mean repeating the full diagnostics before each bench session.
 
 Normal finalization, validation and crash recovery stream high-rate raw data in blocks; the
 lower-rate semantic timeline and heartbeat analysis still grow with session size.
-Journal parsing and repair now stream, but reconstructed semantic events and their
-final exports still grow in memory with session size. Full-resolution PGM video
+Journal parsing/repair and semantic NPZ/text writing now stream. Reconstructed
+semantic events, timeline analysis and JSON validation still grow in memory with
+session size. Full-resolution PGM video
 uses about 2.8 GB/min on this camera. A stalled optional writer is fault-injected in
 tests; a physical storage-device hang has not been tested.
 Windows reported unavailable directory fsync support: file flushes, atomic writes
