@@ -282,6 +282,50 @@ def test_changed_or_missing_driver_source_hash_invalidates_certificate(tmp_path,
     assert "streamdio_driver_sha256" in check["detail"]
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ({"git_commit": "d" * 40, "git_exact_tag": None}, "PASS"),
+        ({"runtime_code_sha256": "f" * 64}, "FAIL"),
+        ({"runtime_code_sha256": None}, "FAIL"),
+        ({"runtime_code_identity_scheme": None}, "FAIL"),
+        ({"runtime_code_identity_scheme": "different-scheme"}, "FAIL"),
+        ({"python_version": "3.12.changed"}, "FAIL"),
+        ({"requirements_lock_sha256": "f" * 64}, "FAIL"),
+        ({"package_versions": {"bpod-core": "changed"}}, "FAIL"),
+        ({"git_dirty": True}, "FAIL"),
+    ],
+)
+def test_installed_code_certificate_reuses_only_unchanged_runtime(tmp_path, mutation, expected):
+    config, provenance, certificate, now = _release_fixture(tmp_path)
+    provenance.update(runtime_code_identity_scheme="hf_dm_package_tree_v1", runtime_code_sha256="1" * 64)
+    certificate["release"] = build_release_identity(config, provenance=provenance)
+    (tmp_path / "rig-certification.json").write_text(json.dumps(certificate), encoding="utf-8")
+    provenance.update(mutation)
+    report = evaluate_animal_use_gate(
+        config, operator_confirmed=True, provenance=provenance,
+        actual_hardware=certificate["hardware"], now_s=now,
+        storage_probe=lambda _path: {"pass": True},
+    )
+    assert report["status"] == expected
+    if mutation.get("git_commit"):
+        assert report["release_identity"]["git_commit"] == mutation["git_commit"]
+
+
+@pytest.mark.parametrize("source_hash", [None, "1" * 64])
+def test_live_code_identity_requires_fingerprinted_certificate(tmp_path, source_hash):
+    config, provenance, _certificate, now = _release_fixture(tmp_path)
+    provenance.update(runtime_code_identity_scheme="hf_dm_package_tree_v1", runtime_code_sha256=source_hash)
+    report = evaluate_animal_use_gate(
+        config, operator_confirmed=True, provenance=provenance, now_s=now,
+        storage_probe=lambda _path: {"pass": True},
+    )
+    check = next(item for item in report["checks"] if item["name"] == "exact_release_identity")
+    assert check["status"] == "FAIL"
+    assert "runtime_code_identity_scheme" in check["detail"]
+    assert "runtime_code_sha256" in check["detail"]
+
+
 def test_gate_probes_results_and_camera_storage(tmp_path):
     config, provenance, _certificate, now = _release_fixture(tmp_path)
     config.camera.save_dir = str(tmp_path / "videos")

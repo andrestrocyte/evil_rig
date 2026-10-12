@@ -366,8 +366,10 @@ circle/low-effort).
 session will not open hardware until the exact release/config/calibration has a current PASS
 certificate and the operator confirms that this is an animal-use run.
 
-Certification binds the clean Git commit, installed driver source hash, effective
-hardware/task settings and calibration. A Git tag is optional. Subjects, session
+Certification binds installed task/driver source hashes, dependencies and Python,
+effective hardware/task settings and calibration. A clean checkout is required;
+its commit is recorded and a Git tag is optional. Documentation/test-only commits
+can reuse commissioning when installed task bytes are unchanged. Subjects, session
 paths, random seeds and trial counts can change without repeating commissioning;
 the calibrated reward ceiling is checked against the selected trial count on
 every run. Changing sensor, modality, timing or reward settings still changes the
@@ -558,7 +560,8 @@ readout.
 ### Animal-use release gate
 
 The production YAML files set `animal_use.enabled: true`. Startup is blocked unless all of these
-match the current run: a clean exact Git tag and commit, dependency lock, config hash, reward
+match the current run: installed task/driver hashes from a clean checkout, dependency lock,
+package/Python versions, config hash, reward
 calibration hash and fit quality, hardware failsafe revision, Bpod/StreamDIO/camera identities,
 current subject weight/water limits, required peripherals, signed approvals, and a current
 all-PASS rig certificate. `WARN` never satisfies this gate.

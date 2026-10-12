@@ -7,7 +7,7 @@ session selection, on-demand diagnostics, cooperative Stop and saved results.
 This audit does not establish that every hardware component is calibrated or
 that the system is bug-free.
 
-Local verification: full suite 544 passed. Ruff and type checks for config,
+Local verification: full suite 569 passed. Ruff and type checks for config,
 recorder, session export, raw I/O, journal I/O and array I/O passed. CI checks
 Windows and Linux; exact-commit results are linked in PR #5.
 
@@ -54,9 +54,11 @@ Windows and Linux; exact-commit results are linked in PR #5.
   missing triggers. Camera count mismatches now fail launcher result checks.
 - Reuse commissioning across subject, trial-count, seed, profile-label and output
   path changes, including auto-resolved monitor telemetry paths. Keep reward caps
-  checked per run; bind the actual installed driver source hash. Exact commit
-  matching no longer requires a redundant Git tag. Certificates created before
-  this update need regeneration because code and identity hashing changed.
+  checked per run; bind actual installed task/asset and driver source hashes,
+  dependency versions/lock and Python version. Documentation/test-only commits
+  can reuse commissioning; each session still records its clean Git commit and
+  optional exact tag. Package changes and unreadable source invalidate the identity.
+  Certificates created before task fingerprinting require regeneration.
 - Stream raw NPZ serialization, CSV exports and NPZ validation in blocks rather
   than constructing several full Python copies. Preserve every value, column and
   dtype. Normal finalization rejects a missing, truncated or CRC-invalid WAL and
@@ -176,6 +178,7 @@ Windows and Linux; exact-commit results are linked in PR #5.
 
 Local evidence (recordings are intentionally excluded from Git):
 
+- `data/runtime/audit/commit_identity_before.json` and `commit_identity_after.json` (temporary Git/certificate fixtures: documentation-only commits reuse identical installed code)
 - `data/runtime/audit/camera_latency_summary.json`
 - `data/runtime/audit/recovery_marker_failure_before.json` and `recovery_marker_failure_after.json` (interrupted cleanup retry)
 - `data/runtime/audit/missing_raw_before.json` and `missing_raw_after.json` (missing and shortened raw sources)

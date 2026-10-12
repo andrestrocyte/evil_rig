@@ -277,8 +277,9 @@ def test_certify_rig_refuses_missing_pre_actuation_confirmations(tmp_path):
         )
 
 
+@pytest.mark.parametrize("missing_identity", [None, "runtime_code_identity_scheme", "runtime_code_sha256", "python_version"])
 def test_certify_rig_emits_gate_consumable_pass_only_with_complete_evidence(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, missing_identity
 ):
     config = _write_config(tmp_path)
     evidence_path = tmp_path / "physical.json"
@@ -310,9 +311,12 @@ def test_certify_rig_emits_gate_consumable_pass_only_with_complete_evidence(
     )
     monkeypatch.setattr(
         "hf_dm.rig_certification.build_release_identity",
-        lambda _config: {
+        lambda _config: {key: value for key, value in {
             "git_commit": "a" * 40,
             "git_exact_tag": None,
+            "runtime_code_identity_scheme": "hf_dm_package_tree_v1",
+            "runtime_code_sha256": "f" * 64,
+            "python_version": "3.12.test",
             "streamdio_driver_sha256": "e" * 64,
             "git_dirty": False,
             "requirements_lock_sha256": "b" * 64,
@@ -321,7 +325,7 @@ def test_certify_rig_emits_gate_consumable_pass_only_with_complete_evidence(
             "calibration_sha256": "d" * 64,
             "hardware_failsafe_revision": "watchdog-r2",
             "streamdio_driver": {"module_path": "C:/vendor/streamdio.py"},
-        },
+        }.items() if key != missing_identity},
     )
 
     report = run_rig_certification(
@@ -331,11 +335,16 @@ def test_certify_rig_emits_gate_consumable_pass_only_with_complete_evidence(
         command_runner=_fake_runner,
     )
 
-    assert report["status"] == "PASS"
+    expected = "FAIL" if missing_identity else "PASS"
+    assert report["status"] == expected
+    if missing_identity:
+        check = next(item for item in report["checks"] if item["name"] == "release_identity_complete")
+        assert check["status"] == "FAIL"
+        assert missing_identity in check["detail"]["missing"]
     assert report["hardware"]["camera"]["serial_number"] == "20137635"
     assert report["hardware"]["bpod"]["firmware"] == [23, 10]
     saved = json.loads((tmp_path / "rig.json").read_text(encoding="utf-8"))
-    assert saved["status"] == "PASS"
+    assert saved["status"] == expected
     assert {item["name"] for item in saved["checks"]} >= REQUIRED_CERTIFICATION_CHECKS
 
 

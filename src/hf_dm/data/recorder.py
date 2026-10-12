@@ -53,6 +53,43 @@ _STREAMDIO_WAL_MAGIC_V1 = WAL_MAGIC_V1
 _STREAMDIO_WAL_RECORD_V1 = _STREAMDIO_WAL_PAYLOAD
 _STREAMDIO_WAL_RECORD = WAL_RECORD
 
+
+def _runtime_code_identity(package_root: Path) -> dict[str, Any]:
+    """Fingerprint installed task bytes, independent of repository-only changes."""
+    identity: dict[str, Any] = {
+        "runtime_code_identity_scheme": "hf_dm_package_tree_v1",
+        "runtime_code_sha256": None,
+    }
+
+    def fail_walk(error: OSError) -> None:
+        raise error
+
+    try:
+        digest = hashlib.sha256()
+        count = 0
+        for directory, directories, filenames in os.walk(package_root, onerror=fail_walk):
+            directories[:] = sorted(name for name in directories if name != "__pycache__")
+            for name in directories:
+                if (Path(directory) / name).is_symlink():
+                    raise OSError(f"Cannot fingerprint linked package directory: {name}")
+            for name in sorted(filenames):
+                source = Path(directory) / name
+                if source.suffix in {".pyc", ".pyo"}:
+                    continue
+                digest.update(source.relative_to(package_root).as_posix().encode("utf-8") + b"\0")
+                with source.open("rb") as handle:
+                    digest.update(hashlib.file_digest(handle, "sha256").digest())
+                count += 1
+        if count == 0:
+            raise OSError("Installed task package contains no source or asset files")
+        identity["runtime_code_sha256"] = digest.hexdigest()
+    except OSError as exc:
+        # Keep the scheme even on failure so certification cannot fall back to
+        # commit-only matching when installed bytes cannot be verified.
+        identity["runtime_code_error"] = f"{type(exc).__name__}: {exc}"
+    return identity
+
+
 def _git_identity(candidate: Path) -> dict[str, str | bool | None]:
     identity: dict[str, str | bool | None] = {
         "git_commit": None,
@@ -190,6 +227,7 @@ def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
             pass
     return {
         **task_git,
+        **_runtime_code_identity(Path(__file__).resolve().parents[1]),
         "package_version": package_version,
         "package_versions": package_versions,
         "python_version": sys.version,

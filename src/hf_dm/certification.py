@@ -175,6 +175,8 @@ def build_release_identity(
         "git_commit": runtime.get("git_commit"),
         "git_exact_tag": runtime.get("git_exact_tag"),
         "git_dirty": runtime.get("git_dirty"),
+        "runtime_code_identity_scheme": runtime.get("runtime_code_identity_scheme"),
+        "runtime_code_sha256": runtime.get("runtime_code_sha256"),
         "requirements_lock_sha256": runtime.get("requirements_lock_sha256"),
         "package_versions": runtime.get("package_versions"),
         "python_version": runtime.get("python_version"),
@@ -363,7 +365,6 @@ def evaluate_animal_use_gate(
     if not isinstance(certified_release, dict):
         certified_release = {}
     release_keys = (
-        "git_commit",
         "streamdio_driver_sha256",
         "requirements_lock_sha256",
         "package_versions",
@@ -371,6 +372,15 @@ def evaluate_animal_use_gate(
         "calibration_sha256",
         "hardware_failsafe_revision",
     )
+    if identity.get("runtime_code_identity_scheme") or certified_release.get("runtime_code_identity_scheme"):
+        # A clean documentation/test-only commit need not repeat commissioning.
+        # Both sides must carry a matching installed-code hash; missing hashes
+        # and old certificates fail closed against a newly fingerprinted runtime.
+        release_keys += ("runtime_code_identity_scheme", "runtime_code_sha256", "python_version")
+    else:
+        # Historical provenance supplied during offline evaluation retains its
+        # original exact-commit semantics. Live capture always includes a scheme.
+        release_keys += ("git_commit",)
     mismatches = {
         key: {"certified": certified_release.get(key), "current": identity.get(key)}
         for key in release_keys
