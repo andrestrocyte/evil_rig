@@ -255,7 +255,7 @@ class TaskDisplay:
         self._pump_quit()
         self.screen.fill(self.config.background_rgb)
         self._draw_targets()
-        center = self._shape_center(signed_position_deg)
+        center = self._shape_center(self.config.wheel_to_screen_deg(signed_position_deg))
 
         if outcome == "matched":
             color = self.config.matched_rgb
@@ -470,6 +470,8 @@ class TaskDisplay:
             self.screen.blit(surf, (14, 14 + idx * 24))
 
     def _triangle(self, center: tuple[int, int], direction: Direction) -> list[tuple[int, int]]:
+        if self.config.invert_wheel_movement:
+            direction = "ccw" if direction == "cw" else "cw"
         cx, cy = center
         radius = self.shape_radius_px
         short = int(radius * 0.82)

@@ -1,8 +1,10 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from hf_dm.hardware.discovery import configure_bpod_event_allocation
+from hf_dm.hardware import discovery
 
 
 class FakeSerial:
@@ -47,6 +49,34 @@ def test_bpod_bringup_installs_firmware_event_allocation():
     assert allocation["allocated_events"] == 75
     assert bpod._n_softcodes == 15
     assert bpod.serial0.writes == [b"%\x1c\x0f\x02\x0f\x0f"]
+
+
+@pytest.mark.parametrize("initially_connected", [False, True])
+def test_connect_refreshes_missing_module_before_allocating_events(monkeypatch, initially_connected):
+    import bpod_core.bpod as bpod_module
+
+    bpod = make_bpod()
+    if not initially_connected:
+        bpod.modules = {
+            f"Serial{index}": SimpleNamespace(n_events=15, is_connected=False)
+            for index in range(1, 4)
+        }
+
+    def refresh():
+        bpod.modules = make_bpod().modules
+
+    bpod.update_modules = Mock(side_effect=refresh)
+    bpod.close = Mock()
+    monkeypatch.setattr(bpod_module, "Bpod", lambda **kwargs: bpod)
+    monkeypatch.setattr(discovery, "configure_bpod_core_settings_path", lambda: None)
+    monkeypatch.setattr(discovery, "ensure_bpod_core_settings_unlocked", lambda path: None)
+
+    assert discovery.connect_bpod_core("COM_TEST") is bpod
+
+    assert bpod.update_modules.call_count == (0 if initially_connected else 1)
+    assert bpod.hf_dm_event_allocation["event_counts"] == [28, 15, 2, 15, 15]
+    assert bpod.serial0.writes == [b"%\x1c\x0f\x02\x0f\x0f"]
+    bpod.close.assert_not_called()
 
 
 def test_bpod_bringup_requires_firmware_acknowledgement():

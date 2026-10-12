@@ -1,4 +1,4 @@
-"""Continuous PC white noise for the pin-27 hardware gate."""
+"""Continuous PC white noise for the pin-26 hardware gate."""
 
 from __future__ import annotations
 

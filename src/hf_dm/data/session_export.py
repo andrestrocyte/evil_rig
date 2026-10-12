@@ -728,9 +728,18 @@ def _write_licks_csv(path: Path, events: list[dict[str, Any]]) -> Path:
                 "event_type": event.get("event_type"),
                 "trial_index": payload.get("trial_index"),
                 "channel": payload.get("channel"),
-                "state": payload.get("state"),
+                "state": payload.get("state", payload.get("value")),
                 "timestamp_us": payload.get("timestamp_us"),
                 "relative_time_s": payload.get("relative_time_s"),
+                "source": payload.get("source"),
+                "clock": payload.get("clock"),
+                "bpod_trial": payload.get("bpod_trial"),
+                "bpod_event": payload.get("event"),
+                "counted": payload.get("counted"),
+                "bpod_timestamp_us": payload.get("bpod_timestamp_us"),
+                "bpod_relative_time_s": payload.get("bpod_relative_time_s"),
+                "timestamp_origin": payload.get("timestamp_origin"),
+                "relay_receipt_wait_s": payload.get("relay_receipt_wait_s"),
             }
         )
     return _write_dict_csv(path, rows)
@@ -1541,7 +1550,10 @@ def _flags(metadata: dict[str, Any]) -> dict[str, Any]:
     return {
         "camera": bool((config.get("camera") or {}).get("record_video", False)),
         "frame2ttl": bool((config.get("frame2ttl") or {}).get("enabled", False)),
-        "cap_touch": bool((config.get("licks") or {}).get("power_required", False)),
+        "cap_touch": (
+            (config.get("licks") or {}).get("source", "capacitive") == "capacitive"
+            and bool((config.get("licks") or {}).get("power_required", False))
+        ),
         "monitor": bool((config.get("monitor") or {}).get("enabled", False)),
     }
 
@@ -1726,8 +1738,9 @@ def _validate_manifest_flags(manifest: dict[str, Any], bundle_dir: Path) -> list
         "frame2ttl": bool(
             (effective_config.get("frame2ttl") or {}).get("enabled", False)
         ),
-        "cap_touch": bool(
-            (effective_config.get("licks") or {}).get("power_required", False)
+        "cap_touch": (
+            (effective_config.get("licks") or {}).get("source", "capacitive") == "capacitive"
+            and bool((effective_config.get("licks") or {}).get("power_required", False))
         ),
         "monitor": bool((effective_config.get("monitor") or {}).get("enabled", False)),
     }

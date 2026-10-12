@@ -4,6 +4,17 @@
 is the StreamDIO firmware used by the bringup notebooks, vendored here so the
 task and firmware stay in sync.
 
+The speaker output is Teensy **pin 26**. Both the `Y` manual gate command and
+the `K` firmware noise generator use this pin. Move the amplifier gate wire
+from the original pin 27 to pin 26 with rig power disconnected. The task still
+uses continuous PC audio with a separate amplifier gate; the audio cable is
+required. Capacitive-touch input remains on pin 25.
+
+The onboard status LED (Teensy pin 13) blinks once per second: 500 ms on,
+500 ms off. This nonblocking indicator runs in the foreground, outside the
+100 us acquisition interrupt. It shows that the firmware is running; it does
+not certify the carrier board, wiring, or connected peripherals.
+
 This cap-touch digitizer and timing-heartbeat build reports firmware version
 `5`. The Sanworks
 `ArCOM` wrapper is vendored beside the sketch so the firmware can be compiled
@@ -50,12 +61,13 @@ Compile or upload from the repo with:
 
 ```powershell
 .\scripts\flash_streamdio_firmware.ps1
-.\scripts\flash_streamdio_firmware.ps1 -Port usb:70000/0/0/4
+.\scripts\flash_streamdio_firmware.ps1 -Port <verified-StreamDIO-upload-port>
 ```
 
-Use the StreamDIO Teensy upload port, not the Bpod Teensy. On the rig where
-this was prepared, the StreamDIO Triple Serial group was COM6/COM8/COM7 and the
-upload port was `usb:70000/0/0/4`; the Bpod Teensy was the separate group
-starting at COM5. Do not infer config/stream ordering from COM numbers; the
-task's `AUTO` discovery identifies those interfaces from firmware discovery
-bytes.
+Identify the StreamDIO Teensy by its USB serial number before every upload;
+USB paths can change when cables move. The replacement StreamDIO currently
+has serial `15755980` (Teensy programmer serial `1575598`), with config COM10,
+stream COM11, and primary COM12. Bpod has serial `17032730` (programmer serial
+`1703273`), with primary COM5. Do not flash the Bpod Teensy with this sketch.
+The task's `AUTO` discovery identifies config/stream interfaces from firmware
+discovery bytes rather than assuming their COM ordering.

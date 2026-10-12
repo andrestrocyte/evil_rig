@@ -245,3 +245,105 @@ def test_health_reasons_delegates_to_c_backend():
     recorder._c_backend = backend
 
     assert recorder.health_reasons() == ["capture_error: spin error"]
+
+
+@pytest.mark.parametrize("save_fails", [False, True])
+def test_c_capture_copies_mono_pixels_preserves_padding_and_releases_image(tmp_path, save_fails):
+    import ctypes
+    from hf_dm.camera.spinnaker import _SpinnakerCRecorder
+
+    recorder = _SpinnakerCRecorder(
+        tmp_path, serial_number=None, fps=30, exposure_us=10000,
+        pixel_format="Mono8", gain_db=None, gamma=None, acquisition_timeout_ms=100,
+        preview_callback=lambda frame: None, preview_min_interval_s=0,
+    )
+    raw = ctypes.create_string_buffer(bytes([1, 2, 3, 4, 99, 99, 5, 6, 7, 8, 99, 99]))
+    previews, released, timestamps = [], [], []
+    recorder._preview_dispatcher = types.SimpleNamespace(
+        enabled=True, submit=lambda frame: previews.append(frame) or True,
+    )
+    recorder._timestamps = types.SimpleNamespace(write=lambda *args: timestamps.append(args))
+
+    def assign(value):
+        def call(_image, pointer):
+            pointer._obj.value = value
+            return 0
+        return call
+
+    def acquire(_camera, _timeout, pointer):
+        pointer._obj.value = 1
+        recorder._running = False
+        return 0
+
+    def release(_image):
+        released.append(True)
+        ctypes.memset(raw, 0, len(raw))
+        return 0
+
+    recorder._fn = {
+        "spinCameraGetNextImageEx": acquire,
+        "spinImageIsIncomplete": assign(0),
+        "spinImageGetTimeStamp": assign(123456789),
+        "spinImageGetWidth": assign(4),
+        "spinImageGetHeight": assign(2),
+        "spinImageGetStride": assign(6),
+        "spinImageGetData": assign(ctypes.addressof(raw)),
+        "spinImageRelease": release,
+        "spinImageSaveFromExt": lambda *args: pytest.fail("Mono8 must bypass SDK encoder"),
+    }
+    target = tmp_path / "frame_000000000.pgm"
+    if save_fails:
+        target.mkdir()
+    recorder._running = True
+    recorder._capture_loop()
+    assert released == [True]
+    if save_fails:
+        assert recorder.error is not None
+        assert recorder._save_errors == 1
+        assert recorder.frame_count == 0
+        assert not timestamps
+    else:
+        assert recorder.error is None
+        assert recorder.frame_count == 1
+        assert target.read_bytes() == b"P5\n4 2\n255\n" + bytes(range(1, 9))
+        assert timestamps == [(0, 123456789, target.name)]
+        assert previews[0]["data"] == bytes(range(1, 9))
+        assert previews[0]["acquired_mono_s"] <= previews[0]["monotonic_s"]
+
+
+def test_c_mono_fast_path_retains_sdk_fallback_for_other_pixel_formats(tmp_path):
+    from hf_dm.camera.spinnaker import _SpinnakerCRecorder
+    recorder = _SpinnakerCRecorder(
+        tmp_path, serial_number=None, fps=30, exposure_us=10000,
+        pixel_format="Mono16", gain_db=None, gamma=None, acquisition_timeout_ms=100,
+    )
+    assert recorder._read_mono_image(None) is None
+
+
+def test_c_camera_configuration_unlocks_trigger_nodes_before_required_writes():
+    from hf_dm.camera.spinnaker import _SpinnakerCRecorder
+    recorder = object.__new__(_SpinnakerCRecorder)
+    recorder._camera = None
+    recorder._exposure_us = 10000
+    recorder._pixel_format = "Mono8"
+    recorder._gain_db = recorder._gamma = None
+    recorder._check = lambda *args: None
+    recorder._apply_roi = lambda *args: None
+    recorder._set_bool = recorder._set_float = lambda *args, **kwargs: None
+    mode = "TriggerWidth"
+    commands = []
+
+    def set_enum(_map, name, value, **kwargs):
+        nonlocal mode
+        if name in {"TriggerMode", "ExposureAuto"} and mode == "TriggerWidth":
+            raise RuntimeError("Node unavailable in TriggerWidth mode")
+        commands.append((name, value))
+        if name == "ExposureMode":
+            mode = value
+
+    recorder._set_enum = set_enum
+    recorder._configure_camera()
+    assert mode == "TriggerWidth"
+    assert commands.index(("ExposureMode", "Timed")) < commands.index(("TriggerMode", "Off"))
+    assert commands.index(("TriggerSource", "Line0")) < commands.index(("TriggerMode", "On"))
+    assert commands[-2:] == [("TriggerMode", "On"), ("ExposureMode", "TriggerWidth")]

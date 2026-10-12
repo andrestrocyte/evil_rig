@@ -28,6 +28,9 @@ reward:
   opposite_pump_s: 0.04
 
 licks:
+  source: capacitive
+  bpod_port: 1
+  optical_clock: streamdio
   channels: [14]
   high_only: true
   power_output_channel: 13
@@ -51,6 +54,7 @@ display:
   choice_distance_deg: 35.0
   choice_center_threshold_deg: 1.0
   rotated_choice_axis: true
+  invert_wheel_movement: true
   display_index: 1
   auto_size_to_display: true
   window_x:

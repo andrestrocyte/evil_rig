@@ -69,6 +69,7 @@ from hf_dm.session.runners import (
     BpodDecisionTrialRunner,
     CenteringTrialRunner,
 )
+from hf_dm.session.optical_licks import BpodLickReader, BpodLickForwarder
 from hf_dm.valve_calibration import (
     RewardCalibration,
     resolve_reward_calibration_path,
@@ -127,7 +128,9 @@ class HFDecisionSession:
         self._last_wheel_movement_mono = time.perf_counter()
         self._consecutive_failures = 0
         self._lick_lock = threading.Lock()
-        self._lick_events: list[dict[str, float | int]] = []
+        self._lick_events: list[dict[str, Any]] = []
+        self._bpod_lick_reader: BpodLickReader | None = None
+        self._bpod_lick_forwarder: BpodLickForwarder | None = None
         self._frame2ttl_lock = threading.Lock()
         self._frame2ttl_events: list[dict[str, float | int]] = []
         self._closed = False
@@ -222,6 +225,15 @@ class HFDecisionSession:
         self.bpod = connect_bpod_core(None if ports.bpod_port == "AUTO" else ports.bpod_port)
         self.bpod.reset_session_clock()
         self.bpod.set_softcode_handler(self._handle_bpod_softcode)
+        if self.config.licks.source == "optical":
+            port_name = f"Port{self.config.licks.bpod_port}"
+            if port_name not in self.bpod.inputs:
+                raise ValueError(f"Bpod does not have behavior input {port_name}")
+            if not self.bpod.inputs[port_name].enable(True):
+                raise RuntimeError(f"Could not enable Bpod behavior input {port_name}")
+            self._bpod_lick_reader = BpodLickReader(
+                self.bpod, self.config.licks.bpod_port, self._handle_bpod_lick_edge
+            )
 
         self.dio = StreamDIOClient(
             config_port=ports.dio_config_port,
@@ -238,7 +250,7 @@ class HFDecisionSession:
             speaker_sample_interval_us=self.config.speaker.sample_interval_us,
         )
         self.dio.configure_rotary_and_force(
-            lick_channels=self.config.licks.channels,
+            lick_channels=self.config.licks.streamdio_channels,
             extra_input_channels=self._frame2ttl_input_channels(),
         )
         self.display = TaskDisplay(self.config.display, self.config.frame2ttl)
@@ -265,7 +277,9 @@ class HFDecisionSession:
                 "stream_port": self.dio.stream_port,
                 "module_info": self._streamdio_module_info(),
                 "force_channel": FORCE_ANALOG_CHANNEL,
-                "lick_channels": list(self.config.licks.channels),
+                "lick_channels": list(self.config.licks.streamdio_channels),
+                "lick_source": self.config.licks.source,
+                "lick_clock": self.config.licks.clock,
                 "frame2ttl_channels": self._frame2ttl_input_channels(),
                 "timing_heartbeat": {
                     "event_type": TIMING_HEARTBEAT_EVENT_TYPE,
@@ -311,6 +325,11 @@ class HFDecisionSession:
             serial_channel_index=max(0, ports.bpod_serial_channel - 1),
             speaker_gate_active_high=self.config.speaker.gate_active_high,
         )
+        if self.config.licks.source == "optical" and self.config.licks.optical_clock == "streamdio":
+            self._bpod_lick_forwarder = BpodLickForwarder(
+                self.speaker_relay.send_input_marker,
+                timeout_s=self.config.timing.output_verification_timeout_s,
+            )
         self.speaker_relay.speaker_gate(False)
         self.white_noise_player = WhiteNoisePlayer(
             frequency_hz=self.config.speaker.frequency_hz,
@@ -322,7 +341,7 @@ class HFDecisionSession:
         self.recorder.log_event(
             "white_noise_ready",
             {
-                "source": "pc_soundcard_continuous_bpod_pin27_gate",
+                "source": "pc_soundcard_continuous_bpod_pin26_gate",
                 "started": sound_started,
                 "required": self.config.speaker.required,
                 "gate_active_high": self.config.speaker.gate_active_high,
@@ -334,12 +353,13 @@ class HFDecisionSession:
                 "Required continuous white noise could not start; refusing to run "
                 "without audible timeout punishment."
             )
-        cap_touch_power = self.relay.cap_touch_power(True)
+        cap_touch_enabled = self.config.licks.source == "capacitive"
+        cap_touch_power = self.relay.cap_touch_power(cap_touch_enabled)
         self._publish_monitor(
             "cap_touch_power",
             {
-                "active": True,
-                "state": 1,
+                "active": cap_touch_enabled,
+                "state": int(cap_touch_enabled),
                 "channel": self.config.licks.power_output_channel,
                 "pin": (
                     CAP_TOUCH_POWER_PIN
@@ -351,7 +371,7 @@ class HFDecisionSession:
             },
         )
         self.recorder.log_event(
-            "cap_touch_power_on",
+            "cap_touch_power_on" if cap_touch_enabled else "cap_touch_power_off",
             {
                 "output_channel": self.config.licks.power_output_channel,
                 "input_channels": list(self.config.licks.channels),
@@ -386,11 +406,13 @@ class HFDecisionSession:
                 "streamdio_module_info": self._streamdio_module_info(),
                 "camera_hz": self.config.camera.frequency_hz,
                 "camera_backend": self.config.camera.backend,
-                "lick_channels": list(self.config.licks.channels),
+                "lick_channels": list(self.config.licks.active_channels),
+                "lick_source": self.config.licks.source,
+                "lick_clock": self.config.licks.clock,
                 "frame2ttl": self._frame2ttl_descriptor(),
                 "cap_touch_power_output_channel": self.config.licks.power_output_channel,
                 "output_control": "bpod_fsm_serial_with_async_streamdio_observation",
-                "speaker_control": "bpod_fsm_serial_pin27_gate_plus_pc_white_noise",
+                "speaker_control": "bpod_fsm_serial_pin26_gate_plus_pc_white_noise",
             },
         )
 
@@ -609,6 +631,8 @@ class HFDecisionSession:
             logger.exception("Failed to record cleanup event %s", event_type)
 
     def _check_recorder_health(self) -> None:
+        if self._bpod_lick_reader is not None:
+            self._bpod_lick_reader.poll()
         if self.recorder is not None:
             self.recorder.raise_if_background_error()
         if (
@@ -650,13 +674,15 @@ class HFDecisionSession:
 
     def _show_black_with_recorder_health(self, duration_s: float) -> None:
         """Keep the display responsive while promptly surfacing durability faults."""
-        assert self.display is not None
         deadline = time.perf_counter() + max(0.0, float(duration_s))
         while True:
             remaining_s = deadline - time.perf_counter()
             if remaining_s <= 0.0:
                 break
-            self.display.show_black(min(0.25, remaining_s))
+            if self.display is not None:
+                self.display.show_black(min(0.25, remaining_s))
+            else:
+                time.sleep(min(0.25, remaining_s))
             self._check_recorder_health()
 
     def _bpod_serial_ports(self) -> set[str]:
@@ -915,7 +941,9 @@ class HFDecisionSession:
                 "camera_hz": self.config.camera.frequency_hz,
                 "camera_backend": self.config.camera.backend,
                 "force_channel": self.config.wheel.force_channel,
-                "lick_channels": list(self.config.licks.channels),
+                "lick_channels": list(self.config.licks.active_channels),
+                "lick_source": self.config.licks.source,
+                "lick_clock": self.config.licks.clock,
                 "lick_high_only": self.config.licks.high_only,
                 "lick_inputs": self._lick_input_descriptors(),
                 "frame2ttl": self._frame2ttl_descriptor(),
@@ -986,6 +1014,8 @@ class HFDecisionSession:
         )
 
     def _configure_cap_touch_digitizer_from_config(self) -> None:
+        if self.config.licks.source != "capacitive":
+            return
         if self.dio is None:
             return
         licks = self.config.licks
@@ -1027,7 +1057,7 @@ class HFDecisionSession:
         ):
             return
 
-        cap_touch_enabled = CAP_TOUCH_INPUT_CHANNEL in {
+        cap_touch_enabled = self.config.licks.source == "capacitive" and CAP_TOUCH_INPUT_CHANNEL in {
             int(channel) for channel in self.config.licks.channels
         }
         cap_touch_hz = min(20.0, max(1.0, float(self.config.monitor.force_sample_hz)))
@@ -1196,6 +1226,15 @@ class HFDecisionSession:
             self.monitor.publish_throttled(key, max_hz, event_type, payload or {})
 
     def _lick_input_descriptors(self) -> list[dict]:
+        if self.config.licks.source == "optical":
+            return [{
+                "channel": self.config.licks.bpod_port,
+                "pin": None,
+                "label": f"Bpod Port{self.config.licks.bpod_port} (optical)",
+                "source": "bpod_optical",
+                "digital_events_enabled": True,
+                "analog_capable": False,
+            }]
         descriptors: list[dict] = []
         for channel in self.config.licks.channels:
             channel_i = int(channel)
@@ -1467,6 +1506,11 @@ class HFDecisionSession:
         normalized_value = -1 if value is None else int(value)
         if event_type == TIMING_HEARTBEAT_EVENT_TYPE:
             self._last_streamdio_heartbeat_mono_s = event_host_mono_s
+        if event_type == "port_input" and self._bpod_lick_forwarder is not None:
+            self._bpod_lick_forwarder.accept_receipt(
+                normalized_channel, normalized_value, int(timestamp_us),
+                float(relative_time), event_host_mono_s,
+            )
         if event_type == TIMING_HEARTBEAT_EVENT_TYPE and self.recorder is not None:
             payload = {
                 "module_timestamp_us": int(timestamp_us),
@@ -1538,7 +1582,7 @@ class HFDecisionSession:
             timestamp_us,
             relative_time,
         )
-        if event_type == "analog_input" and normalized_channel in self.config.licks.channels:
+        if event_type == "analog_input" and self.config.licks.source == "capacitive" and normalized_channel in self.config.licks.streamdio_channels:
             self._publish_monitor_throttled(
                 f"cap_touch_sample_{normalized_channel}",
                 min(30.0, max(1.0, float(self.config.monitor.force_sample_hz))),
@@ -1605,15 +1649,30 @@ class HFDecisionSession:
             )
         if event_type != "dio_input":
             return
-        if normalized_channel not in self.config.licks.channels:
+        if normalized_channel not in self.config.licks.streamdio_channels:
             return
-        counted = not self.config.licks.high_only or bool(normalized_value)
         base_event = {
             "channel": normalized_channel,
             "pin": CAP_TOUCH_INPUT_PIN if normalized_channel == CAP_TOUCH_INPUT_CHANNEL else None,
             "value": normalized_value,
             "timestamp_us": int(timestamp_us),
             "relative_time_s": float(relative_time),
+            "source": "streamdio_capacitive",
+            "clock": "streamdio",
+        }
+        self._record_lick_edge(base_event)
+
+    def _handle_bpod_lick_edge(self, event: dict[str, Any]) -> None:
+        if self.config.licks.optical_clock == "streamdio" and self._bpod_lick_forwarder is None:
+            raise RuntimeError("StreamDIO lick clock selected before optical relay was ready")
+        if self._bpod_lick_forwarder is not None:
+            event = self._bpod_lick_forwarder.forward(event)
+        self._record_lick_edge(event)
+
+    def _record_lick_edge(self, event: dict[str, Any]) -> None:
+        counted = not self.config.licks.high_only or bool(event["value"])
+        base_event = {
+            **event,
             "wall_time_s": time.time(),
             "monotonic_s": time.perf_counter(),
         }
@@ -1793,7 +1852,7 @@ class HFDecisionSession:
         with self._lick_lock:
             return len(self._lick_events)
 
-    def _lick_events_since(self, start_index: int) -> list[dict[str, float | int]]:
+    def _lick_events_since(self, start_index: int) -> list[dict[str, Any]]:
         with self._lick_lock:
             return list(self._lick_events[start_index:])
 
@@ -1818,7 +1877,7 @@ class HFDecisionSession:
             {"active": False, "duration_s": float(duration_s), "source": "host_pulse"},
         )
         return {
-            "source": "pc_soundcard_continuous_bpod_pin27_gate",
+            "source": "pc_soundcard_continuous_bpod_pin26_gate",
             "command_start_mono_s": started,
             "gate_on_mono_s": on_done,
             "gate_off_mono_s": off_done,
@@ -2005,6 +2064,9 @@ class HFDecisionSession:
         duration_s = max(0.0, float(duration_s))
         start_camera_count = len(self.dio.get_camera_events())
         start_lick_count = self._lick_event_count()
+        start_optical_edges = (
+            self._bpod_lick_reader.edge_count if self._bpod_lick_reader is not None else 0
+        )
         start_streamdio_count = len(self.recorder.streamdio_events)
         start_snap = self.wheel.snapshot()
         self.recorder.log_event(
@@ -2019,7 +2081,7 @@ class HFDecisionSession:
         end_reason = "preflight"
         try:
             if duration_s > 0.0:
-                self._show_black_with_recorder_health(duration_s)
+                self._observe_licks_during_black(duration_s)
             end_snap = self.wheel.snapshot()
             end_camera_count = len(self.dio.get_camera_events())
             end_lick_count = self._lick_event_count()
@@ -2051,8 +2113,13 @@ class HFDecisionSession:
                         self.config.wheel.direction_channel,
                         0,
                     ),
+                    "lick_source": self.config.licks.source,
+                    "lick_clock": self.config.licks.clock,
                     "lick_input_edges_seen": sum(
-                        digital_counts.get(channel, 0) for channel in self.config.licks.channels
+                        digital_counts.get(channel, 0)
+                        for channel in self.config.licks.streamdio_channels
+                    ) if self._bpod_lick_reader is None else (
+                        self._bpod_lick_reader.edge_count - start_optical_edges
                     ),
                     "frame2ttl_input_edges_seen": digital_counts.get(
                         int(self.config.frame2ttl.input_channel),
@@ -2639,6 +2706,8 @@ class HFDecisionSession:
         softcode_thread = getattr(self.bpod, "_softcode_thread", None)
         if softcode_thread is not None and hasattr(softcode_thread, "drain"):
             softcode_thread.drain()
+        if self._bpod_lick_reader is not None:
+            self._bpod_lick_reader.poll()
 
     def _start_output_verifier(self) -> None:
         if self._output_verifier is None:
@@ -3057,7 +3126,7 @@ class HFDecisionSession:
                     {
                         "trial_index": runtime.trial_index,
                         "duration_s": self.config.timing.timeout_noise_s,
-                        "source": "bpod_serial_pin27_gate",
+                        "source": "bpod_serial_pin26_gate",
                         "trigger": "bpod_state_entry",
                         "sound_status": self._sound_status(),
                     },
@@ -3080,7 +3149,7 @@ class HFDecisionSession:
                     {
                         "trial_index": runtime.trial_index,
                         "duration_s": self.config.timing.timeout_noise_s,
-                        "source": "bpod_serial_pin27_gate",
+                        "source": "bpod_serial_pin26_gate",
                         "trigger": "bpod_state_entry",
                         "sound_status": self._sound_status(),
                     },
@@ -3149,8 +3218,9 @@ class HFDecisionSession:
     def _opposite_side(side: Side) -> Side:
         return "right" if side == "left" else "left"
 
-    @staticmethod
-    def _wheel_direction_for_side(side: Side) -> Direction:
+    def _wheel_direction_for_side(self, side: Side) -> Direction:
+        if self.config.display.invert_wheel_movement:
+            return "ccw" if side == "left" else "cw"
         return "cw" if side == "left" else "ccw"
 
     @staticmethod
@@ -3226,7 +3296,8 @@ class HFDecisionSession:
 
     def _decision_positions(self, net_position_deg: float) -> tuple[float, float]:
         distance = self.config.display.choice_distance_deg
-        bounded = max(-distance, min(distance, float(net_position_deg)))
+        screen_position_deg = self.config.display.wheel_to_screen_deg(float(net_position_deg))
+        bounded = max(-distance, min(distance, screen_position_deg))
         left_position = -distance + max(0.0, bounded)
         right_position = distance + min(0.0, bounded)
         return left_position, right_position
@@ -3529,11 +3600,25 @@ class HFDecisionSession:
         assert self.recorder is not None
         duration_s = self.config.timing.inter_trial_min_s
         self.recorder.log_event("iti_start", {"duration_s": duration_s})
-        if self.display is not None:
-            self.display.show_black(duration_s)
-        else:
-            time.sleep(duration_s)
+        self._observe_licks_during_black(duration_s)
         self.recorder.log_event("iti_end", {"duration_s": duration_s})
+
+    def _observe_licks_during_black(self, duration_s: float) -> None:
+        """Keep Bpod's input event acquisition active during optical ITIs/preflight."""
+        if self._bpod_lick_reader is None or duration_s <= 0:
+            self._show_black_with_recorder_health(duration_s)
+            return
+        assert self.bpod is not None and self.recorder is not None
+        fsm = StateMachine(name="OpticalLickObservation")
+        fsm.add_state(
+            name="Observe", timer=duration_s, transitions={"Tup": ">exit"}, actions={}
+        )
+        self._prepare_bpod_run(0)
+        self.bpod.run(fsm, trial_number=0)
+        while self.bpod.is_running:
+            self._show_black_with_recorder_health(0.02)
+        self._wait_for_bpod_trial_threads()
+        self.recorder.log_bpod_trial(0, self.bpod.get_data(concat=False))
 
     def _run_dm_trial_legacy(self, trial_index: int) -> bool:
         assert (

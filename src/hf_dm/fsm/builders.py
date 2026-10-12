@@ -262,7 +262,7 @@ def build_host_supervised_decision_fsm(
             sc.STATE_TIMEOUT_ON,
             speaker_relay.act(speaker_relay.ids.speaker_gate_on),
         ),
-        comment="Bpod directly gates the already-playing PC white noise on pin 27.",
+        comment="Bpod directly gates the already-playing PC white noise on pin 26.",
     )
     _add_state_marker(
         fsm,

@@ -11,6 +11,7 @@ from hf_dm.hardware.bringup_constants import (
     FORCE_ANALOG_CHANNEL,
     FORCE_ANALOG_PIN,
     LICK_INPUT_CHANNEL,
+    SPEAKER_GATE_PIN,
     STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE,
 )
 from hf_dm.streamdio.client import StreamDIOClient
@@ -116,7 +117,7 @@ class FakeProtocol:
             self.speaker_samples += 10
         return {
             "enabled": self.speaker_enabled,
-            "pin": 27,
+            "pin": SPEAKER_GATE_PIN,
             "sample_interval_us": 100,
             "samples_generated": self.speaker_samples,
             "current_state": 0,
@@ -365,6 +366,7 @@ def test_cap_touch_status_reads_digitizer_fields():
 
 def test_module_status_collects_driver_status_snapshots():
     client = _client()
+    client.raw.module_info["speaker_pin"] = 27  # Driver's legacy default.
 
     status = client.get_module_status()
 
@@ -373,7 +375,8 @@ def test_module_status_collects_driver_status_snapshots():
     assert status["streaming_active"]
     assert status["module_info"]["firmware_version"] == 5
     assert status["analog_input_status"]["channel"] == FORCE_ANALOG_CHANNEL
-    assert status["speaker_status"]["pin"] == 27
+    assert status["speaker_status"]["pin"] == SPEAKER_GATE_PIN
+    assert status["module_info"]["speaker_pin"] == SPEAKER_GATE_PIN
 
 
 def test_cap_touch_threshold_configuration_sends_runtime_firmware_command():

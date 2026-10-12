@@ -324,7 +324,7 @@ class HardwareSelfTestSession(HFDecisionSession):
         noise_start_events = [event for event in events if event.event_type == "white_noise_start"]
         noise_end_events = [event for event in events if event.event_type == "white_noise_end"]
         if not noise_start_events or len(noise_start_events) != len(noise_end_events):
-            fail("white_noise_gate", "Bpod pin-27 timeout gate did not complete")
+            fail("white_noise_gate", "StreamDIO pin-26 timeout gate did not complete")
 
         video_events = [event for event in events if event.event_type == "video_recording_stopped"]
         video_frames = sum(int(event.payload.get("frames_saved", 0)) for event in video_events)
@@ -413,7 +413,7 @@ class HardwareSelfTestSession(HFDecisionSession):
             (
                 "white_noise_gate",
                 f"completed white-noise gate pulses={len(noise_end_events)}",
-                "Check Bpod pin 27 and the continuous sound source.",
+                "Check StreamDIO Teensy pin 26 and the continuous sound source.",
             ),
             (
                 "spinnaker_recording",

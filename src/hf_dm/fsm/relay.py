@@ -128,11 +128,14 @@ class SerialRelay:
 
     def send_bytes(self, byte_values: list[int], inter_byte_s: float = 0.002) -> None:
         """Send raw bytes to the selected Bpod module port immediately."""
+        payload = bytes(byte_values)
         self.module.set_relay(False)
-        output_name = f"Serial{self._serial_channel_index + 1}"
-        output = self.bpod.outputs[output_name]
-        for value in byte_values:
-            output.override(int(value))
+        # Firmware 'T' takes a one-based module port, payload length, and bytes.
+        # Output.override uses 'O', which only controls physical outputs and
+        # silently does nothing for a serial module channel.
+        port = int(self.module.index) + 1
+        for value in payload:
+            self.bpod.serial0.write(bytes((ord("T"), port, 1, value)))
             time.sleep(inter_byte_s)
 
     def prepare_bpod_run(self) -> int:
@@ -142,6 +145,21 @@ class SerialRelay:
         pending = max(0, int(getattr(serial, "in_waiting", 0) or 0))
         serial.reset_input_buffer()
         return pending
+
+    def send_input_marker(self, port: int, state: int) -> None:
+        """Forward one behavior-port edge to StreamDIO without changing the FSM.
+
+        The existing StreamDIO ['I', 'P', port, state] command emits a timestamped
+        port_input event. Send the whole packet in one write; do not issue an
+        acknowledgement-producing command while the FSM USB reader is active.
+        """
+        if not 1 <= port <= 5 or state not in (0, 1):
+            raise ValueError("Optical marker needs behavior port 1..5 and state 0/1")
+        payload = bytes((ord("I"), ord("P"), port, state))
+        packet = bytes((ord("T"), int(self.module.index) + 1, len(payload))) + payload
+        written = self.bpod.serial0.write(packet)
+        if written is not None and written != len(packet):
+            raise RuntimeError("Incomplete Bpod optical-marker USB write")
 
     def set_channel_state(self, channel: int, state: bool) -> None:
         self.send_bytes([int(channel), 1 if state else 0])

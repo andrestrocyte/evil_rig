@@ -23,14 +23,15 @@ from hf_dm.hardware.bringup_constants import (
     CCW_FORCE_OUTPUT_CHANNEL,
     CW_FORCE_OUTPUT_CHANNEL,
     FRAME2TTL_INPUT_CHANNEL,
-    LICK_INPUT_CHANNEL,
     PUMP_OUTPUT_CHANNEL,
+    SPEAKER_GATE_PIN,
     STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID,
     STREAMDIO_STATE_MARKER_MESSAGE_IDS,
     STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE,
     STREAMDIO_TIMING_HEARTBEAT_PERIOD_US,
 )
 from hf_dm.session.controller import HFDecisionSession
+from hf_dm.session.optical_licks import BpodLickForwarder
 from hf_dm.session.runners.simulated_bpod import SimulatedBpod
 from hf_dm.streamdio.wheel import Direction, WheelKinematics, _percentile
 from hf_dm.timing_heartbeat import TIMING_HEARTBEAT_EVENT_TYPE
@@ -183,7 +184,7 @@ class SimulatedRelay:
             "command_end_mono_s": now,
             "status": {
                 "enabled": bool(enabled),
-                "pin": 27,
+                "pin": SPEAKER_GATE_PIN,
                 "sample_interval_us": 100,
                 "samples_generated": 1 if enabled else 0,
                 "current_state": 0,
@@ -540,6 +541,8 @@ class SimulatedHFDecisionSession(HFDecisionSession):
         self.relay = SimulatedRelay()
         self.speaker_relay = SimulatedSpeakerRelay()
         self.dio = SimulatedDIO()
+        if self.config.licks.source == "optical" and self.config.licks.optical_clock == "streamdio":
+            self._bpod_lick_forwarder = BpodLickForwarder(self._emit_simulated_optical_marker)
         self.display = TaskDisplay(self.config.display, self.config.frame2ttl)
         out, base_name = resolve_session_output(
             Path(self.config.results_dir),
@@ -561,7 +564,9 @@ class SimulatedHFDecisionSession(HFDecisionSession):
             {
                 "type": "streamdio_sim",
                 "force_channel": self.config.wheel.force_channel,
-                "lick_channels": list(self.config.licks.channels),
+                "lick_channels": list(self.config.licks.streamdio_channels),
+                "lick_source": self.config.licks.source,
+                "lick_clock": self.config.licks.clock,
                 "frame2ttl_channels": self._frame2ttl_input_channels(),
                 "timing_heartbeat": {
                     "event_type": TIMING_HEARTBEAT_EVENT_TYPE,
@@ -609,18 +614,19 @@ class SimulatedHFDecisionSession(HFDecisionSession):
         self.recorder.log_event(
             "white_noise_ready",
             {
-                "source": "simulated_bpod_pin27_gate",
+                "source": "simulated_bpod_pin26_gate",
                 "started": True,
                 "required": self.config.speaker.required,
                 "simulated": True,
             },
         )
-        cap_touch_transition = self.relay.cap_touch_power(True)
+        cap_touch_enabled = self.config.licks.source == "capacitive"
+        cap_touch_transition = self.relay.cap_touch_power(cap_touch_enabled)
         self._publish_monitor(
             "cap_touch_power",
             {
-                "active": True,
-                "state": 1,
+                "active": cap_touch_enabled,
+                "state": int(cap_touch_enabled),
                 "channel": self.config.licks.power_output_channel,
                 "pin": (
                     CAP_TOUCH_POWER_PIN
@@ -632,7 +638,7 @@ class SimulatedHFDecisionSession(HFDecisionSession):
             },
         )
         self.recorder.log_event(
-            "cap_touch_power_on",
+            "cap_touch_power_on" if cap_touch_enabled else "cap_touch_power_off",
             {
                 "output_channel": self.config.licks.power_output_channel,
                 "input_channels": list(self.config.licks.channels),
@@ -660,7 +666,9 @@ class SimulatedHFDecisionSession(HFDecisionSession):
                 "dio_stream": self.dio.stream_port,
                 "camera_hz": self.config.camera.frequency_hz,
                 "camera_backend": "spinnaker_sim",
-                "lick_channels": list(self.config.licks.channels),
+                "lick_channels": list(self.config.licks.active_channels),
+                "lick_source": self.config.licks.source,
+                "lick_clock": self.config.licks.clock,
                 "frame2ttl": self._frame2ttl_descriptor(),
                 "simulated": True,
             },
@@ -746,19 +754,36 @@ class SimulatedHFDecisionSession(HFDecisionSession):
             if start is None:
                 runtime.fail(RuntimeError("Missing simulated centering start position"))
                 return
-            movement = "cw" if start < 0.0 else "ccw"
+            movement = runtime.choice_target_direction
             self.wheel.plan_choice(movement, abs(start))
             return
         planned = runtime.simulated_choice  # type: ignore[attr-defined]
         self.wheel.plan_choice(planned, self.config.display.choice_distance_deg)
         if self.options.emit_licks:
+            if self.config.licks.source == "optical":
+                self._handle_bpod_lick_edge({
+                    "channel": self.config.licks.bpod_port,
+                    "pin": None,
+                    "value": 1,
+                    "timestamp_us": int(time.perf_counter() * 1_000_000),
+                    "relative_time_s": time.perf_counter(),
+                    "source": "bpod_optical",
+                    "clock": "simulated",
+                })
+                return
             self._handle_streamdio_event(
                 "dio_input",
-                LICK_INPUT_CHANNEL,
+                self.config.licks.streamdio_channels[0],
                 1,
                 int((time.perf_counter() % 10_000) * 1_000_000),
                 time.perf_counter(),
             )
+
+    def _emit_simulated_optical_marker(self, port: int, state: int) -> None:
+        relative_s = max(0.0, time.perf_counter() - self.dio._stream_start_mono)
+        self._handle_streamdio_event(
+            "port_input", port, state, int(relative_s * 1_000_000), relative_s,
+        )
 
     def _prepare_centering_trial(self, start_position_deg: float) -> None:
         del start_position_deg

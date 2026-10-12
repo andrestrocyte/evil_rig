@@ -41,6 +41,7 @@ class DisplayConfig:
     choice_distance_deg: float = 35.0
     choice_center_threshold_deg: float = 1.0
     rotated_choice_axis: bool = True
+    invert_wheel_movement: bool = False
     display_index: int | None = 1
     auto_size_to_display: bool = True
     window_x: int | None = None
@@ -63,6 +64,10 @@ class DisplayConfig:
     @property
     def axis(self) -> str:
         return "vertical" if self.rotated_choice_axis else "horizontal"
+
+    def wheel_to_screen_deg(self, wheel_deg: float) -> float:
+        """Map physical wheel displacement to screen displacement."""
+        return -wheel_deg if self.invert_wheel_movement else wheel_deg
 
 
 @dataclass
@@ -120,6 +125,9 @@ class TaskDesignConfig:
 
 @dataclass
 class LickConfig:
+    source: str = "capacitive"
+    bpod_port: int = 1
+    optical_clock: str = "bpod"
     channels: tuple[int, ...] = (LICK_INPUT_CHANNEL,)
     high_only: bool = True
     power_output_channel: int = CAP_TOUCH_POWER_OUTPUT_CHANNEL
@@ -127,6 +135,20 @@ class LickConfig:
     cap_touch_min_high_threshold: int | None = None
     cap_touch_delta_high: int | None = None
     cap_touch_delta_low: int | None = None
+
+    @property
+    def streamdio_channels(self) -> tuple[int, ...]:
+        return self.channels if self.source == "capacitive" else ()
+
+    @property
+    def active_channels(self) -> tuple[int, ...]:
+        if self.source == "optical":
+            return (self.bpod_port,)
+        return self.streamdio_channels
+
+    @property
+    def clock(self) -> str:
+        return self.optical_clock if self.source == "optical" else "streamdio"
 
 
 @dataclass
@@ -382,6 +404,7 @@ class SessionConfig:
                     display_raw.get("choice_center_threshold_deg", 1.0)
                 ),
                 rotated_choice_axis=bool(display_raw.get("rotated_choice_axis", True)),
+                invert_wheel_movement=bool(display_raw.get("invert_wheel_movement", False)),
                 display_index=(
                     int(display_raw["display_index"])
                     if display_raw.get("display_index") not in (None, "")
@@ -495,6 +518,9 @@ class SessionConfig:
                 ),
             ),
             licks=LickConfig(
+                source=str(lick_raw.get("source", "capacitive")),
+                bpod_port=int(lick_raw.get("bpod_port", 1)),
+                optical_clock=str(lick_raw.get("optical_clock", "bpod")),
                 channels=channels(
                     "channels",
                     channels("digital_channels", (LICK_INPUT_CHANNEL,)),
@@ -1138,6 +1164,9 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
         task.delay_star_extra_s,
     )
 
+    require(config.licks.source in {"capacitive", "optical"}, "licks.source", "must be capacitive or optical", config.licks.source)
+    require(1 <= config.licks.bpod_port <= 5, "licks.bpod_port", "must be between 1 and 5", config.licks.bpod_port)
+    require(config.licks.optical_clock in {"bpod", "streamdio"}, "licks.optical_clock", "must be bpod or streamdio", config.licks.optical_clock)
     lick_channels = tuple(config.licks.channels)
     require(
         lick_channels == (LICK_INPUT_CHANNEL,),
@@ -1161,7 +1190,7 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
     digital_inputs: list[tuple[str, int]] = [
         ("wheel.pulse_channel", wheel.pulse_channel),
         ("wheel.direction_channel", wheel.direction_channel),
-        *((f"licks.channels[{i}]", ch) for i, ch in enumerate(lick_channels)),
+        *((f"licks.channels[{i}]", ch) for i, ch in enumerate(config.licks.streamdio_channels)),
     ]
     if frame2ttl.enabled:
         digital_inputs.append(("frame2ttl.input_channel", frame2ttl.input_channel))

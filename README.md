@@ -94,12 +94,12 @@ flowchart TB
         REC["SessionRecorder<br/>NPZ / JSON / journal"]
         CAM["Headless Spinnaker<br/>video recorder"]
         MON["Operator monitor<br/>(separate process)"]
-        SND["PC white noise +<br/>pin-27 gate (timeout)"]
+        SND["PC white noise +<br/>pin-26 gate (timeout)"]
     end
 
     subgraph BPOD["Bpod State Machine"]
         FSM["Trial FSM<br/>quiescence / choice / reward / timeout"]
-        GATE["Serial action<br/>pin-27 speaker gate"]
+        GATE["Serial action<br/>pin-26 speaker gate"]
     end
 
     subgraph SDIO["StreamDIO module"]
@@ -155,7 +155,7 @@ stateDiagram-v2
     RewardLow --> PostRewardLow: Tup (pump on)
     PostRewardHigh --> [*]: Tup (post_reward_s)
     PostRewardLow --> [*]: Tup (post_reward_s)
-    TimeoutNoise --> PostTimeout: Tup (white noise on pin 27)
+    TimeoutNoise --> PostTimeout: Tup (white noise on pin 26)
     PostTimeout --> [*]: Tup (noise off)
 ```
 
@@ -167,7 +167,7 @@ stateDiagram-v2
    timeout.
 3. **Choice:** when a shape is centered, Python sends one high/low SoftCode. Bpod enters the blank
    state, turns force off, waits `choice_blank_s`, runs the pump state, then holds `post_reward_s`.
-4. **Timeout:** Bpod enters the timeout state, gates audible white noise on pin 27 for
+4. **Timeout:** Bpod enters the timeout state, gates audible white noise on pin 26 for
    `timeout_noise_s`, then holds `post_timeout_s`.
 5. After the FSM completes, the host holds a black screen for `inter_trial_min_s` (default 3 s,
    logged as `iti_start`/`iti_end`), then a fresh FSM starts the next trial.
@@ -184,6 +184,11 @@ events asynchronously and does not re-actuate during normal trials.
 
 ## Hardware contract
 
+The rig configs set `display.invert_wheel_movement: true` to reverse wheel-driven
+screen movement. This setting preserves CW force on pin 21 and CCW force on pin 19,
+and preserves the encoder's CW/CCW pulse labels. Choice and reward mapping follow
+the shape moved to the center. Set it to `false` for the original screen direction.
+
 All channels/pins match the `MM_PyBpod2` bringup notebooks. **Ports default to `AUTO`** with the
 same discovery logic as the screen task.
 
@@ -198,12 +203,12 @@ same discovery logic as the screen task.
 | Cap-touch power | output ch13 | pin 15 | `cap_touch_bringup_pin15_power_pin14_touch.ipynb` |
 | Lick (cap-touch) | input ch14 | pin 25 | `cap_touch_bringup_pin15_power_pin14_touch.ipynb` |
 | Camera TTL | StreamDIO 30 Hz, 10 ms | pin 32 | `camera_bringup_pin32_ttl.ipynb` |
-| Speaker gate | Bpod Serial1 action | pin 27 | `speaker_bringup_pin27_whitenoise.ipynb` |
+| Speaker gate | Bpod Serial1 action | pin 26 | `speaker_bringup_pin27_whitenoise.ipynb` (original pin 27, remapped in this firmware) |
 | Frame2TTL v3 | DI05 (input ch5) | pin 6 | `frame2ttl_v3_bringup_di05_pin6.ipynb` |
 
 **Notes**
 
-- Cap-touch power is held high for the whole session; lick edges on input ch14 are stored both as
+- When capacitive touch is selected, its power is held high for the whole session; lick edges on input ch14 are stored both as
   raw module-timestamped events and as explicit `lick` session events.
 - The firmware streams **one** analog input at a time, so force stays on AI13 and the vendored
   StreamDIO firmware (`firmware/`) digitizes cap-touch pin 25 locally into channel-14 high/low
@@ -358,7 +363,7 @@ recorded in `session_export.cli_overrides` and the config snapshot.
 ### Session setup dialog
 
 By default, `hf-dm.cli` opens a small Tk dialog to choose the **mouse folder**, **modality**,
-**profile**, **free/forced trial counts**, and **session name** before the task starts. Bundled
+**profile**, **free/forced trial counts**, **lick sensor**, and **session name** before the task starts. Bundled
 profiles:
 
 | Profile | Free | Forced |
@@ -374,6 +379,57 @@ python -m hf_dm.cli --config configs/dm_50.yaml --no-session-dialog \
   --session-mouse-dir data/sessions/mouse01 --session-modality force \
   --session-profile "50 50/50" --session-name 20260629_force_5050
 ```
+
+### Selecting the lick sensor
+
+Both sensors can remain connected. Choose `capacitive` (default) or `optical` in the session
+setup dialog, or pass `--lick-source optical --lick-port 1` with `--no-session-dialog`.
+The selected source supplies the GUI lick indicators, session lick events, and trial counts;
+the other source does not contribute lick counts. The saved config records the selection.
+
+For the Sanworks optical lickometer, connect **Bpod behavior port 1 → RJ45 cable → port
+interface board → photogate**. Keep StreamDIO on Bpod **module port 1**, and leave the
+capacitive signal on StreamDIO pin 25. See the official
+[lickometer assembly](https://sanworks.github.io/Bpod_Wiki/assembly/lickometer-assembly/) and
+[port interface board assembly](https://sanworks.github.io/Bpod_Wiki/assembly/port-breakout-board-assembly/) instructions.
+The lickometer receives power through the port interface board. This task does not operate
+that board's valve or cue LED; reward delivery remains on the StreamDIO pump output.
+
+```yaml
+licks:
+  source: optical       # capacitive or optical
+  bpod_port: 1          # behavior port, not module port
+  optical_clock: streamdio  # bpod: original edges; streamdio: forwarded receipt timestamps
+  channels: [14]        # StreamDIO inputs used only for capacitive touch
+```
+
+Optical `Port1_High` counts a lick and `Port1_Low` clears the indicator (`high_only: true`).
+MATLAB-style `Port1In`/`Port1Out` names are also supported. Both
+edges retain Bpod hardware timestamps in the lick event log, with `source: bpod_optical`
+and `clock: bpod_session`; these timestamps use Bpod's session clock, while capacitive
+events use StreamDIO's clock. An output-free Bpod observation state captures optical
+events during ITIs and preflight. Short host gaps between state machines are not recorded.
+Capacitive power is switched off for optical sessions. No StreamDIO firmware change is needed.
+
+For unchanged wiring and a StreamDIO timestamp, select `streamdio` under **Optical timestamp
+clock** in session setup, or pass `--lick-source optical --lick-clock streamdio --lick-port 1`.
+Bpod records the physical edge; Python forwards one `['I', 'P', port, state]` marker through
+Bpod's existing module UART connection. StreamDIO firmware 5 already timestamps these
+markers as raw `port_input` events. The GUI and trial lick counts use the paired receipt.
+Only one marker is outstanding, and missing/mismatched receipts stop acquisition rather
+than silently substituting a timestamp from another clock. Reward, force and state timers
+continue to run on Bpod without additional lick-related state transitions.
+
+**Timing meaning:** `timestamp_us` is the StreamDIO UART-receipt time, not the original
+photogate edge time. This route includes Bpod-to-PC, host polling, and return USB/UART delay.
+`bpod_timestamp_us`, `bpod_relative_time_s`, and the original raw Bpod row preserve the
+physical edge time. `timestamp_origin: streamdio_uart_receive` and `relay_receipt_wait_s`
+identify receipt timestamps and the send-to-receipt host interval; that interval does not
+measure the entire edge-to-receipt delay. Both clocks are exported in `licks.csv` and the
+journal. Use the original Bpod timestamps for precise lick intervals. A physical split to
+a voltage-converted StreamDIO input would be required for direct same-clock edge capture.
+Shipped YAML files prefer StreamDIO receipts; older configs without `optical_clock` keep
+the working Bpod edge-time path. Capacitive licks remain direct StreamDIO events.
 
 ### Training stages
 
@@ -751,6 +807,7 @@ tests/                      # hardware-free pytest suite
 | bpod-core settings lock held | This task uses `data/runtime/bpod-core`; override with `HF_DM_BPOD_CORE_CONFIG_DIR`. Close the older `hf_dm.cli` process and rerun preflight |
 | StreamDIO `Access is denied` (COM7/COM8) | Another process owns the port — close notebooks/serial monitors/task processes; unplug/replug StreamDIO |
 | Detector LED changes but no licks | Flash the vendored `firmware/`; check cap-touch wiring/power, then thresholds |
+| Camera preview falls seconds behind | Mono8 C-API capture now writes raw PGM directly and previews from memory, bypassing the slow SDK image encoder. The Video age indicator includes acquisition-to-GUI transit. See [rig bringup notes](docs/RIG_BRINGUP_2026_10.md) for measured results |
 | Frame2TTL sees no transitions | Run `--frame2ttl-diagnostic`; confirm the photodiode is over the lower-right patch |
 | No `bpod_state` markers | Run `--bpod-opcode-diagnostic` to verify state markers reach StreamDIO |
 

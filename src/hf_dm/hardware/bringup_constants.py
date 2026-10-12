@@ -50,8 +50,8 @@ PUMP_OUTPUT_CHANNEL = 1        # pin 23
 CW_FORCE_OUTPUT_CHANNEL = 3    # pin 21
 CCW_FORCE_OUTPUT_CHANNEL = 5   # pin 19
 
-# Speaker gate on Teensy pin 27 (speaker_bringup_pin27_whitenoise.ipynb)
-SPEAKER_GATE_PIN = 27
+# Speaker gate moved to Teensy pin 26; the original bringup notebook used pin 27.
+SPEAKER_GATE_PIN = 26
 SPEAKER_GATE_OPCODE = 89         # ord('Y')
 SERIAL_GATE_ON_MESSAGE_ID = 210
 SERIAL_GATE_OFF_MESSAGE_ID = 211

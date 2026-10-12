@@ -720,3 +720,11 @@ def test_frame_age_text_formats_recent_and_stale_frames():
     assert _frame_age_text(None) == "age -"
     assert _frame_age_text(9.75, now=10.0) == "age 250 ms"
     assert _frame_age_text(8.0, now=10.0) == "age 2.0 s"
+
+
+def test_camera_age_includes_time_before_gui_queue_receipt():
+    state = OperatorMonitorState(history_s=10.0, trial_history=3)
+    state.apply({"type": "camera_frame", "payload": {
+        "frame_index": 1, "acquired_mono_s": 123.0, "monotonic_s": 123.2,
+    }})
+    assert state.last_camera_frame_mono_s == 123.0

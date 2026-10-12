@@ -13,6 +13,17 @@ from hf_dm.config import (
 from hf_dm.hardware.bringup_constants import FRAME2TTL_INPUT_CHANNEL, FRAME2TTL_INPUT_PIN
 
 
+def test_screen_motion_inversion_loads_and_is_saved_in_config_snapshot(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("display:\n  invert_wheel_movement: true\n", encoding="utf-8")
+
+    config = SessionConfig.from_yaml(path)
+
+    assert config.display.wheel_to_screen_deg(12.0) == -12.0
+    assert config_to_dict(config)["display"]["invert_wheel_movement"] is True
+    assert SessionConfig().display.wheel_to_screen_deg(12.0) == 12.0
+
+
 def test_lick_cap_touch_thresholds_load_from_yaml():
     with TemporaryDirectory() as tmp:
         path = Path(tmp) / "config.yaml"

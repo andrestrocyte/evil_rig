@@ -554,6 +554,9 @@ class StreamDIOClient:
                     }
                 except Exception as exc:
                     status[f"{name}_error"] = f"{type(exc).__name__}: {exc}"
+        speaker_pin = status.get("speaker_status", {}).get("pin")
+        if speaker_pin is not None:
+            status["module_info"]["speaker_pin"] = speaker_pin
         return status
 
     def configure_cap_touch_digitizer(
