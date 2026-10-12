@@ -15,7 +15,7 @@ from hf_dm.data.recorder import SessionRecorder, _reconcile_streamdio_recovery_r
 from hf_dm.data.session_export import session_bundle_dir
 
 
-def crashed_recording(path, count=20, *, chunk_s=0, layout="flat"):
+def crashed_recording(path, count=20, *, chunk_s=0, layout="flat", durable=True):
     config = SessionConfig(subject_id="recover_test", n_trials=0, results_dir=str(path))
     config.camera.required = False
     config.session_export.layout = layout
@@ -31,7 +31,7 @@ def crashed_recording(path, count=20, *, chunk_s=0, layout="flat"):
     for i in range(count):
         r.log_streamdio_event("analog_input", 13, i % 4096, i * 1000, i / 1000,
                              host_perf_counter_s=100 + i / 1000)
-    r._close_streamdio_wal(durable=True)
+    r._close_streamdio_wal(durable=durable)
     r.close_journal()
     return r
 
@@ -107,7 +107,9 @@ def test_recovery_chunk_write_failure_keeps_sources_and_can_be_retried(tmp_path,
 
 @pytest.mark.parametrize("damage", ["partial", "crc_tail", "crc_middle"])
 def test_recovery_preserves_damaged_tail_bytes_and_refuses_interior_corruption(tmp_path, damage):
-    r = crashed_recording(tmp_path, count=3)
+    # A CRC-damaged last record can be a crash tail only when no checkpoint
+    # already promises it. Synced-record loss is tested in test_raw_checkpoints.
+    r = crashed_recording(tmp_path, count=3, durable=damage != "crc_tail")
     raw = bytearray(r.streamdio_wal_path.read_bytes())
     if damage == "partial":
         raw.extend(b"partial")

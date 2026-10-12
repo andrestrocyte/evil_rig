@@ -809,6 +809,12 @@ the marker, or the journal:
 hf-dm recover-session data/sessions/decision_making/mouse01/2026-06-28/001
 ```
 
+New recordings declare an initial empty raw WAL and journal a raw-event count
+after periodic WAL flushes, completed trials and final close. The default periodic
+interval is one second. Both disk flushes run outside the incoming-sample lock.
+The count is a lower bound on the data that must exist; the checkpoint also records
+whether the WAL filesystem flush succeeded or was unsupported.
+
 Recovery streams the journal and preserves its exact original bytes before repair.
 It repairs only an unfinished final record, including a torn UTF-8 character;
 a complete final row missing just its newline is kept. Malformed newline-terminated
@@ -822,6 +828,15 @@ blocks. Their common prefix must agree; missing chunk indices, corrupt chunks,
 or interior WAL checksum failures stop recovery explicitly. A damaged final WAL
 record can be excluded, with its byte count reported and an exact
 `.wal.recovery-backup` retained and hashed in the manifest.
+
+Before changing the journal or exports, recovery requires enough raw records to
+meet the latest checkpoint. A missing declared WAL with no chunks, a shortened
+stream, or a damaged already-checkpointed record fails explicitly. Complete chunks
+can supply a missing WAL. Recovery reports the verified lower bound; older journals
+without independent count evidence report `raw_checkpoint_verified: false`.
+The checks cannot establish how many uncheckpointed samples were lost after the
+last count was saved, or replace missing records. A prior recovery's saved count
+also remains a lower bound on subsequent retries.
 
 Recovery retains existing chunks and writes any missing suffix synchronously in
 blocks of at most 8,192 events. It does not replay through the live writer queue

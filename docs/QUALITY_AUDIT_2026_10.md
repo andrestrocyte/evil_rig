@@ -7,9 +7,9 @@ session selection, on-demand diagnostics, cooperative Stop and saved results.
 This audit does not establish that every hardware component is calibrated or
 that the system is bug-free.
 
-Local verification: full suite 494 passed. Ruff and type checks for config,
+Local verification: full suite 524 passed. Ruff and type checks for config,
 recorder, session export, raw I/O, journal I/O and array I/O passed. CI checks
-Windows and Linux; the preceding commit passed all 476 tests on both platforms.
+Windows and Linux; the preceding commit passed all 494 tests on both platforms.
 
 ## Repairs
 
@@ -103,6 +103,15 @@ Windows and Linux; the preceding commit passed all 476 tests on both platforms.
   artifacts. Accept copied checkpoints with local evidence, and preserve valid
   older bundles whose WAL was already removed; refuse invalid older bundles with
   no WAL instead of rebuilding from incomplete sources.
+- Declare an empty raw WAL at new-session startup and persist an independent
+  raw-event count after periodic flushes, trial completion and final close.
+  Serialize flush/checkpoint pairs without holding the incoming-sample lock during
+  disk I/O. Before any recovery rewrite, compare WAL/chunk data against the latest
+  count and refuse missing or shortened sources. Complete chunks can supply a
+  missing WAL. Keep compatibility with older journals while reporting absent
+  independent count evidence. Offline validation checks the same lower bound.
+  Record unsupported WAL fsync, propagate checkpoint failures, and retain journal
+  sequence progression after a completed line's fsync fails.
 
 ## Evidence on this PC
 
@@ -140,11 +149,16 @@ Windows and Linux; the preceding commit passed all 476 tests on both platforms.
 | Semantic-array and JSON streaming | Same 50,000-event workload now peaks at 141.7 MiB versus 348.7 MiB; full recovery/validation 8.16 versus 6.48 s; every sample value matches the original hash | Synthetic workload; stronger validation and two-pass string sizing add work. Semantic models, timeline analysis and JSON validation still grow with session size |
 | Live recording with semantic streaming | 465 camera triggers = 465 images; 17,302 raw records and 191 semantic events retained; all 25 artifacts validate; no incomplete/save errors, clean cleanup | Fifteen-second observation; one ordinary acquisition wait timeout, with no missing triggered frame |
 | Interrupted recovery cleanup | Before: marker deletion failure followed by retry changed one recovered raw row to zero and still validated. After: retry retains the row and validates existing artifacts without rewriting | Synthetic temporary recording; regression tests cover both deletions, both layouts, checkpoint write failure, altered artifacts, relative paths, copied evidence and older bundles |
+| Missing raw source / whole-record truncation | Before: 20 recorded rows became 0 or 10 and recovery reported valid. After: both attempts fail before journal changes and retain the incomplete marker | Synthetic temporary recordings. Checkpoints prove a lower bound; uncheckpointed tail loss remains unknowable from the count alone |
+| Live raw checkpoints | 31 checkpoints; final count equals all 31,943 raw events. 915 camera triggers = 915 images, all 25 artifacts valid; no incomplete frames, acquisition timeouts, save errors or cleanup failure | Thirty-second input observation; physical gestures and output calibration not exercised |
+| Preview with raw checkpoints | Host frame age 77 / 88 ms median/p95; receipt-to-save 2.24 / 3.72 ms; maximum backlog growth 0.51 ms, ending -0.81 ms | Host-relative measurements, not calibrated exposure-to-screen latency |
 
 Local evidence (recordings are intentionally excluded from Git):
 
 - `data/runtime/audit/camera_latency_summary.json`
 - `data/runtime/audit/recovery_marker_failure_before.json` and `recovery_marker_failure_after.json` (interrupted cleanup retry)
+- `data/runtime/audit/missing_raw_before.json` and `missing_raw_after.json` (missing and shortened raw sources)
+- `data/runtime/audit/raw_checkpoint_live_result.json` (live checkpoint counts and camera timing)
 - `data/runtime/audit/production_timing/result.json`
 - `data/runtime/operator/runs/20261012_212437_904677/result.json` (camera)
 - `data/runtime/operator/runs/20261012_212901_829814/result.json` (complete rig check)

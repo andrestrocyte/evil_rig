@@ -31,6 +31,8 @@ class JournalScan:
     trailing_bytes: int
     needs_newline: bool
     recovery_backups: dict[str, str | None]
+    raw_minimum_count: int | None = None
+    export_layout: str = "mm_hierarchy"
 
     def check_unchanged(self) -> None:
         if _identity(self.path) != self.identity:
@@ -63,6 +65,38 @@ def backup_checksums(paths: list[Path]) -> dict[str, str]:
     return result
 
 
+def streamdio_checkpoint_count(payload: dict[str, Any]) -> int:
+    """A saved checkpoint is a lower bound, never an estimate of the crash tail."""
+    count = payload.get("event_count")
+    if type(count) is not int or count < 0:
+        raise ValueError("Invalid StreamDIO checkpoint event_count")
+    if type(payload.get("wal_fsync_succeeded")) is not bool:
+        raise ValueError("Invalid StreamDIO checkpoint fsync status")
+    return count
+
+
+def raw_count_lower_bound(row: dict[str, Any], previous: int | None) -> int | None:
+    """Share the independent raw-count checks between recovery and validation."""
+    kind, payload = row["kind"], row["payload"]
+    if kind == "session_header" and "streamdio_checkpoint_version" in payload:
+        version = payload["streamdio_checkpoint_version"]
+        if type(version) is not int or version != 1:
+            raise ValueError("Unsupported StreamDIO checkpoint version")
+        return 0
+    if kind == "streamdio_checkpoint":
+        count = streamdio_checkpoint_count(payload)
+        if previous is not None and count < previous:
+            raise ValueError("StreamDIO checkpoint event_count decreased")
+        return count
+    if kind == "event" and payload.get("event_type") == "session_recovered":
+        prior_count = (payload.get("payload") or {}).get("recovered_streamdio_events")
+        if prior_count is not None:
+            if type(prior_count) is not int or prior_count < 0:
+                raise ValueError("Invalid prior recovery raw event count")
+            return max(previous or 0, prior_count)
+    return previous
+
+
 def _validate_row(row: Any, path: Path, line_number: int, sequence: int) -> dict[str, Any]:
     location = f"{path}:{line_number}"
     if not isinstance(row, dict):
@@ -79,8 +113,10 @@ def _validate_row(row: Any, path: Path, line_number: int, sequence: int) -> dict
     if sequence > 0 and kind == "session_header":
         raise ValueError(f"Session journal has a duplicate header: {location}")
     if kind not in {"session_header", "metadata", "export_options", "stream_summary",
-                    "fsm_definition", "event", "trial", "bpod_trial", "session_summary"}:
+                    "fsm_definition", "event", "trial", "bpod_trial", "session_summary", "streamdio_checkpoint"}:
         raise ValueError(f"Session journal invalid kind: {location}: {kind}")
+    if kind == "streamdio_checkpoint":
+        streamdio_checkpoint_count(row["payload"])
     return row
 
 
@@ -94,6 +130,8 @@ def scan_journal(path: Path, *, tolerate_tail: bool = False) -> JournalScan:
     count = summaries = offset = trailing = 0
     header: dict[str, Any] = {}
     recovery_backups: dict[str, str | None] = {}
+    raw_minimum_count: int | None = None
+    export_layout = "mm_hierarchy"
     last_line = b""
     with path.open("rb") as handle:
         line_number = 0
@@ -116,15 +154,18 @@ def scan_journal(path: Path, *, tolerate_tail: bool = False) -> JournalScan:
                 raise ValueError(f"Invalid session journal JSON/UTF-8 at {path}:{line_number}: {exc}") from exc
             row = _validate_row(row, path, line_number, count)
             _backup_references(row, recovery_backups)
+            raw_minimum_count = raw_count_lower_bound(row, raw_minimum_count)
             if count == 0:
                 header = row["payload"]
+            if row["kind"] == "export_options" and "layout" in row["payload"]:
+                export_layout = str(row["payload"]["layout"])
             summaries += row["kind"] == "session_summary"
             count += 1
     if not count:
         raise ValueError(f"Session journal is missing its header: {path}")
     scan = JournalScan(path, identity, count, header, summaries, offset - trailing,
                        trailing, bool(last_line and not last_line.endswith(b"\n") and not trailing),
-                       recovery_backups)
+                       recovery_backups, raw_minimum_count, export_layout)
     scan.check_unchanged()
     return scan
 

@@ -24,6 +24,7 @@ from hf_dm.hardware.bringup_constants import FORCE_ANALOG_CHANNEL, FRAME2TTL_INP
 from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
 from hf_dm.data.raw_stream import FileRows, NpzRows, chunk_number
 from hf_dm.data.array_stream import NpzArray
+from hf_dm.data.session_journal import raw_count_lower_bound
 from hf_dm.timing_heartbeat import (
     TIMING_HEARTBEAT_EVENT_TYPE,
     analyze_timing_heartbeats,
@@ -2427,6 +2428,7 @@ def _validate_jsonl_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> 
     is_session_journal = path.name.endswith(".journal.jsonl")
     journal_counts: dict[str, int] = {}
     journal_summary: dict[str, Any] | None = None
+    raw_minimum_count: int | None = None
     expected_sequence = 0
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -2467,6 +2469,8 @@ def _validate_jsonl_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> 
                         )
                     )
                     kind = row.get("kind")
+                    if isinstance(row.get("payload"), dict):
+                        raw_minimum_count = raw_count_lower_bound(row, raw_minimum_count)
                     if isinstance(kind, str):
                         journal_counts[kind] = journal_counts.get(kind, 0) + 1
                         if kind == "session_summary" and isinstance(row.get("payload"), dict):
@@ -2501,6 +2505,9 @@ def _validate_jsonl_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> 
         if journal_counts.get("session_summary") != 1:
             errors.append(f"session journal must contain one summary: {rel}")
         manifest_counts = manifest.get("counts") or {}
+        raw_count = _optional_int(manifest_counts.get("streamdio_events"))
+        if raw_count is not None and raw_minimum_count is not None and raw_count < raw_minimum_count:
+            errors.append(f"StreamDIO checkpoint exceeds exported raw count: {rel}: {raw_minimum_count} > {raw_count}")
         for kind, manifest_key in (
             ("trial", "trials"),
             ("event", "events"),
@@ -2546,6 +2553,7 @@ def _validate_session_journal_row(
         "trial",
         "bpod_trial",
         "session_summary",
+        "streamdio_checkpoint",
     }
     if kind not in allowed:
         errors.append(f"session journal invalid kind: {rel}:{line_number}: {kind}")
