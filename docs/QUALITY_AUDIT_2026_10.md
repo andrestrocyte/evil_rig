@@ -7,9 +7,9 @@ session selection, on-demand diagnostics, cooperative Stop and saved results.
 This audit does not establish that every hardware component is calibrated or
 that the system is bug-free.
 
-Local verification: full suite 524 passed. Ruff and type checks for config,
+Local verification: full suite 534 passed. Ruff and type checks for config,
 recorder, session export, raw I/O, journal I/O and array I/O passed. CI checks
-Windows and Linux; the preceding commit passed all 494 tests on both platforms.
+Windows and Linux; exact-commit results are linked in PR #5.
 
 ## Repairs
 
@@ -112,6 +112,14 @@ Windows and Linux; the preceding commit passed all 494 tests on both platforms.
   independent count evidence. Offline validation checks the same lower bound.
   Record unsupported WAL fsync, propagate checkpoint failures, and retain journal
   sequence progression after a completed line's fsync fails.
+- Expose the existing calibration/certification window through **Rig setup** in
+  the launcher, using the selected profile, sensor and data directory. Keep session
+  actions disabled until setup closes, save setup logs/results, and distinguish a
+  closed dialog from a passing certificate. Group cascading unreadable-certificate
+  errors into one actionable setup item while retaining all checks in a full-report
+  view. Cancel requests cooperative stop and keeps the setup window visible until
+  the active certification process exits; later diagnostics are skipped. Prevent
+  valve calibration from overlapping certification.
 
 ## Evidence on this PC
 
@@ -152,6 +160,8 @@ Windows and Linux; the preceding commit passed all 494 tests on both platforms.
 | Missing raw source / whole-record truncation | Before: 20 recorded rows became 0 or 10 and recovery reported valid. After: both attempts fail before journal changes and retain the incomplete marker | Synthetic temporary recordings. Checkpoints prove a lower bound; uncheckpointed tail loss remains unknowable from the count alone |
 | Live raw checkpoints | 31 checkpoints; final count equals all 31,943 raw events. 915 camera triggers = 915 images, all 25 artifacts valid; no incomplete frames, acquisition timeouts, save errors or cleanup failure | Thirty-second input observation; physical gestures and output calibration not exercised |
 | Preview with raw checkpoints | Host frame age 77 / 88 ms median/p95; receipt-to-save 2.24 / 3.72 ms; maximum backlog growth 0.51 ms, ending -0.81 ms | Host-relative measurements, not calibrated exposure-to-screen latency |
+| Setup workflow | Real launcher opens the setup window with selected optical/StreamDIO settings and E: data path; task buttons disable while it is open and re-enable after Cancel. Missing-certificate consequences group into one action; full report remains available | UI inspection only; no hardware action or certificate creation |
+| Setup cancellation | Actual Tk window remains visible while a simulated child observes Stop and exits; Continue stays disabled, cancellation is logged, and no certificate is created | Simulated child, not a physical driver hang; unit test verifies later diagnostics do not launch after Stop |
 
 Local evidence (recordings are intentionally excluded from Git):
 
@@ -159,6 +169,8 @@ Local evidence (recordings are intentionally excluded from Git):
 - `data/runtime/audit/recovery_marker_failure_before.json` and `recovery_marker_failure_after.json` (interrupted cleanup retry)
 - `data/runtime/audit/missing_raw_before.json` and `missing_raw_after.json` (missing and shortened raw sources)
 - `data/runtime/audit/raw_checkpoint_live_result.json` (live checkpoint counts and camera timing)
+- `data/runtime/audit/setup_gui_result.json`, `launcher_completion.png`, `setup_completion.png` (real Windows UI)
+- `data/runtime/audit/setup_cancel_result.json` (cooperative cancellation through the Tk workflow)
 - `data/runtime/audit/production_timing/result.json`
 - `data/runtime/operator/runs/20261012_212437_904677/result.json` (camera)
 - `data/runtime/operator/runs/20261012_212901_829814/result.json` (complete rig check)

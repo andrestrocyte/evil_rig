@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
 import os
@@ -174,6 +174,77 @@ def validate_saved_session(path: str, output: Any, *, timeout_s: float = 300.0) 
     if result.returncode not in (0, 1) or not result.stdout.strip():
         raise RuntimeError(f"Saved-data validator failed (exit {result.returncode}); see console.log")
     return json.loads(result.stdout)
+
+
+class RigSetupJob:
+    """Own the existing interactive setup window without starting a task."""
+
+    def __init__(self, root: Path, options: LaunchOptions) -> None:
+        options.validate()
+        self.root = root
+        self.run_dir = root / "data/runtime/operator/runs" / datetime.now().strftime("%Y%m%d_%H%M%S_%f_setup")
+        self.run_dir.mkdir(parents=True)
+        # Setup must describe the eventual animal-session configuration. Bench
+        # launching disables water accounting only for that individual run.
+        self.config = prepare_config(root, self.run_dir, replace(options, mode="animal"))
+        self.log_path = self.run_dir / "console.log"
+        self.status = "Ready to open rig setup"
+        self.process: subprocess.Popen | None = None
+        self._log_handle: Any = None
+        self.report: dict[str, Any] = {
+            "status": "ready", "action": "setup", "options": asdict(options), "config": str(self.config),
+        }
+
+    def _save_report(self) -> None:
+        path = self.run_dir / "result.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(self.report, indent=2), encoding="utf-8")
+        temporary.replace(path)
+
+    def start(self) -> None:
+        if self.process is not None:
+            raise RuntimeError("Rig setup already started")
+        command = [sys.executable, "-m", "hf_dm.ops_cli", "certification-gui", "--config", str(self.config)]
+        self.report.update(command=command, started_wall_s=time.time())
+        self._log_handle = self.log_path.open("wb", buffering=0)
+        try:
+            self.process = subprocess.Popen(
+                command, cwd=self.root, stdout=self._log_handle, stderr=subprocess.STDOUT,
+                env={**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"},
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except BaseException as exc:
+            self._log_handle.close()
+            self._log_handle = None
+            self.report.update(status="failed", error=f"{type(exc).__name__}: {exc}", finished_wall_s=time.time())
+            self._save_report()
+            raise
+        self.report.update(status="running", pid=self.process.pid)
+        self.status = "Rig setup is open. Finish or close that window before starting a session."
+        self._save_report()
+
+    @property
+    def running(self) -> bool:
+        if self.process is None:
+            return False
+        code = self.process.poll()
+        if code is None:
+            return True
+        if self.report["status"] == "running":
+            if self._log_handle is not None:
+                self._log_handle.close()
+                self._log_handle = None
+            # Closing the setup dialog is not proof of a passing certificate.
+            self.report.update(status="closed" if code == 0 else "failed", returncode=code,
+                               finished_wall_s=time.time())
+            self.status = ("Rig setup closed. Animal sessions still check readiness at Start."
+                           if code == 0 else "Rig setup failed; see Logs.")
+            try:
+                self._save_report()
+            except OSError as exc:
+                self.report["report_error"] = f"{type(exc).__name__}: {exc}"
+                self.status = f"Rig setup closed, but its result could not be saved: {exc}"
+        return False
 
 
 class AcquisitionJob:
@@ -351,12 +422,16 @@ def main() -> None:
     ttk.Label(frame, text="Bench = no animal. Rig check briefly activates pump, force and sound.").grid(row=7, column=0, columnspan=4, sticky="w", pady=6)
     controls = ttk.Frame(frame)
     controls.grid(row=8, column=0, columnspan=4, sticky="w", pady=8)
+    run_controls = ttk.Frame(controls)
+    run_controls.pack(anchor="w")
+    setup_controls = ttk.Frame(controls)
+    setup_controls.pack(anchor="w", pady=(6, 0))
     status = tk.StringVar(value="Ready")
     ttk.Label(frame, textvariable=status, wraplength=760).grid(row=9, column=0, columnspan=4, sticky="w", pady=6)
     log = tk.Text(frame, height=13, font=("Consolas", 9), state="disabled")
     log.grid(row=10, column=0, columnspan=4, sticky="nsew")
     frame.rowconfigure(10, weight=1)
-    job: AcquisitionJob | None = None
+    job: AcquisitionJob | RigSetupJob | None = None
     closing = False
 
     def launch(action: str) -> None:
@@ -369,7 +444,7 @@ def main() -> None:
             values["forced_trials"] = int(values["forced_trials"])
             values["max_minutes"] = float(values["max_minutes"])
             options = LaunchOptions(**values)
-            job = AcquisitionJob(root, action, options)
+            job = RigSetupJob(root, options) if action == "setup" else AcquisitionJob(root, action, options)
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(json.dumps(asdict(options), indent=2), encoding="utf-8")
             job.start()
@@ -377,7 +452,7 @@ def main() -> None:
             messagebox.showerror("Cannot start", str(exc), parent=window)
 
     def stop() -> None:
-        if job is not None and job.running:
+        if isinstance(job, AcquisitionJob) and job.running:
             job.stop()
 
     def open_path(path: Path) -> None:
@@ -387,14 +462,24 @@ def main() -> None:
         else:
             subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
 
-    for title, action in [("Start session", "session"), ("Check rig", "check"), ("Watch inputs (20 s)", "inputs")]:
-        ttk.Button(controls, text=title, command=lambda a=action: launch(a)).pack(side="left", padx=(0, 7))
-    ttk.Button(controls, text="Stop", command=stop).pack(side="left", padx=7)
-    ttk.Button(controls, text="Logs", command=lambda: open_path(job.run_dir if job else state_path.parent)).pack(side="left", padx=7)
-    ttk.Button(controls, text="Data…", command=lambda: variables["data_dir"].set(
+    action_buttons = []
+    for title, action in [("Start session", "session"), ("Check rig", "check"), ("Watch inputs (20 s)", "inputs"),
+                          ("Rig setup", "setup")]:
+        button = ttk.Button(setup_controls if action == "setup" else run_controls,
+                            text=title, command=lambda a=action: launch(a))
+        button.pack(side="left", padx=(0, 7))
+        action_buttons.append(button)
+    stop_button = ttk.Button(run_controls, text="Stop", command=stop)
+    stop_button.pack(side="left", padx=7)
+    ttk.Button(setup_controls, text="Logs", command=lambda: open_path(job.run_dir if job else state_path.parent)).pack(side="left", padx=7)
+    ttk.Button(setup_controls, text="Data…", command=lambda: variables["data_dir"].set(
         filedialog.askdirectory(initialdir=variables["data_dir"].get()) or variables["data_dir"].get())).pack(side="left")
 
     def tick() -> None:
+        running = job is not None and job.running
+        for button in action_buttons:
+            button.configure(state="disabled" if running else "normal")
+        stop_button.configure(state="normal" if running and isinstance(job, AcquisitionJob) else "disabled")
         if job is not None:
             status.set(job.status)
             try:
@@ -408,13 +493,16 @@ def main() -> None:
                 log.configure(state="disabled")
             except OSError:
                 pass
-        if closing and (job is None or not job.running):
+        if closing and not running:
             window.destroy()
         else:
             window.after(300, tick)
 
     def close() -> None:
         nonlocal closing
+        if isinstance(job, RigSetupJob) and job.running:
+            job.status = "Close the Rig setup window first; it may still be running a calibration or check."
+            return
         closing = True
         stop()
 

@@ -33,6 +33,50 @@ class CertificationDialogResult:
     operator_confirmed: bool
 
 
+def _request_certification_stop(running: dict[str, Any]) -> bool:
+    process = running.get("process")
+    if process is None or process.poll() is not None:
+        return False
+    Path(running["stop_path"]).touch()
+    running["close_requested"] = True
+    return True
+
+
+def readiness_rows(report: dict[str, Any]) -> list[tuple[str, str]]:
+    """Present actions, grouping consequences of one unreadable certificate."""
+    checks = report.get("checks", [])
+    unreadable = any(item.get("name") == "certification_readable" and item.get("status") != "PASS"
+                     for item in checks)
+    certificate_details = {"certification_schema", "certification_status", "certification_current",
+                           "exact_release_identity", "certified_checks_all_pass", "human_approvals",
+                           "certified_hardware_identity_complete"}
+    descriptions = {
+        "certification_readable": "Rig certificate: missing or unreadable. Complete calibration and rig certification.",
+        "clean_git_provenance": "Software update: finish saving the installed code changes before commissioning.",
+        "reward_calibration": "Water calibration: run guided valve calibration, or select a current calibration file.",
+        "subject_welfare": "Subject setup: check the reward limit, today's weight and water target under Operator data.",
+        "operator_confirmation": "Run confirmation: confirm this session after the setup checks pass.",
+        "dependency_lock_present": "Software installation: restore the tested dependency lock file.",
+        "local_durable_storage": "Data directory: choose a working local drive with enough free space.",
+        "required_runtime_hardware": "Hardware settings: enable the required camera, speaker and selected lick sensor.",
+        "certification_schema": "Rig certificate: the file format is invalid. Run certification again.",
+        "certification_status": "Rig certification: a previous check failed. Review the full report before retrying.",
+        "certification_current": "Rig certificate: check its date and refresh expired certification.",
+        "exact_release_identity": "Rig settings changed: check the software, calibration and settings against the certificate.",
+        "certified_checks_all_pass": "Rig checks: measured or automated evidence is missing or failed. See the full report.",
+        "human_approvals": "Physical evidence: record the required measurements and operator approvals.",
+        "certified_hardware_identity_complete": "Hardware identity: rerun certification with the rig devices connected.",
+    }
+    rows = []
+    for check in checks:
+        name = str(check.get("name", "unknown"))
+        if check.get("status") == "PASS" or (unreadable and name in certificate_details):
+            continue
+        rows.append((str(check.get("status", "FAIL")),
+                     descriptions.get(name, f"{name.replace('_', ' ')}: review the full diagnostic report.")))
+    return rows
+
+
 def run_certification_dialog(
     config: SessionConfig,
     report: dict[str, Any],
@@ -117,16 +161,18 @@ def run_certification_dialog(
     status_tab = ttk.Frame(notebook, padding=8)
     setup_tab = ttk.Frame(notebook, padding=8)
     actions_tab = ttk.Frame(notebook, padding=8)
-    notebook.add(status_tab, text="Failed checks")
+    notebook.add(status_tab, text="Setup needed")
     notebook.add(setup_tab, text="Operator data")
     notebook.add(actions_tab, text="Calibration & certification")
 
-    tree = ttk.Treeview(status_tab, columns=("status", "detail"), show="headings")
+    status_table = ttk.Frame(status_tab)
+    status_table.pack(fill="both", expand=True)
+    tree = ttk.Treeview(status_table, columns=("status", "detail"), show="headings")
     tree.heading("status", text="Status")
-    tree.heading("detail", text="Check and detail")
+    tree.heading("detail", text="What to do")
     tree.column("status", width=80, stretch=False)
     tree.column("detail", width=730)
-    scroll = ttk.Scrollbar(status_tab, orient="vertical", command=tree.yview)
+    scroll = ttk.Scrollbar(status_table, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=scroll.set)
     tree.pack(side="left", fill="both", expand=True)
     scroll.pack(side="right", fill="y")
@@ -261,6 +307,9 @@ def run_certification_dialog(
     ).pack(anchor="w", pady=(0, 8))
 
     def calibrate_valve() -> None:
+        if running:
+            status_var.set("Finish or stop certification before starting valve calibration.")
+            return
         if not save_fields(notify=False):
             return
         warnings = (
@@ -401,14 +450,19 @@ def run_certification_dialog(
         handle.flush()
         fsync_best_effort(handle, path=running.get("log_path"))
         handle.close()
+        close_requested = bool(running.get("close_requested"))
         running.clear()
         certify_button.configure(state="normal")
         append_gui_audit(
             config,
-            "rig_certification_completed" if returncode == 0 else "rig_certification_failed",
+            ("rig_certification_cancelled" if close_requested else
+             "rig_certification_completed" if returncode == 0 else "rig_certification_failed"),
             operator=operator_var.get(),
             detail={"returncode": returncode, "log": str(log_path)},
         )
+        if close_requested:
+            root.destroy()
+            return
         refresh_report()
         if returncode == 0:
             messagebox.showinfo("Certification complete", "Rig certification passed.", parent=root)
@@ -438,10 +492,11 @@ def run_certification_dialog(
             messagebox.showerror("Cannot start certification", str(exc), parent=root)
             return
         log_path = certification_workspace(config) / "logs" / (
-            f"certification_{time.strftime('%Y%m%d_%H%M%S')}.log"
+            f"certification_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}.log"
         )
         log_path.parent.mkdir(parents=True, exist_ok=True)
         handle = log_path.open("w", encoding="utf-8", newline="\n")
+        stop_path = log_path.with_suffix(".stop")
         append_gui_audit(
             config,
             "rig_certification_started",
@@ -455,15 +510,17 @@ def run_certification_dialog(
                 stdout=handle,
                 stderr=subprocess.STDOUT,
                 text=True,
-                env=dict(os.environ),
+                env={**os.environ, "HF_DM_STOP_REQUEST": str(stop_path)},
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except Exception as exc:
             handle.close()
             append_gui_audit(config, "rig_certification_launch_failed", detail=str(exc))
             messagebox.showerror("Cannot launch certification", str(exc), parent=root)
             return
-        running.update(process=process, log_handle=handle, log_path=log_path)
+        running.update(process=process, log_handle=handle, log_path=log_path, stop_path=stop_path)
         certify_button.configure(state="disabled")
+        continue_button.configure(state="disabled")
         status_var.set("Certification is running; hardware diagnostics may take several minutes...")
         root.after(500, certification_finished)
 
@@ -490,6 +547,13 @@ def run_certification_dialog(
     def cancel_dialog() -> None:
         result["operator"] = operator_var.get()
         result["operator_confirmed"] = run_confirmed_var.get()
+        try:
+            if _request_certification_stop(running):
+                status_var.set("Stopping certification; waiting for hardware cleanup before closing...")
+                return
+        except OSError as exc:
+            messagebox.showerror("Cannot request Stop", str(exc), parent=root)
+            return
         root.destroy()
 
     ttk.Button(footer, text="Cancel", command=cancel_dialog).pack(side="right", padx=(0, 8))
@@ -499,14 +563,26 @@ def run_certification_dialog(
 
     current_report = report
 
+    def show_full_report() -> None:
+        detail_window = tk.Toplevel(root)
+        detail_window.title("Full readiness report")
+        detail_window.geometry("850x650")
+        detail_text = tk.Text(detail_window, wrap="word", font=("TkFixedFont", 10))
+        detail_scroll = ttk.Scrollbar(detail_window, orient="vertical", command=detail_text.yview)
+        detail_text.configure(yscrollcommand=detail_scroll.set)
+        detail_scroll.pack(side="right", fill="y")
+        detail_text.pack(fill="both", expand=True)
+        detail_text.insert("1.0", json.dumps(current_report, indent=2, sort_keys=True, default=str))
+        detail_text.configure(state="disabled")
+
+    ttk.Button(status_tab, text="Show full diagnostic report", command=show_full_report).pack(anchor="w", pady=(8, 0))
+
     def render(current: dict[str, Any]) -> None:
         for item in tree.get_children():
             tree.delete(item)
-        for check in current.get("checks", []):
-            if check.get("status") == "PASS":
-                continue
-            detail = json.dumps(check.get("detail"), sort_keys=True, default=str)
-            tree.insert("", "end", values=(check.get("status"), f"{check.get('name')}: {detail}"))
+        rows = readiness_rows(current)
+        for status, detail in rows:
+            tree.insert("", "end", values=(status, detail))
         passed = current.get("status") == "PASS"
         status_var.set(
             (
@@ -515,10 +591,10 @@ def run_certification_dialog(
                 else "All release checks pass; certification is ready."
             )
             if passed
-            else f"Blocked: {sum(c.get('status') != 'PASS' for c in current.get('checks', []))} check(s) failed."
+            else f"Setup needed: {len(rows)} item(s). Full check details are available below."
         )
         continue_button.configure(
-            state="normal" if passed and run_confirmed_var.get() else "disabled"
+            state="normal" if passed and run_confirmed_var.get() and not running else "disabled"
         )
 
     def refresh_report() -> bool:

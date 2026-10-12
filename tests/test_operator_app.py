@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from hf_dm.config import SessionConfig
-from hf_dm.operator_app import LaunchOptions, command_steps, prepare_config, diagnostic_result
+from hf_dm.operator_app import LaunchOptions, RigSetupJob, command_steps, prepare_config, diagnostic_result
 from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.run_control import OperatorStop, RunControl, bounded_close
 
@@ -141,3 +141,97 @@ def test_launcher_preserves_profiles_and_records_absolute_output_paths(tmp_path)
 def test_launcher_rejects_subject_path_injection(subject, tmp_path):
     with pytest.raises(ValueError):
         LaunchOptions(subject=subject, data_dir=str(tmp_path)).validate()
+
+
+def setup_job(tmp_path):
+    import shutil
+    root = tmp_path / "rig checkout"
+    (root / "configs").mkdir(parents=True)
+    shutil.copyfile(Path(__file__).resolve().parents[1] / "configs/dm_50.yaml", root / "configs/dm_50.yaml")
+    options = LaunchOptions(subject="setup_test", lick_source="optical", data_dir=str(tmp_path / "recordings"))
+    return RigSetupJob(root, options), options
+
+
+def test_rig_setup_uses_selected_options_without_starting_a_task(tmp_path, monkeypatch):
+    import json
+    import subprocess
+    job, options = setup_job(tmp_path)
+    process = SimpleNamespace(pid=123, poll=lambda: None)
+    calls = []
+
+    def launch(command, **kwargs):
+        calls.append((command, kwargs))
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    try:
+        job.start()
+        assert job.running
+        command, kwargs = calls[0]
+        assert command[1:4] == ["-m", "hf_dm.ops_cli", "certification-gui"]
+        assert "--confirm-animal-use" not in command
+        assert "--hardware-self-test" not in command
+        assert command[-1] == str(job.config)
+        assert kwargs["stdout"] is job._log_handle
+        assert kwargs["env"]["PYTHONUTF8"] == "1"
+        config = SessionConfig.from_yaml(job.config)
+        assert config.licks.source == "optical"
+        assert config.welfare.append_session_water is True
+        assert options.mode == "bench"
+        assert Path(config.results_dir) == Path(options.data_dir)
+        assert json.loads((job.run_dir / "result.json").read_text())["status"] == "running"
+        with pytest.raises(RuntimeError, match="already started"):
+            job.start()
+        assert len(calls) == 1
+    finally:
+        process.poll = lambda: 0
+        assert not job.running
+
+
+@pytest.mark.parametrize("returncode, expected", [(0, "closed"), (1, "failed")])
+def test_setup_close_releases_log_without_claiming_readiness(tmp_path, monkeypatch, returncode, expected):
+    import json
+    import subprocess
+    job, _ = setup_job(tmp_path)
+    process = SimpleNamespace(pid=123, poll=lambda: returncode)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: process)
+    job.start()
+    handle = job._log_handle
+    assert not job.running
+    assert handle.closed
+    report = json.loads((job.run_dir / "result.json").read_text())
+    assert report["status"] == expected and report["returncode"] == returncode
+    assert "ready" not in report and "passed" not in report
+
+
+def test_setup_launch_failure_closes_log_and_records_error(tmp_path, monkeypatch):
+    import json
+    import subprocess
+    job, _ = setup_job(tmp_path)
+    handles = []
+
+    def fail(*args, **kwargs):
+        handles.append(kwargs["stdout"])
+        raise OSError("injected launch failure")
+
+    monkeypatch.setattr(subprocess, "Popen", fail)
+    with pytest.raises(OSError, match="injected launch failure"):
+        job.start()
+    assert handles[0].closed
+    assert not job.running
+    assert json.loads((job.run_dir / "result.json").read_text())["status"] == "failed"
+
+
+def test_setup_result_write_failure_does_not_break_gui_polling(tmp_path, monkeypatch):
+    import subprocess
+    job, _ = setup_job(tmp_path)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: SimpleNamespace(pid=123, poll=lambda: 0))
+    job.start()
+
+    def fail():
+        raise OSError("injected result write failure")
+
+    monkeypatch.setattr(job, "_save_report", fail)
+    assert not job.running
+    assert "could not be saved" in job.status
+    assert "injected result write failure" in job.report["report_error"]

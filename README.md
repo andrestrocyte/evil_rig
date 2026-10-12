@@ -28,6 +28,16 @@ session**. **Check rig** runs a finite bench check (about 50 seconds here);
 interrupted session and verifies cleanup. These diagnostics are on-demand;
 ordinary sessions retain lightweight acquisition health checks.
 
+Use **Rig setup** for the calibration and certification window. It uses the
+selected task profile, lick sensor and data directory, and keeps its own log.
+Session controls stay disabled until setup closes. The setup screen groups
+consequences of a missing certificate into one actionable item; **Show full
+diagnostic report** retains every underlying check. Opening or closing setup does
+not certify the rig or start a task. Cancel during certification requests a
+cooperative stop, waits for the active check to finish cleanup, and prevents later
+diagnostics from starting. Calibrate and commission the rig when needed; ordinary
+sessions reuse valid evidence rather than repeating the full setup.
+
 Stop allows 30 seconds for hardware shutdown. After verified cleanup, large
 exports get a separate five-minute limit; saved-data validation also runs with a
 five-minute timeout in its own process. A timed-out writer leaves recovery data

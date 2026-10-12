@@ -194,6 +194,9 @@ def _run_cli_diagnostic(
     arguments: list[str],
     report_path: Path | None = None,
 ) -> dict[str, Any]:
+    stop_request = os.environ.get("HF_DM_STOP_REQUEST")
+    if stop_request and Path(stop_request).exists():
+        return {"name": name, "status": "FAIL", "error": "Operator requested stop; diagnostic not started"}
     results_root = Path(config.results_dir).expanduser().resolve()
     before = {path.resolve() for path in results_root.rglob("session.json")} if results_root.exists() else set()
     command = [
