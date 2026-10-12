@@ -15,6 +15,7 @@ import threading
 import time
 import zlib
 from collections import Counter, deque
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, distribution as installed_distribution, version
@@ -24,6 +25,14 @@ from typing import Any, Literal
 import numpy as np
 
 from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
+from hf_dm.data.raw_stream import (
+    RAW_DTYPE, RawArray, RawRow, WalRows, write_npz,
+    WAL_MAGIC as _STREAMDIO_WAL_MAGIC,
+    WAL_MAGIC_V1 as _STREAMDIO_WAL_MAGIC_V1,
+    WAL_PAYLOAD as _STREAMDIO_WAL_PAYLOAD,
+    WAL_PAYLOAD as _STREAMDIO_WAL_RECORD_V1,
+    WAL_RECORD as _STREAMDIO_WAL_RECORD,
+)
 from hf_dm.timing_heartbeat import (
     analyze_timing_heartbeats,
     timing_heartbeat_qc_summary,
@@ -32,13 +41,7 @@ from hf_dm.timing_heartbeat import (
 Direction = Literal["cw", "ccw"]
 Choice = Literal["cw", "ccw", "timeout", "centering"]
 JournalMode = Literal["new", "resume", "disabled"]
-
-_STREAMDIO_WAL_MAGIC_V1 = b"HFDMSTR1\n"
-_STREAMDIO_WAL_MAGIC = b"HFDMSTR2\n"
-_STREAMDIO_WAL_PAYLOAD = struct.Struct("<24siiQdd")
-_STREAMDIO_WAL_RECORD_V1 = _STREAMDIO_WAL_PAYLOAD
-_STREAMDIO_WAL_RECORD = struct.Struct("<24siiQddI")
-
+CHUNK_SHUTDOWN_TIMEOUT_S = 10.0
 
 def _git_identity(candidate: Path) -> dict[str, str | bool | None]:
     identity: dict[str, str | bool | None] = {
@@ -210,7 +213,7 @@ def _atomic_write_npz(path: Path, **arrays: Any) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         with temporary.open("wb") as handle:
-            np.savez_compressed(handle, **arrays)
+            write_npz(handle, arrays)
             handle.flush()
             fsync_best_effort(handle, path=temporary)
         os.replace(temporary, path)
@@ -370,11 +373,9 @@ class SessionRecorder:
             tuple[int | None, list[tuple[str, int, int, int, float, float]] | None]
         ] | None = None
         self._streamdio_chunk_thread: threading.Thread | None = None
+        self._streamdio_chunk_finish = threading.Event()
         self._streamdio_chunk_files: list[str] = []
         self._streamdio_chunk_error: str | None = None
-        self._streamdio_failed_chunk_rows: list[
-            tuple[str, int, int, int, float, float]
-        ] = []
         self._streamdio_memory_mode = "full"
         self._streamdio_memory_bounded = False
         self._streamdio_recent_max_events = 0
@@ -709,7 +710,7 @@ class SessionRecorder:
         events_arr = self._events_to_structured()
         final_streamdio_events = self._streamdio_rows_for_finalize()
         self._discard_partial_streamdio_chunks()
-        streamdio_arr = self._streamdio_rows_to_structured(final_streamdio_events)
+        streamdio_arr = RawArray(final_streamdio_events)
         timing_heartbeat_qc = timing_heartbeat_qc_summary(
             analyze_timing_heartbeats(
                 final_streamdio_events,
@@ -765,9 +766,7 @@ class SessionRecorder:
             except OSError:
                 pass
 
-        streamdio_counts = Counter(event[0] for event in final_streamdio_events)
-        if not streamdio_counts and self._streamdio_counts:
-            streamdio_counts = Counter(self._streamdio_counts)
+        streamdio_counts = Counter(self._streamdio_counts)
         meta = {
             "summary": asdict(summary),
             "metadata": self.metadata,
@@ -971,7 +970,8 @@ class SessionRecorder:
                 session_bundle_dir(self.base_path, layout=layout) / "continuous_streams"
             )
             self._streamdio_chunk_dir.mkdir(parents=True, exist_ok=True)
-            self._streamdio_chunk_queue = queue.Queue()
+            self._streamdio_chunk_queue = queue.Queue(maxsize=2)
+            self._streamdio_chunk_finish.clear()
             self._streamdio_chunk_thread = threading.Thread(
                 target=self._streamdio_chunk_writer,
                 name="hf-dm-streamdio-chunk-writer",
@@ -1115,6 +1115,8 @@ class SessionRecorder:
     ) -> None:
         if self._streamdio_chunk_s <= 0.0 or self._streamdio_chunk_queue is None:
             return
+        if self._streamdio_chunk_error is not None:
+            return  # optional chunks stop; the complete WAL remains authoritative
         relative_s = float(row[4])
         if self._streamdio_chunk_start_s is None:
             self._streamdio_chunk_start_s = relative_s
@@ -1129,25 +1131,42 @@ class SessionRecorder:
         rows = self._streamdio_chunk_buffer
         self._streamdio_chunk_buffer = []
         self._streamdio_chunk_start_s = None
-        self._streamdio_chunk_queue.put((self._streamdio_chunk_index, rows))
-        self._streamdio_chunk_index += 1
+        if self._streamdio_chunk_error is None:
+            try:
+                self._streamdio_chunk_queue.put_nowait((self._streamdio_chunk_index, rows))
+                self._streamdio_chunk_index += 1
+            except queue.Full:
+                self._streamdio_chunk_error = "chunk writer backlog exceeded two blocks; using complete WAL"
 
     def _finalize_streamdio_chunks(self) -> None:
         if self._streamdio_chunk_queue is None:
             return
         self._enqueue_streamdio_chunk()
-        self._streamdio_chunk_queue.put((None, None))
+        # A separate finish signal cannot block behind a full writer queue.
+        self._streamdio_chunk_finish.set()
         if self._streamdio_chunk_thread is not None:
-            self._streamdio_chunk_thread.join(timeout=10.0)
+            self._streamdio_chunk_thread.join(timeout=CHUNK_SHUTDOWN_TIMEOUT_S)
             if self._streamdio_chunk_thread.is_alive():
                 self._streamdio_chunk_error = "chunk writer did not stop within timeout"
+                # It could still publish a chunk. Do not create a manifest or
+                # delete recovery data until that writer has actually stopped.
+                raise RuntimeError(self._streamdio_chunk_error + "; recovery WAL retained")
         self._streamdio_chunk_thread = None
+        while not self._streamdio_chunk_queue.empty():
+            self._streamdio_chunk_queue.get_nowait()
 
     def _streamdio_chunk_writer(self) -> None:
         assert self._streamdio_chunk_queue is not None
         assert self._streamdio_chunk_dir is not None
         while True:
-            index, rows = self._streamdio_chunk_queue.get()
+            if self._streamdio_chunk_error is not None:
+                return
+            try:
+                index, rows = self._streamdio_chunk_queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._streamdio_chunk_finish.is_set():
+                    return
+                continue
             if index is None:
                 return
             path = self._streamdio_chunk_dir / f"streamdio_chunk_{int(index):03d}.npz"
@@ -1167,29 +1186,29 @@ class SessionRecorder:
                         time.sleep(0.05 * (attempt + 1))
             if error is not None:
                 self._streamdio_chunk_error = f"{type(error).__name__}: {error}"
-                self._streamdio_failed_chunk_rows.extend(rows or [])
+                return
 
-    def _streamdio_rows_for_finalize(self) -> list[tuple[str, int, int, int, float, float]]:
-        if not self._streamdio_memory_bounded:
-            return list(self.streamdio_events)
+    def _streamdio_rows_for_finalize(self) -> Sequence[RawRow]:
+        if not self._streamdio_memory_bounded or self._journal_mode == "resume":
+            return self.streamdio_events
         if self._streamdio_wal_path.exists():
             try:
-                wal_rows, trailing_bytes = load_streamdio_wal(self._streamdio_wal_path)
-                if trailing_bytes == 0 and len(wal_rows) == self._streamdio_total_count:
+                wal_rows = WalRows(self._streamdio_wal_path)
+                if len(wal_rows) == self._streamdio_total_count:
+                    # Validate before primary output; subsequent passes also
+                    # check CRCs, with only one small block resident at a time.
+                    for _ in wal_rows:
+                        pass
                     return wal_rows
-                self._streamdio_chunk_error = (
+                raise ValueError(
                     "StreamDIO WAL incomplete at finalize: "
-                    f"{len(wal_rows)} of {self._streamdio_total_count} events, "
-                    f"{trailing_bytes} trailing bytes"
+                    f"{len(wal_rows)} of {self._streamdio_total_count} events"
                 )
             except Exception as exc:
-                self._streamdio_chunk_error = (
-                    f"StreamDIO WAL read failed: {type(exc).__name__}: {exc}"
-                )
-        rows = self._load_streamdio_chunk_rows()
-        if rows or self._streamdio_failed_chunk_rows:
-            return [*rows, *self._streamdio_failed_chunk_rows]
-        return list(self.streamdio_events)
+                raise RuntimeError(f"StreamDIO WAL read failed; recovery evidence retained: {exc}") from exc
+        if self._streamdio_total_count:
+            raise RuntimeError("StreamDIO WAL missing; refusing incomplete bounded export")
+        return []
 
     def _discard_partial_streamdio_chunks(self) -> None:
         """Remove a misleading partial chunk set after a terminal writer error.
@@ -1404,15 +1423,7 @@ class SessionRecorder:
     def _streamdio_rows_to_structured(
         rows: list[tuple[str, int, int, int, float, float]],
     ) -> np.ndarray:
-        dtype = [
-            ("event_type", "U24"),
-            ("channel", "i2"),
-            ("value", "i4"),
-            ("module_timestamp_us", "u8"),
-            ("relative_time_s", "f8"),
-            ("host_perf_counter_s", "f8"),
-        ]
-        return np.array(rows, dtype=dtype)
+        return np.array(rows, dtype=RAW_DTYPE)
 
 
 _JOURNAL_SUFFIX = ".journal.jsonl"

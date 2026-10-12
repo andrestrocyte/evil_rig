@@ -28,6 +28,11 @@ session**. **Check rig** runs a finite bench check (about 50 seconds here);
 interrupted session and verifies cleanup. These diagnostics are on-demand;
 ordinary sessions retain lightweight acquisition health checks.
 
+Stop allows 30 seconds for hardware shutdown. After verified cleanup, large
+exports get a separate five-minute limit; saved-data validation also runs with a
+five-minute timeout in its own process. A timed-out writer leaves recovery data
+intact and reports failure.
+
 To install a new checkout with Python 3.12 and the camera SDK already installed:
 
 ```powershell
@@ -669,14 +674,20 @@ triggers).
 All shipped profiles bound the raw-event working history to about 50,000 recent
 rows. Every raw event is written to the recovery journal (WAL); final NPZ/CSV
 exports retain the full stream. `dm_200` also writes optional 45-second NPZ chunks.
-Bounding memory does not require those extra chunks.
+Bounding memory does not require those extra chunks. Finalization writes the raw
+NPZ array in 8,192-row blocks and streams CSV output; validation also reads the
+compressed raw array in blocks. The formats and raw timestamps are unchanged.
+Optional chunk output has a two-block queue. If it falls behind, the complete WAL
+supplies final exports; if its writer cannot finish, recovery files are retained
+instead of publishing a completed session.
 
 The rig checks available space before connecting and every two seconds during
 acquisition, stopping through normal cleanup when a recording volume falls below
 2 GiB free. Full-resolution uncompressed video still needs substantial space
 (about 2.8 GB/min on the installed camera). This reserve is a guard, not a promise
-that every possible session's exports will fit. Finalization currently reconstructs
-the complete stream in memory; its peak memory use grows with session length.
+that every possible session's exports will fit. Semantic events, camera timelines
+and heartbeat analysis still grow with session length. Crash recovery currently
+reconciles its raw records in memory; normal finalization avoids those full copies.
 
 ### Inspecting a session
 

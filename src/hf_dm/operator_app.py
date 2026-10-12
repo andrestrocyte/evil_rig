@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from typing import Any
 
 import yaml
@@ -125,6 +126,56 @@ def diagnostic_result(name: str, session_path: str) -> dict[str, Any] | None:
             "result": payload, "camera_trigger_alignment": alignment}
 
 
+@dataclass
+class JobWatchdog:
+    started: float
+    acquisition_limit_s: float
+    stop_grace_s: float = 30.0
+    finalize_limit_s: float = 300.0
+    stop_started: float | None = None
+    finalizing_started: float | None = None
+    timed_out: bool = False
+
+    def check(self, now: float, *, stop_requested: bool, hardware_closed: bool) -> str | None:
+        if hardware_closed:
+            if self.finalizing_started is None:
+                self.finalizing_started = now
+            if now - self.finalizing_started > self.finalize_limit_s:
+                return "Data finalization timed out after hardware cleanup; recovery data retained"
+            return None
+        self.finalizing_started = None
+        if now - self.started > self.acquisition_limit_s:
+            self.timed_out = True
+        if stop_requested or self.timed_out:
+            if self.stop_started is None:
+                self.stop_started = now
+            if now - self.stop_started > self.stop_grace_s:
+                return "Acquisition failed to stop; inspect cleanup interlock and log"
+        return None
+
+
+def hardware_closed_signal(path: Path, token: str) -> bool:
+    try:
+        signal = json.loads(path.read_text(encoding="utf-8"))
+        return signal.get("run_token") == token and signal.get("hardware_closed") is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def validate_saved_session(path: str, output: Any, *, timeout_s: float = 300.0) -> dict[str, Any]:
+    # Validation is also finite and isolated from the desktop GUI process.
+    result = subprocess.run(
+        [sys.executable, "-c", "from hf_dm.data.session_export import main_validate; main_validate()", path],
+        capture_output=True, text=True, encoding="utf-8", timeout=timeout_s,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if result.stderr:
+        output.write(result.stderr.encode("utf-8"))
+    if result.returncode not in (0, 1) or not result.stdout.strip():
+        raise RuntimeError(f"Saved-data validator failed (exit {result.returncode}); see console.log")
+    return json.loads(result.stdout)
+
+
 class AcquisitionJob:
     def __init__(self, root: Path, action: str, options: LaunchOptions) -> None:
         options.validate()
@@ -173,40 +224,43 @@ class AcquisitionJob:
                         break
                     self.status = f"Running: {name.replace('_', ' ')}"
                     result_path = self.run_dir / f"{name}.json"
+                    phase_path = self.run_dir / f"{name}.phase.json"
+                    run_token = uuid.uuid4().hex
                     env = os.environ.copy()
                     limit = 180.0 if self.action != "session" else self.options.max_minutes * 60
                     env.update(PYTHONUTF8="1", PYTHONUNBUFFERED="1",
                                HF_DM_STOP_REQUEST=str(self.stop_path),
+                               HF_DM_PHASE_PATH=str(phase_path), HF_DM_RUN_TOKEN=run_token,
                                HF_DM_RUN_TIMEOUT_S=str(limit), HF_DM_RESULT_PATH=str(result_path))
                     command = [sys.executable, "-m", "hf_dm.cli", "--config", str(self.config),
                                "--no-session-dialog", "--no-certification-dialog", *arguments]
                     output.write((f"\n--- {name} ---\n" + json.dumps(command) + "\n").encode())
                     started = time.monotonic()
-                    timed_out = False
+                    watchdog = JobWatchdog(started, limit)
                     process = subprocess.Popen(command, cwd=self.root, env=env, stdout=output,
                                                stderr=subprocess.STDOUT,
                                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                    stop_started = None
                     while process.poll() is None:
-                        if time.monotonic() - started > limit:
-                            timed_out = True
+                        closed = hardware_closed_signal(phase_path, run_token)
+                        failure = watchdog.check(time.monotonic(), stop_requested=self.stop_path.exists(), hardware_closed=closed)
+                        if watchdog.timed_out and not self.stop_path.exists():
                             self.stop()
-                        if self.stop_path.exists():
-                            stop_started = stop_started or time.monotonic()
-                            if time.monotonic() - stop_started > 30:
-                                # The acquisition's persistent cleanup latch stays
-                                # armed if its graceful shutdown cannot finish.
-                                import psutil
-                                parent = psutil.Process(process.pid)
-                                children = parent.children(recursive=True)
-                                for child in children:
-                                    try:
-                                        child.terminate()
-                                    except psutil.NoSuchProcess:
-                                        pass
-                                process.terminate()
-                                process.wait(timeout=5)
-                                raise TimeoutError("Acquisition failed to stop; inspect cleanup interlock and log")
+                        if closed:
+                            self.status = "Hardware closed; saving session data…"
+                        if failure:
+                            # The acquisition's persistent cleanup latch stays
+                            # armed if its graceful shutdown cannot finish.
+                            import psutil
+                            parent = psutil.Process(process.pid)
+                            children = parent.children(recursive=True)
+                            for child in children:
+                                try:
+                                    child.terminate()
+                                except psutil.NoSuchProcess:
+                                    pass
+                            process.terminate()
+                            process.wait(timeout=5)
+                            raise TimeoutError(failure)
                         time.sleep(0.1)
                     step: dict[str, Any] = {"name": name, "returncode": process.returncode,
                                             "duration_s": time.monotonic() - started}
@@ -216,9 +270,8 @@ class AcquisitionJob:
                     if step.get("cleanup_error"):
                         raise RuntimeError(f"Hardware cleanup failed: {step['cleanup_error']}")
                     if step.get("session_path"):
-                        from hf_dm.data.session_export import validate_session
                         self.status = "Verifying saved session data…"
-                        validation = validate_session(step["session_path"])
+                        validation = validate_saved_session(step["session_path"], output)
                         step["data_validation"] = validation
                         if not validation["valid"]:
                             raise RuntimeError("Saved-data validation failed; see result.json")
@@ -229,7 +282,7 @@ class AcquisitionJob:
                                 raise RuntimeError(f"{name}: recorded sensor check failed; see result.json")
                     elif process.returncode == 0:
                         raise RuntimeError("Acquisition exited without a saved session result")
-                    if timed_out:
+                    if watchdog.timed_out:
                         raise TimeoutError("Run exceeded its time limit; inspect saved data and log")
                     expected_stop = self.stop_path.exists() and str(step.get("error", "")).startswith("OperatorStop:")
                     if process.returncode and not expected_stop:

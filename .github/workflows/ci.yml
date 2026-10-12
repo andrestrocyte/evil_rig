@@ -30,6 +30,6 @@ jobs:
       - name: Critical lint checks
         run: python -m ruff check src tests
       - name: Stable-module type checks
-        run: python -m mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_export.py
+        run: python -m mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_export.py src/hf_dm/data/raw_stream.py
       - name: Hardware-free tests
         run: python -m pytest

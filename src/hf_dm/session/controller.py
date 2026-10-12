@@ -209,6 +209,7 @@ class HFDecisionSession:
 
     def _connect_hardware(self) -> None:
         self._run_control.check()
+        self._run_control.clear_hardware_closed()
         self._closed = False
         self._require_live_barcode_capacity()
         self.runtime_provenance = capture_runtime_provenance()
@@ -647,6 +648,8 @@ class HFDecisionSession:
             self._last_cleanup_error = HardwareCleanupError(cleanup_errors)
             if raise_on_error:
                 raise self._last_cleanup_error
+        else:
+            self._run_control.mark_hardware_closed()
 
     def _safe_log_event(self, event_type: str, payload: dict | None = None) -> None:
         """Keep recorder failures from interrupting hardware cleanup."""

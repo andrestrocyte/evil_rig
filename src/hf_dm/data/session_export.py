@@ -8,19 +8,21 @@ import json
 import os
 import subprocess
 import time
-from contextlib import contextmanager
-from dataclasses import asdict, is_dataclass
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager, ExitStack
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, overload
 
 import numpy as np
 import yaml
 
 from hf_dm.hardware.bringup_constants import FORCE_ANALOG_CHANNEL, FRAME2TTL_INPUT_CHANNEL
 from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
+from hf_dm.data.raw_stream import FileRows, NpzRows
 from hf_dm.timing_heartbeat import (
     TIMING_HEARTBEAT_EVENT_TYPE,
     analyze_timing_heartbeats,
@@ -286,7 +288,7 @@ def make_session_bundle(
     metadata: dict[str, Any],
     trials: list[Any],
     events: list[Any],
-    streamdio_events: list[Any],
+    streamdio_events: Sequence[Any],
     bpod_trials: list[dict[str, Any]],
     fsm_definitions: dict[str, str] | list[dict[str, Any]],
     npz_path: Path | None,
@@ -315,11 +317,12 @@ def make_session_bundle(
     trial_dicts = [_to_dict(trial) for trial in trials]
     event_dicts = [_event_to_dict(event) for event in events]
     debug_event_dicts = [_event_to_dict(event) for event in (debug_events or [])]
-    streamdio_rows = [_streamdio_to_dict(row) for row in streamdio_events]
+    streamdio_rows = streamdio_events if isinstance(streamdio_events, _StreamDIOView) else _StreamDIOView(streamdio_events)
+    streamdio_index = _index_streamdio(streamdio_rows, metadata)
 
     written: list[Path] = []
     timing_heartbeat_report = analyze_timing_heartbeats(
-        streamdio_rows,
+        streamdio_index.alignment_rows,
         session_events=event_dicts,
     )
     timing_heartbeat_samples = list(timing_heartbeat_report.get("samples") or [])
@@ -349,24 +352,7 @@ def make_session_bundle(
             [
                 _write_dict_csv(exports_dir / "trials_summary.csv", trial_dicts),
                 _write_dict_csv(exports_dir / "events.csv", event_dicts),
-                _write_streamdio_csv(exports_dir / "streamdio_events.csv", streamdio_rows),
-                _write_streamdio_subset_csv(
-                    exports_dir / "force_trace.csv",
-                    streamdio_rows,
-                    lambda row: row["event_type"] == "analog_input"
-                    and int(row["channel"]) == _force_channel(metadata),
-                ),
-                _write_streamdio_subset_csv(
-                    exports_dir / "camera_ttl.csv",
-                    streamdio_rows,
-                    lambda row: row["event_type"] == "camera",
-                ),
-                _write_streamdio_subset_csv(
-                    exports_dir / "frame2ttl_edges.csv",
-                    streamdio_rows,
-                    lambda row: row["event_type"] == "dio_input"
-                    and int(row["channel"]) == _frame2ttl_channel(metadata),
-                ),
+                *_write_streamdio_exports(exports_dir, streamdio_rows, metadata),
                 _write_licks_csv(exports_dir / "licks.csv", event_dicts),
                 _write_bpod_flat_csv(bpod_dir / "bpod_trials_flat.csv", bpod_trials),
             ]
@@ -407,14 +393,14 @@ def make_session_bundle(
             written.append(existing_export)
 
     if bool(options.get("export_timeline", True)):
-        timeline = _timeline_rows(event_dicts, streamdio_rows, bundle_dir=bundle_dir)
+        timeline = _timeline_rows(event_dicts, streamdio_index.alignment_rows, bundle_dir=bundle_dir)
         timeline_path = exports_dir / "synchronized_timeline.csv"
         written.append(_write_dict_csv(timeline_path, timeline))
         anchors_path = exports_dir / "alignment_anchors.json"
         _atomic_write_text(
             anchors_path,
             json.dumps(
-                _alignment_anchors(event_dicts, streamdio_rows, bundle_dir=bundle_dir),
+                _alignment_anchors(event_dicts, streamdio_index.alignment_rows, bundle_dir=bundle_dir),
                 indent=2,
             ),
         )
@@ -457,7 +443,7 @@ def make_session_bundle(
         metadata=metadata,
         trials=trial_dicts,
         event_dicts=event_dicts,
-        streamdio_rows=streamdio_rows,
+        streamdio_index=streamdio_index,
         bpod_trials=bpod_trials,
         fsm_definitions=fsm_definitions,
         artifacts=artifact_paths,
@@ -490,7 +476,7 @@ def make_session_bundle(
             metadata=metadata,
             trials=trial_dicts,
             event_dicts=event_dicts,
-            streamdio_rows=streamdio_rows,
+            streamdio_index=streamdio_index,
             bpod_trials=bpod_trials,
             fsm_definitions=fsm_definitions,
             artifacts=artifact_paths,
@@ -595,6 +581,65 @@ def _streamdio_to_dict(row: Any) -> dict[str, Any]:
     }
 
 
+class _StreamDIOView(Sequence[dict[str, Any]]):
+    """Convert only the current record, instead of duplicating millions of rows."""
+
+    def __init__(self, rows: Sequence[Any]):
+        self.rows = rows
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        if isinstance(self.rows, FileRows):
+            for row in self.rows:
+                yield dict(zip(STREAMDIO_COLUMNS, row, strict=True))
+        else:
+            for row in self.rows:
+                yield _streamdio_to_dict(row)
+
+    @overload
+    def __getitem__(self, index: int) -> dict[str, Any]: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[dict[str, Any]]: ...
+
+    def __getitem__(self, index: int | slice) -> dict[str, Any] | list[dict[str, Any]]:
+        if isinstance(index, slice):
+            return [_streamdio_to_dict(row) for row in self.rows[index]]
+        return _streamdio_to_dict(self.rows[index])
+
+
+@dataclass
+class _StreamDIOIndex:
+    count: int
+    counts_by_type: dict[str, int]
+    force_samples: int
+    frame2ttl_edges: int
+    alignment_rows: list[dict[str, Any]]
+
+
+def _index_streamdio(
+    rows: Iterable[dict[str, Any]], metadata: dict[str, Any], *, include_alignment: bool = True,
+) -> _StreamDIOIndex:
+    index = _StreamDIOIndex(0, {}, 0, 0, [])
+    force_channel, frame_channel = _force_channel(metadata), _frame2ttl_channel(metadata)
+    for row in rows:
+        kind, channel = str(row.get("event_type")), _optional_int(row.get("channel"))
+        index.count += 1
+        index.counts_by_type[kind] = index.counts_by_type.get(kind, 0) + 1
+        if kind == "analog_input" and channel == force_channel:
+            index.force_samples += 1
+        if kind == "dio_input" and channel == frame_channel:
+            index.frame2ttl_edges += 1
+        if include_alignment and (
+            kind in {"camera", "bpod_state", TIMING_HEARTBEAT_EVENT_TYPE}
+            or (kind == "dio_input" and channel in {frame_channel, FRAME2TTL_INPUT_CHANNEL})
+        ):
+            index.alignment_rows.append(row)
+    return index
+
+
 def _json_value(value: Any) -> Any:
     if hasattr(value, "item"):
         return value.item()
@@ -687,13 +732,37 @@ def _write_dict_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
-def _write_streamdio_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
+def _write_streamdio_csv(path: Path, rows: Iterable[dict[str, Any]]) -> Path:
     with _atomic_text_handle(path, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=STREAMDIO_COLUMNS)
         writer.writeheader()
         for row in rows:
             writer.writerow({key: row.get(key) for key in STREAMDIO_COLUMNS})
     return path
+
+
+def _write_streamdio_exports(
+    directory: Path, rows: Iterable[dict[str, Any]], metadata: dict[str, Any],
+) -> list[Path]:
+    paths = [directory / name for name in (
+        "streamdio_events.csv", "force_trace.csv", "camera_ttl.csv", "frame2ttl_edges.csv",
+    )]
+    force_channel, frame_channel = _force_channel(metadata), _frame2ttl_channel(metadata)
+    with ExitStack() as stack:
+        writers = [csv.writer(stack.enter_context(_atomic_text_handle(path, newline=""))) for path in paths]
+        for writer in writers:
+            writer.writerow(STREAMDIO_COLUMNS)
+        for row in rows:
+            values = [row.get(key) for key in STREAMDIO_COLUMNS]
+            channel = _optional_int(row.get("channel"))
+            writers[0].writerow(values)
+            if row["event_type"] == "analog_input" and channel == force_channel:
+                writers[1].writerow(values)
+            elif row["event_type"] == "camera":
+                writers[2].writerow(values)
+            elif row["event_type"] == "dio_input" and channel == frame_channel:
+                writers[3].writerow(values)
+    return paths
 
 
 def _write_timing_heartbeat_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
@@ -709,10 +778,10 @@ def _write_timing_heartbeat_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
 
 def _write_streamdio_subset_csv(
     path: Path,
-    rows: list[dict[str, Any]],
+    rows: Iterable[dict[str, Any]],
     predicate: Any,
 ) -> Path:
-    return _write_streamdio_csv(path, [row for row in rows if predicate(row)])
+    return _write_streamdio_csv(path, (row for row in rows if predicate(row)))
 
 
 def _write_licks_csv(path: Path, events: list[dict[str, Any]]) -> Path:
@@ -798,7 +867,7 @@ def _write_bpod_data_json(
 
 def _timeline_rows(
     events: list[dict[str, Any]],
-    streamdio_rows: list[dict[str, Any]],
+    streamdio_rows: Sequence[dict[str, Any]],
     *,
     bundle_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
@@ -868,7 +937,7 @@ def _timeline_rows(
 
 def _alignment_anchors(
     events: list[dict[str, Any]],
-    streamdio_rows: list[dict[str, Any]],
+    streamdio_rows: Sequence[dict[str, Any]],
     *,
     bundle_dir: Path | None = None,
 ) -> dict[str, Any]:
@@ -1090,7 +1159,7 @@ def _manifest(
     metadata: dict[str, Any],
     trials: list[dict[str, Any]],
     event_dicts: list[dict[str, Any]],
-    streamdio_rows: list[dict[str, Any]],
+    streamdio_index: _StreamDIOIndex,
     bpod_trials: list[dict[str, Any]],
     fsm_definitions: dict[str, str] | list[dict[str, Any]],
     artifacts: list[Path],
@@ -1098,10 +1167,7 @@ def _manifest(
     recorder_stats: dict[str, Any],
     timing_heartbeat_qc: dict[str, Any],
 ) -> dict[str, Any]:
-    counts_by_type: dict[str, int] = {}
-    for row in streamdio_rows:
-        event_type = str(row.get("event_type"))
-        counts_by_type[event_type] = counts_by_type.get(event_type, 0) + 1
+    counts_by_type = streamdio_index.counts_by_type
     event_counts: dict[str, int] = {}
     for event in event_dicts:
         event_type = str(event.get("event_type"))
@@ -1120,13 +1186,6 @@ def _manifest(
     streamdio_info = _streamdio_module_info(metadata, event_dicts)
     video_summary = _video_summary(manifest_path.parent, event_dicts)
     frame_count = _optional_int(video_summary.get("n_frames")) or 0
-    force_channel = _force_channel(metadata)
-    force_sample_count = sum(
-        1
-        for row in streamdio_rows
-        if row.get("event_type") == "analog_input"
-        and int(row.get("channel") or -1) == force_channel
-    )
     runtime_provenance = metadata.get("runtime_provenance") or {}
     package_version = (
         runtime_provenance.get("package_version")
@@ -1158,7 +1217,7 @@ def _manifest(
         "counts": {
             "trials": len(trials),
             "events": len(event_dicts),
-            "streamdio_events": len(streamdio_rows),
+            "streamdio_events": streamdio_index.count,
             "streamdio_by_type": dict(sorted(counts_by_type.items())),
             "session_events_by_type": dict(sorted(event_counts.items())),
             "licks": event_counts.get("lick", 0),
@@ -1168,13 +1227,8 @@ def _manifest(
                 0,
             ),
             "frames": frame_count,
-            "force_samples": force_sample_count,
-            "frame2ttl_edges": sum(
-                1
-                for row in streamdio_rows
-                if row.get("event_type") == "dio_input"
-                and int(row.get("channel") or -1) == _frame2ttl_channel(metadata)
-            ),
+            "force_samples": streamdio_index.force_samples,
+            "frame2ttl_edges": streamdio_index.frame2ttl_edges,
             "bpod_trials": len(bpod_trials),
             "bpod_trial_rows": _bpod_trial_row_count(bpod_trials),
         },
@@ -1187,7 +1241,7 @@ def _manifest(
         },
         "stream_summaries": metadata.get("stream_summaries") or {},
         "video": video_summary,
-        "clock_alignment": _clock_alignment(event_dicts, streamdio_rows, metadata),
+        "clock_alignment": _clock_alignment(event_dicts, streamdio_index.alignment_rows, metadata),
         "artifacts": artifact_entries,
         "fsm_definition_count": (
             len(fsm_definitions)
@@ -1207,7 +1261,7 @@ def _manifest(
 
 def _clock_alignment(
     events: list[dict[str, Any]],
-    streamdio_rows: list[dict[str, Any]],
+    streamdio_rows: Sequence[dict[str, Any]],
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
     wall_perf_anchors: list[tuple[float, float]] = []
@@ -1667,11 +1721,11 @@ def _git_commit(cwd: Path) -> str | None:
     return result.stdout.strip() or None
 
 
-def _load_npz_streamdio(path: Path) -> list[dict[str, Any]]:
-    with np.load(path, allow_pickle=True) as data:
-        if "streamdio_events" not in data.files:
-            return []
-        return [_streamdio_to_dict(row) for row in data["streamdio_events"]]
+def _load_npz_streamdio(path: Path) -> Sequence[dict[str, Any]]:
+    try:
+        return _StreamDIOView(NpzRows(path))
+    except KeyError:
+        return []
 
 
 def _validate_config_provenance(manifest: dict[str, Any], bundle_dir: Path) -> list[str]:
@@ -1833,18 +1887,19 @@ def _validate_manifest_counts(manifest: dict[str, Any], bundle_dir: Path) -> lis
 
     npz_path, npz_rel = _primary_npz_path(manifest, bundle_dir)
     if npz_path is not None and npz_path.exists():
-        streamdio_rows: list[dict[str, Any]] | None
+        streamdio_index: _StreamDIOIndex | None
         try:
-            streamdio_rows = _load_npz_streamdio(npz_path)
-        except Exception:
-            streamdio_rows = None
-        if streamdio_rows is not None:
-            streamdio_counts = _count_by_key(streamdio_rows, "event_type")
+            streamdio_index = _index_streamdio(_load_npz_streamdio(npz_path), metadata, include_alignment=False)
+        except Exception as exc:
+            errors.append(f"primary raw-event stream unreadable: {npz_rel}: {type(exc).__name__}: {exc}")
+            streamdio_index = None
+        if streamdio_index is not None:
+            streamdio_counts = streamdio_index.counts_by_type
             _append_count_mismatch(
                 errors,
                 "manifest count streamdio_events",
                 counts.get("streamdio_events"),
-                len(streamdio_rows),
+                streamdio_index.count,
                 npz_rel,
             )
             _append_count_mismatch(
@@ -1868,30 +1923,18 @@ def _validate_manifest_counts(manifest: dict[str, Any], bundle_dir: Path) -> lis
                 streamdio_counts.get("camera", 0),
                 npz_rel,
             )
-            force_samples = sum(
-                1
-                for row in streamdio_rows
-                if row.get("event_type") == "analog_input"
-                and int(row.get("channel") or -1) == _force_channel(metadata)
-            )
             _append_count_mismatch(
                 errors,
                 "manifest count force_samples",
                 counts.get("force_samples"),
-                force_samples,
+                streamdio_index.force_samples,
                 npz_rel,
-            )
-            frame2ttl_edges = sum(
-                1
-                for row in streamdio_rows
-                if row.get("event_type") == "dio_input"
-                and int(row.get("channel") or -1) == _frame2ttl_channel(metadata)
             )
             _append_count_mismatch(
                 errors,
                 "manifest count frame2ttl_edges",
                 counts.get("frame2ttl_edges"),
-                frame2ttl_edges,
+                streamdio_index.frame2ttl_edges,
                 npz_rel,
             )
     raw_video = manifest.get("video")
@@ -1946,7 +1989,7 @@ def _primary_npz_path(
     return None, "session npz"
 
 
-def _count_by_key(rows: list[Any], key: str) -> dict[str, int]:
+def _count_by_key(rows: Iterable[Any], key: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for row in rows:
         if not isinstance(row, dict):
@@ -2251,10 +2294,11 @@ def _validate_npz_artifact(path: Path, rel: str, manifest: dict[str, Any]) -> li
                     f"{len(data['trials'])} != {int(trial_count)}"
                 )
             streamdio_count = counts.get("streamdio_events")
-            if streamdio_count is not None and len(data["streamdio_events"]) != int(streamdio_count):
+            raw_count = len(NpzRows(path))
+            if streamdio_count is not None and raw_count != int(streamdio_count):
                 errors.append(
                     f"primary npz streamdio count mismatch: {rel}: "
-                    f"{len(data['streamdio_events'])} != {int(streamdio_count)}"
+                    f"{raw_count} != {int(streamdio_count)}"
                 )
             if len(data["summary_json"]) < 1:
                 errors.append(f"primary npz missing summary row: {rel}")
@@ -2583,12 +2627,12 @@ def _validate_timing_heartbeat_consistency(
         return ["timing heartbeat QC cannot be verified without primary NPZ"]
     try:
         rows = _load_npz_streamdio(npz_path)
+        actual = timing_heartbeat_qc_summary(analyze_timing_heartbeats(rows))
     except Exception as exc:
         return [
             f"timing heartbeat QC source unreadable: {rel}: "
             f"{type(exc).__name__}: {exc}"
         ]
-    actual = timing_heartbeat_qc_summary(analyze_timing_heartbeats(rows))
     errors: list[str] = []
     for field in (
         "overall_status",

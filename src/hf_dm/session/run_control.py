@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -29,6 +31,24 @@ class RunControl:
         self.reserve_bytes = reserve_bytes
         self._storage_paths = tuple(dict.fromkeys(Path(path).expanduser().resolve() for path in storage_paths))
         self._next_storage_check = 0.0
+        phase_path = os.environ.get("HF_DM_PHASE_PATH")
+        self.phase_path = Path(phase_path) if phase_path else None
+        self.run_token = os.environ.get("HF_DM_RUN_TOKEN")
+
+    def clear_hardware_closed(self) -> None:
+        if self.phase_path is not None:
+            self.phase_path.unlink(missing_ok=True)
+
+    def mark_hardware_closed(self) -> None:
+        """Advisory launcher signal, emitted only after verified hardware cleanup."""
+        if self.phase_path is None:
+            return
+        try:
+            temporary = self.phase_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"hardware_closed": True, "run_token": self.run_token}), encoding="utf-8")
+            temporary.replace(self.phase_path)
+        except OSError:
+            logging.getLogger(__name__).exception("Could not signal completed hardware cleanup to launcher")
 
     def check(self) -> None:
         now = time.perf_counter()

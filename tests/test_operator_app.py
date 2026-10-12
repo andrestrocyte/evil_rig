@@ -12,6 +12,46 @@ from hf_dm.session.controller import HFDecisionSession
 from hf_dm.session.run_control import OperatorStop, RunControl, bounded_close
 
 
+def test_verified_cleanup_allows_bounded_large_export_after_stop(tmp_path, monkeypatch):
+    from hf_dm.operator_app import JobWatchdog, hardware_closed_signal
+    phase = tmp_path / "phase.json"
+    monkeypatch.setenv("HF_DM_PHASE_PATH", str(phase))
+    monkeypatch.setenv("HF_DM_RUN_TOKEN", "this-launch")
+    control = RunControl()
+    watch = JobWatchdog(0, 60)
+    assert watch.check(10, stop_requested=True, hardware_closed=False) is None
+    assert not hardware_closed_signal(phase, "this-launch")
+    control.mark_hardware_closed()
+    assert not hardware_closed_signal(phase, "previous-launch")
+    assert hardware_closed_signal(phase, "this-launch")
+    assert watch.check(12, stop_requested=True, hardware_closed=True) is None
+    assert watch.check(100, stop_requested=True, hardware_closed=True) is None
+    assert not watch.timed_out
+    assert "finalization timed out" in watch.check(313, stop_requested=True, hardware_closed=True)
+    control.clear_hardware_closed()
+    assert not hardware_closed_signal(phase, "this-launch")
+
+
+def test_unverified_hardware_cleanup_keeps_short_stop_deadline():
+    from hf_dm.operator_app import JobWatchdog
+    watch = JobWatchdog(0, 20)
+    assert watch.check(21, stop_requested=False, hardware_closed=False) is None
+    assert watch.timed_out
+    assert "failed to stop" in watch.check(52, stop_requested=True, hardware_closed=False)
+
+
+def test_saved_data_validation_has_a_process_timeout(monkeypatch):
+    import io
+    import subprocess
+    from hf_dm.operator_app import validate_saved_session
+    def stalled(*args, **kwargs):
+        assert kwargs["timeout"] == 300
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+    monkeypatch.setattr(subprocess, "run", stalled)
+    with pytest.raises(subprocess.TimeoutExpired):
+        validate_saved_session("session.json", io.BytesIO())
+
+
 def test_stop_request_is_cooperative_and_deadline_is_finite(tmp_path, monkeypatch):
     stop = tmp_path / "stop.request"
     monkeypatch.setenv("HF_DM_STOP_REQUEST", str(stop))

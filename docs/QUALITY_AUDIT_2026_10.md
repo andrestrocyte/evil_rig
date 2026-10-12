@@ -7,9 +7,9 @@ session selection, on-demand diagnostics, cooperative Stop and saved results.
 This audit does not establish that every hardware component is calibrated or
 that the system is bug-free.
 
-Local verification: full suite 361 passed; all 72 commissioning, lifecycle and
-simulation tests passed after the final adjustments. Ruff and stable-module mypy
-passed. CI checks Windows and Linux.
+Local verification: full suite 373 passed. Ruff and type checks for config,
+recorder, session export and the new block I/O module passed. CI checks Windows
+and Linux; the preceding commit also passed all 362 tests on both platforms.
 
 ## Repairs
 
@@ -52,6 +52,16 @@ passed. CI checks Windows and Linux.
   checked per run; bind the actual installed driver source hash. Exact commit
   matching no longer requires a redundant Git tag. Certificates created before
   this update need regeneration because code and identity hashing changed.
+- Stream raw NPZ serialization, CSV exports and NPZ validation in blocks rather
+  than constructing several full Python copies. Preserve every value, column and
+  dtype. Normal finalization rejects a missing, truncated or CRC-invalid WAL and
+  retains recovery evidence instead of substituting a partial in-memory cache.
+- Bound the optional chunk queue to two blocks. Backlog falls back to the complete
+  WAL; a writer that fails to stop prevents completion/manifest publication.
+- Separate the 30-second hardware-stop deadline from the five-minute export
+  deadline, using a per-launch token and a verified-cleanup signal. Data validation
+  also has a five-minute process timeout. Stop no longer kills a healthy large
+  export merely because its hardware shutdown grace period expired.
 
 ## Evidence on this PC
 
@@ -71,6 +81,10 @@ passed. CI checks Windows and Linux.
 | Idle optical poll optimization | Subsequent 30-second run: 915 triggers = 915 frames; preview age 74 / 89 ms median/p95; aggregate CPU median 336% to 214% (100% = one CPU core) | Different run durations; host measurements, not calibrated exposure latency |
 | Force snapshot benchmark | 60,000 samples: display snapshot mean 2.42 ms to 0.0011 ms; exact p95 tested against NumPy | Synthetic ADC values; physical force calibration still pending |
 | Low-space fault injection | Stop/finalize in 1.07 s, 17 triggers = 17 frames, exports valid, clean cleanup/interlock | Raised reserve threshold without filling the disk; not a physical disk-full or power-loss test |
+| Million-row export | Finalization peak RSS 725.7 to 69.6 MiB; 17.59 to 16.10 s. Validation 611.8 to 62.1 MiB; 22.92 to 9.99 s | Synthetic records, separate runs on this PC; not an animal session |
+| Export equivalence | All 1,000,000 NPZ rows and dtype equal; raw/force/camera/Frame2TTL CSVs byte-identical to prior exporter | Metadata/timing fields intentionally vary by benchmark run |
+| 3.6-million-row export | Finalize 58.04 s / 139.5 MiB peak RSS; validation 31.96 s / 103.8 MiB; complete bundle validates | Synthetic 1 kHz record volume for one hour; not a live one-hour hardware soak |
+| Stop with block exports | 225 triggers = 225 images; clean shutdown, valid data and clear interlock 2.41 s after Stop | Short live optical observation; no physical beam gestures |
 
 Local evidence (recordings are intentionally excluded from Git):
 
@@ -85,6 +99,10 @@ Local evidence (recordings are intentionally excluded from Git):
 - `data/runtime/operator/runs/20261012_220416_893759/result.json` (idle-poll optimization)
 - `data/runtime/audit/storage_guard_result.json` (injected low-space threshold)
 - `data/runtime/audit/wheel_snapshot_before.json` and `wheel_snapshot_after.json`
+- `data/runtime/audit/export_before/benchmark.json` and `export_optimized/benchmark.json`
+- `data/runtime/audit/export_equivalence.json` (complete raw values and CSV comparison)
+- `data/runtime/audit/export_one_hour/benchmark.json` (3.6 million synthetic records)
+- `data/runtime/operator/runs/20261012_223247_869969/stop_result.json` (live block-export Stop)
 
 The earlier rig check at `20261012_211459_030909` incorrectly reported overall
 success despite only four of six barcode matches. The earlier Stop check at
@@ -104,9 +122,15 @@ Use the launcher's 20-second input view when someone is at the rig. Retain the
 animal-use commissioning/calibration gate until physical evidence is available.
 This does not mean repeating the full diagnostics before each bench session.
 
-Finalization still reconstructs the full raw stream in memory. Full-resolution PGM
-video uses about 2.8 GB/min on this camera. Optional chunk output has a background
-queue; a persistently stalled storage device is not covered by the short live tests.
+Normal finalization and validation stream the high-rate raw data in blocks; the
+lower-rate semantic timeline and heartbeat analysis still grow with session size.
+Crash recovery still reconciles raw records in memory. Full-resolution PGM video
+uses about 2.8 GB/min on this camera. A stalled optional writer is fault-injected in
+tests; a physical storage-device hang has not been tested.
 Windows reported unavailable directory fsync support: file flushes, atomic writes
 and process-crash recovery are tested, but sudden-power-loss durability is not
 established. These limits prevent a defensible "10/10, bug-free" claim.
+
+Camera configuration also needs a further audit: explicit ROI writes currently
+lack full readback verification, and the alternate PySpin saving path has not had
+the live timing validation performed on this rig's C API backend.
