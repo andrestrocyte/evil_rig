@@ -111,6 +111,7 @@ def test_recover_session_repairs_truncated_tail_and_finalizes(tmp_path):
             host_perf_counter_s=100.0 + index * 0.1,
         )
     recorder.add_trial(_trial())
+    recorder._close_streamdio_wal(durable=True)
     recorder.close_journal()
     with recorder.journal_path.open("a", encoding="utf-8") as handle:
         handle.write('{"schema_version":1')

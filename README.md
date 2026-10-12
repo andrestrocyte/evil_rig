@@ -702,8 +702,8 @@ acquisition, stopping through normal cleanup when a recording volume falls below
 2 GiB free. Full-resolution uncompressed video still needs substantial space
 (about 2.8 GB/min on the installed camera). This reserve is a guard, not a promise
 that every possible session's exports will fit. Semantic events, camera timelines
-and heartbeat analysis still grow with session length. Crash recovery currently
-reconciles its raw records in memory; normal finalization avoids those full copies.
+and heartbeat analysis still grow with session length. Normal finalization and
+crash recovery both stream the high-rate raw records without full in-memory copies.
 
 ### Inspecting a session
 
@@ -796,9 +796,21 @@ the marker, or the journal:
 hf-dm recover-session data/sessions/decision_making/mouse01/2026-06-28/001
 ```
 
-Recovery preserves the original journal, repairs a truncated final line, restores completed trials +
-Bpod rows, folds in completed StreamDIO chunks, atomically rewrites NPZ/JSON, and runs the manifest
-validator. The marker is removed only after primary writes and exports succeed.
+Recovery preserves the original journal, repairs a truncated final line, restores
+completed trials and Bpod rows, and compares the WAL and completed chunks in
+blocks. Their common prefix must agree; missing chunk indices, corrupt chunks,
+or interior WAL checksum failures stop recovery explicitly. A damaged final WAL
+record can be excluded, with its byte count reported and an exact
+`.wal.recovery-backup` retained and hashed in the manifest.
+
+Recovery retains existing chunks and writes any missing suffix synchronously in
+blocks of at most 8,192 events. It does not replay through the live writer queue
+or delete its input chunks. The regenerated NPZ/JSON/exports are validated before
+the WAL and incomplete marker are removed. Failed writes or validation leave the
+durable inputs and marker available for retry. Validation establishes consistency
+of the recovered records; it cannot recreate records that never reached storage.
+Recovery creates a manifest even if the original session disabled it, so this
+validation also works for sessions with optional exports turned off.
 
 **Session QC.** `hf-dm session-qc` writes `session.qc.json` with PASS/WARN/FAIL for response rate,
 matched rate, response time, choice-loop stalls, and worst frame duration. Calibrated sessions also

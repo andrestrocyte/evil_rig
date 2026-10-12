@@ -70,6 +70,12 @@ and Linux; the preceding commit also passed all 362 tests on both platforms.
   the C backend. Retain post-save CSV clock semantics and add separate host receipt
   clocks. A PySpin save timeout now fails capture instead of being confused with
   an ordinary acquisition wait; a stopped camera wait no longer invents an error.
+- Stream crash-recovery WAL/chunk reads and compare shared prefixes sequentially.
+  Retain original chunks, append only the missing suffix in blocks, and keep the
+  WAL/marker until the recovered bundle validates. Stop on divergent sources,
+  corrupt chunks, missing indices or interior WAL CRC damage. Preserve damaged
+  final WAL bytes in a manifest-hashed backup. Close readers on early failure and
+  sort chunk numbers numerically beyond 999.
 
 ## Evidence on this PC
 
@@ -96,6 +102,9 @@ and Linux; the preceding commit also passed all 362 tests on both platforms.
 | Camera settings | Actual 1440 × 1080 Mono8; 640 × 480 crop at (32, 24), full-frame restoration and deliberately invalid width all behave correctly; clean SDK cleanup | Live C backend; alternate PySpin adapters exercised with fakes |
 | Camera after readback changes | 914 triggers = 914 images; preview 77 / 87 ms median/p95; receipt-to-save 2.92 / 5.89 ms; all 25 artifacts validate | Thirty-second input observation; no incomplete/save errors, clean cleanup; not calibrated exposure-to-display timing |
 | Compression experiment | Lossless level-1 compression retains about 24% of original image bytes; minimum tested PNG filtering takes about 22 ms/frame | Eight saved frames; insufficient margin to change the live default without further throughput testing |
+| Million-row crash recovery | Peak RSS 353.6 to 68.2 MiB; recovery plus validation 25.13 to 27.23 s; complete bundle validates | Synthetic source records; more sequential verification trades some time for bounded raw-data memory |
+| Recovery equivalence / failures | All one million raw NPZ rows and dtype equal; four raw CSVs byte-identical. Injected disk failure and failed validation retry successfully; original prefix chunks unchanged | Process/file fault injection, not storage hardware failure or sudden power loss |
+| 3.6-million-row crash recovery | Recovery and validation complete in 97.44 s at 139.3 MiB peak RSS; all 3.6 million records retained, bundle valid | Synthetic one-hour volume at 1 kHz; semantic camera timeline still grows with record duration |
 
 Local evidence (recordings are intentionally excluded from Git):
 
@@ -117,6 +126,9 @@ Local evidence (recordings are intentionally excluded from Git):
 - `data/runtime/audit/camera_settings_readback.json` (live readback and ROI rollback)
 - `data/runtime/audit/camera_receipt_result.json` (live counts, GUI age and receipt-to-save timing)
 - `data/runtime/audit/png_compression.json` (read-only compression benchmark)
+- `data/runtime/audit/recovery_before/benchmark.json` and `recovery_after/benchmark.json`
+- `data/runtime/audit/recovery_equivalence.json` (one-million-row exact comparison)
+- `data/runtime/audit/recovery_one_hour/benchmark.json` (3.6-million-row recovery)
 
 The earlier rig check at `20261012_211459_030909` incorrectly reported overall
 success despite only four of six barcode matches. The earlier Stop check at
@@ -136,9 +148,9 @@ Use the launcher's 20-second input view when someone is at the rig. Retain the
 animal-use commissioning/calibration gate until physical evidence is available.
 This does not mean repeating the full diagnostics before each bench session.
 
-Normal finalization and validation stream the high-rate raw data in blocks; the
+Normal finalization, validation and crash recovery stream high-rate raw data in blocks; the
 lower-rate semantic timeline and heartbeat analysis still grow with session size.
-Crash recovery still reconciles raw records in memory. Full-resolution PGM video
+The semantic journal is still loaded in memory during recovery. Full-resolution PGM video
 uses about 2.8 GB/min on this camera. A stalled optional writer is fault-injected in
 tests; a physical storage-device hang has not been tested.
 Windows reported unavailable directory fsync support: file flushes, atomic writes

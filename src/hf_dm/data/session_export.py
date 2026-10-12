@@ -22,7 +22,7 @@ import yaml
 
 from hf_dm.hardware.bringup_constants import FORCE_ANALOG_CHANNEL, FRAME2TTL_INPUT_CHANNEL
 from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
-from hf_dm.data.raw_stream import FileRows, NpzRows
+from hf_dm.data.raw_stream import FileRows, NpzRows, chunk_number
 from hf_dm.timing_heartbeat import (
     TIMING_HEARTBEAT_EVENT_TYPE,
     analyze_timing_heartbeats,
@@ -425,7 +425,7 @@ def make_session_bundle(
         written.append(preview_export)
 
     manifest_path = bundle_dir / "manifest.json"
-    chunk_paths = sorted(continuous_dir.glob("streamdio_chunk_*.npz"))
+    chunk_paths = sorted(continuous_dir.glob("streamdio_chunk_*.npz"), key=chunk_number)
     journal_path = Path(base_path).with_suffix(".journal.jsonl")
     artifact_paths = [
         json_path,
@@ -434,6 +434,13 @@ def make_session_bundle(
         *_video_artifact_paths(bundle_dir, event_dicts),
         *chunk_paths,
     ]
+    # Damaged WAL tails are retained verbatim by recovery. Include that evidence
+    # in the manifest so copying/validating a recovered bundle also checks it.
+    for event in event_dicts:
+        if event.get("event_type") == "session_recovered":
+            backup = (event.get("payload") or {}).get("streamdio_wal_recovery_backup")
+            if backup and Path(backup) not in artifact_paths:
+                artifact_paths.append(Path(backup))
     if npz_path is not None and npz_path.exists():
         artifact_paths.insert(0, npz_path)
     manifest = _manifest(
@@ -1403,7 +1410,7 @@ def _continuous_stream_summary(
             )
     if not chunks:
         return None
-    chunks.sort(key=lambda item: str(item.get("path") or ""))
+    chunks.sort(key=lambda item: chunk_number(Path(str(item["path"]))))
     return {
         "stream": "streamdio_events",
         "chunk_count": len(chunks),

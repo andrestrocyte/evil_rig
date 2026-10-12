@@ -55,9 +55,13 @@ class FileRows(Sequence[RawRow]):
 
 
 class WalRows(FileRows):
-    """Strict reader for a closed WAL; crash-tail repair is a separate workflow."""
+    """Repeatable closed-WAL reader; optionally accept only a damaged final record.
 
-    def __init__(self, path: Path):
+    Interior CRC damage is never treated as an ordinary crash tail. Recovery
+    retains the original bytes and exposes the discarded byte count explicitly.
+    """
+
+    def __init__(self, path: Path, *, recover_tail: bool = False):
         self.path = path
         with path.open("rb") as handle:
             self.magic = handle.read(len(WAL_MAGIC))
@@ -65,8 +69,33 @@ class WalRows(FileRows):
             raise ValueError(f"Invalid StreamDIO WAL header: {path}")
         self.record = WAL_RECORD if self.magic == WAL_MAGIC else WAL_PAYLOAD
         self._count, tail = divmod(path.stat().st_size - len(self.magic), self.record.size)
-        if tail:
+        if tail and not recover_tail:
             raise ValueError(f"StreamDIO WAL has {tail} trailing bytes: {path}")
+        self.trailing_bytes = tail
+        if recover_tail and self.magic == WAL_MAGIC:
+            seen = 0
+            with path.open("rb") as handle:
+                handle.seek(len(self.magic))
+                while seen < self._count:
+                    n = min(BLOCK_ROWS, self._count - seen)
+                    block = handle.read(n * self.record.size)
+                    if len(block) != n * self.record.size:
+                        raise ValueError("StreamDIO WAL changed during recovery scan")
+                    view = memoryview(block)
+                    for index, raw in enumerate(self.record.iter_unpack(block)):
+                        start = index * self.record.size
+                        if zlib.crc32(view[start:start + WAL_PAYLOAD.size]) & 0xFFFFFFFF != raw[6]:
+                            if seen != self._count - 1:
+                                raise ValueError(f"StreamDIO WAL interior checksum mismatch at record {seen}")
+                            self.trailing_bytes += self.record.size
+                            self._count -= 1
+                            break
+                        seen += 1
+        with path.open("rb") as handle:
+            handle.seek(len(self.magic) + self._count * self.record.size)
+            self._tail = handle.read(self.trailing_bytes + 1)
+        if len(self._tail) != self.trailing_bytes:
+            raise ValueError("StreamDIO WAL size changed during initialization")
 
     def __iter__(self) -> Iterator[RawRow]:
         names: dict[bytes, str] = {}
@@ -74,8 +103,10 @@ class WalRows(FileRows):
         with self.path.open("rb") as handle:
             if handle.read(len(self.magic)) != self.magic:
                 raise ValueError("StreamDIO WAL header changed during export")
-            while block := handle.read(self.record.size * BLOCK_ROWS):
-                if len(block) % self.record.size:
+            while seen < self._count:
+                n = min(BLOCK_ROWS, self._count - seen)
+                block = handle.read(self.record.size * n)
+                if len(block) != self.record.size * n:
                     raise ValueError("StreamDIO WAL truncated during export")
                 view = memoryview(block)
                 for index, raw in enumerate(self.record.iter_unpack(block)):
@@ -89,6 +120,8 @@ class WalRows(FileRows):
                         names[raw[0]] = name
                     yield (name, raw[1], raw[2], raw[3], raw[4], raw[5])
                     seen += 1
+            if handle.read(self.trailing_bytes + 1) != self._tail:
+                raise ValueError("StreamDIO WAL tail or count changed during export")
         if seen != self._count:
             raise ValueError("StreamDIO WAL count changed during export")
 
@@ -129,6 +162,26 @@ class NpzRows(FileRows):
                 remaining -= n
             if handle.read(1):
                 raise ValueError("Unexpected trailing raw-event array bytes")
+
+
+def chunk_number(path: Path) -> int:
+    """Numeric order remains correct when a recording exceeds 999 chunks."""
+    return int(path.stem.removeprefix("streamdio_chunk_"))
+
+
+class ChunkRows(FileRows):
+    """Read the whole contiguous chunk prefix, without loading entire arrays."""
+
+    def __init__(self, paths: Sequence[Path]):
+        self.paths = sorted(paths, key=chunk_number)
+        if [chunk_number(path) for path in self.paths] != list(range(len(self.paths))):
+            raise ValueError("StreamDIO chunk sequence has a gap or duplicate index")
+        self.parts = [NpzRows(path) for path in self.paths]
+        self._count = sum(map(len, self.parts))
+
+    def __iter__(self) -> Iterator[RawRow]:
+        for part in self.parts:
+            yield from part
 
 
 class RawArray:
