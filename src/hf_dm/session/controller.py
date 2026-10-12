@@ -1976,12 +1976,7 @@ class HFDecisionSession:
                     "target_trigger_hz": camera_cfg.frequency_hz,
                     "exposure_us": camera_cfg.exposure_us,
                     "pixel_format": camera_cfg.pixel_format,
-                    "roi": {
-                        "width": camera_cfg.roi_width,
-                        "height": camera_cfg.roi_height,
-                        "offset_x": camera_cfg.roi_offset_x,
-                        "offset_y": camera_cfg.roi_offset_y,
-                    },
+                    **recorder.camera_settings,
                 },
             )
             self.recorder.log_event(
@@ -1991,6 +1986,7 @@ class HFDecisionSession:
                     "save_dir": str(session_dir),
                     "serial_number": camera_cfg.serial_number,
                     "pixel_format": camera_cfg.pixel_format,
+                    **recorder.camera_settings,
                 },
             )
         except Exception as exc:

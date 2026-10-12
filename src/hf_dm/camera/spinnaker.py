@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from .settings import apply_roi
+
 logger = logging.getLogger(__name__)
 
 
@@ -188,6 +190,19 @@ def _next_pgm_token(raw: bytes, pos: int) -> tuple[bytes, int]:
     return raw[start:pos], pos
 
 
+def _save_mono_pgm(path: Path, width: int, height: int, stride: int, raw: bytes) -> None:
+    """Save every Mono8 pixel, excluding row padding, without an SDK encoder."""
+    if min(width, height) <= 0 or stride < width or len(raw) != stride * height:
+        raise ValueError("Invalid Mono8 dimensions or buffer size")
+    with path.open("wb") as handle:
+        handle.write(f"P5\n{width} {height}\n255\n".encode("ascii"))
+        if stride == width:
+            handle.write(raw)
+        else:
+            for row in range(height):
+                handle.write(raw[row * stride : row * stride + width])
+
+
 class _PreviewDispatcher:
     """Drop-stale dispatcher so preview publishing cannot stall acquisition."""
 
@@ -260,10 +275,14 @@ class _FrameTimestampWriter:
         self._handle = self.path.open("w", newline="", encoding="utf-8")
         self._writer = csv.writer(self._handle)
         self._writer.writerow(
-            ["frame_index", "camera_timestamp_ns", "wall_time_s", "monotonic_s", "filename"]
+            ["frame_index", "camera_timestamp_ns", "wall_time_s", "monotonic_s", "filename",
+             "received_wall_time_s", "received_monotonic_s"]
         )
 
-    def write(self, frame_index: int, camera_timestamp_ns: int | None, filename: str) -> None:
+    def write(
+        self, frame_index: int, camera_timestamp_ns: int | None, filename: str,
+        *, received_wall_s: float | None = None, received_mono_s: float | None = None,
+    ) -> None:
         self._writer.writerow(
             [
                 int(frame_index),
@@ -271,6 +290,8 @@ class _FrameTimestampWriter:
                 time.time(),
                 time.perf_counter(),
                 filename,
+                "" if received_wall_s is None else received_wall_s,
+                "" if received_mono_s is None else received_mono_s,
             ]
         )
         if frame_index % 30 == 0:
@@ -318,6 +339,8 @@ class _SpinnakerCRecorder:
         self._roi_offset_y = None if roi_offset_y is None else int(roi_offset_y)
         self._gain_db = gain_db
         self._gamma = gamma
+        self._actual_roi: dict[str, int] | None = None
+        self._settings_readback: dict[str, Any] = {}
         self._acquisition_timeout_ms = int(acquisition_timeout_ms)
         self._preview_callback = preview_callback
         self._preview_max_width = int(preview_max_width)
@@ -461,7 +484,10 @@ class _SpinnakerCRecorder:
             "target_trigger_hz": int(self._fps),
             "exposure_us": int(self._exposure_us),
             "pixel_format": self._pixel_format,
-            "roi": self._roi_summary(),
+            "roi": self._actual_roi,
+            "requested_roi": self._roi_summary(),
+            "settings_readback": dict(self._settings_readback),
+            "exposure_control": "StreamDIO trigger pulse width; ExposureTime is the timed-mode setting",
             "preview_frames": int(self._preview_count),
             "preview_frames_delivered": int(self._preview_dispatcher.delivered_count),
             "frame_timestamps_csv": str(self.session_dir / "frame_timestamps.csv"),
@@ -547,9 +573,14 @@ class _SpinnakerCRecorder:
         )
         self._bind("spinEnumerationEntryGetIntValue", [void_p, ctypes.POINTER(ctypes.c_int64)])
         self._bind("spinEnumerationSetIntValue", [void_p, ctypes.c_int64])
+        self._bind("spinEnumerationGetCurrentEntry", [void_p, ctypes.POINTER(void_p)])
+        self._bind("spinEnumerationEntryGetSymbolic", [void_p, ctypes.c_char_p, size_p])
         self._bind("spinFloatSetValue", [void_p, ctypes.c_double])
-        self._bind_optional("spinIntegerSetValue", [void_p, ctypes.c_int64])
+        self._bind("spinFloatGetValue", [void_p, ctypes.POINTER(ctypes.c_double)])
+        self._bind("spinIntegerSetValue", [void_p, ctypes.c_int64])
+        self._bind("spinIntegerGetValue", [void_p, ctypes.POINTER(ctypes.c_int64)])
         self._bind("spinBooleanSetValue", [void_p, ctypes.c_ubyte])
+        self._bind("spinBooleanGetValue", [void_p, ctypes.POINTER(ctypes.c_ubyte)])
         self._bind(
             "spinStringGetValue",
             [void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t)],
@@ -632,17 +663,48 @@ class _SpinnakerCRecorder:
         self._apply_roi(node_map)
         self._set_enum(node_map, "PixelFormat", self._pixel_format, required=True)
         if self._gain_db is not None:
-            self._set_enum(node_map, "GainAuto", "Off")
+            self._set_enum(node_map, "GainAuto", "Off", required=True)
             self._set_float(node_map, "Gain", self._gain_db)
         if self._gamma is not None:
-            self._set_bool(node_map, "GammaEnable", True)
+            self._set_bool(node_map, "GammaEnable", True, required=True)
             self._set_float(node_map, "Gamma", self._gamma)
+        self._record_optional_settings(node_map)
         self._set_enum(node_map, "TriggerSelector", "FrameStart", required=True)
         self._set_enum(node_map, "TriggerSource", "Line0", required=True)
         self._set_enum(node_map, "TriggerActivation", "RisingEdge", required=True)
         self._set_float(node_map, "TriggerDelay", 9.0)
         self._set_enum(node_map, "TriggerMode", "On", required=True)
         self._set_enum(node_map, "ExposureMode", "TriggerWidth", required=True)
+
+    def _record_optional_settings(self, node_map: ctypes.c_void_p) -> None:
+        for name, kind in (("Gain", "Float"), ("Gamma", "Float"), ("GammaEnable", "Boolean")):
+            try:
+                self._settings_readback[name] = self._read_value(node_map, name, kind)
+            except RuntimeError:
+                self._settings_readback[name] = None
+        try:
+            self._settings_readback["GainAuto"] = self._read_enum(node_map, "GainAuto")
+        except RuntimeError:
+            self._settings_readback["GainAuto"] = None
+
+    def _read_value(self, node_map: ctypes.c_void_p, name: str, kind: str) -> Any:
+        node = self._get_node(node_map, name)
+        if node is None:
+            raise RuntimeError(f"Spinnaker {name}: node unavailable")
+        value = {"Integer": ctypes.c_int64, "Float": ctypes.c_double, "Boolean": ctypes.c_ubyte}[kind]()
+        self._check(f"spin{kind}GetValue", node, ctypes.byref(value))
+        return bool(value.value) if kind == "Boolean" else value.value
+
+    def _read_enum(self, node_map: ctypes.c_void_p, name: str) -> str:
+        node = self._get_node(node_map, name)
+        if node is None:
+            raise RuntimeError(f"Spinnaker {name}: node unavailable")
+        entry = ctypes.c_void_p()
+        self._check("spinEnumerationGetCurrentEntry", node, ctypes.byref(entry))
+        size = ctypes.c_size_t(256)
+        buffer = ctypes.create_string_buffer(size.value)
+        self._check("spinEnumerationEntryGetSymbolic", entry, buffer, ctypes.byref(size))
+        return buffer.value.decode("ascii")
 
     def _get_node(self, node_map: ctypes.c_void_p, name: str) -> ctypes.c_void_p | None:
         node = ctypes.c_void_p()
@@ -681,34 +743,39 @@ class _SpinnakerCRecorder:
         if result != 0:
             failed(f"set failed with Spinnaker error {result}")
             logger.debug("Could not set Spinnaker enum %s=%s (%d)", name, entry_name, result)
+            return
+        try:
+            actual = self._read_enum(node_map, name)
+            if actual != entry_name:
+                raise RuntimeError(f"readback mismatch: got {actual}")
+        except RuntimeError as exc:
+            failed(str(exc))
+            return
+        self._settings_readback[name] = actual
 
     def _set_float(self, node_map: ctypes.c_void_p, name: str, value: float) -> None:
         node = self._get_node(node_map, name)
         if node is None:
-            return
-        result = self._fn["spinFloatSetValue"](node, float(value))
-        if result != 0:
-            logger.debug("Could not set Spinnaker float %s=%s (%d)", name, value, result)
+            raise RuntimeError(f"Required Spinnaker float {name}={value}: node unavailable")
+        self._check("spinFloatSetValue", node, float(value))
+        # Camera floats can be quantized. Retain the actual accepted value.
+        self._settings_readback[name] = self._read_value(node_map, name, "Float")
 
     def _set_int(self, node_map: ctypes.c_void_p, name: str, value: int) -> None:
-        if "spinIntegerSetValue" not in self._fn:
-            return
         node = self._get_node(node_map, name)
         if node is None:
-            return
-        result = self._fn["spinIntegerSetValue"](node, int(value))
-        if result != 0:
-            logger.debug("Could not set Spinnaker integer %s=%s (%d)", name, value, result)
+            raise RuntimeError(f"Required Spinnaker integer {name}={value}: node unavailable")
+        self._check("spinIntegerSetValue", node, int(value))
+        actual = self._read_value(node_map, name, "Integer")
+        if actual != value:
+            raise RuntimeError(f"Spinnaker {name} readback mismatch: requested {value}, got {actual}")
 
     def _apply_roi(self, node_map: ctypes.c_void_p) -> None:
-        for node_name, value in (
-            ("OffsetX", self._roi_offset_x),
-            ("OffsetY", self._roi_offset_y),
-            ("Width", self._roi_width),
-            ("Height", self._roi_height),
-        ):
-            if value is not None:
-                self._set_int(node_map, node_name, max(0, int(value)))
+        self._actual_roi = apply_roi(
+            self._roi_summary(),
+            lambda name: self._read_value(node_map, name, "Integer"),
+            lambda name, value: self._set_int(node_map, name, value),
+        )
 
     def _set_bool(
         self,
@@ -731,6 +798,16 @@ class _SpinnakerCRecorder:
                     f"set failed with Spinnaker error {result}"
                 )
             logger.debug("Could not set Spinnaker bool %s=%s (%d)", name, value, result)
+            return
+        try:
+            actual = self._read_value(node_map, name, "Boolean")
+            if actual != value:
+                raise RuntimeError(f"readback mismatch: got {actual}")
+        except RuntimeError as exc:
+            if required:
+                raise RuntimeError(f"Required Spinnaker bool {name}={value}: {exc}") from exc
+            return
+        self._settings_readback[name] = actual
 
     def _capture_loop(self) -> None:
         assert self._timestamps is not None
@@ -750,6 +827,8 @@ class _SpinnakerCRecorder:
                 self._error = f"spinCameraGetNextImageEx failed with Spinnaker error {result}"
                 logger.error("Spinnaker C capture loop error: %s", self._error)
                 break
+            acquired_mono_s = time.perf_counter()
+            acquired_wall_s = time.time()
             try:
                 incomplete = ctypes.c_ubyte()
                 if self._fn["spinImageIsIncomplete"](image, ctypes.byref(incomplete)) != 0:
@@ -761,7 +840,6 @@ class _SpinnakerCRecorder:
                 frame_index = self._frame_count
                 filename = f"frame_{frame_index:09d}.pgm"
                 frame_path = self.session_dir / filename
-                acquired_mono_s = time.perf_counter()
                 camera_timestamp = ctypes.c_uint64()
                 timestamp_result = self._fn["spinImageGetTimeStamp"](
                     image,
@@ -776,14 +854,7 @@ class _SpinnakerCRecorder:
                             camera_timestamp_ns=camera_timestamp_ns,
                             mono_frame=mono_frame, acquired_mono_s=acquired_mono_s,
                         )
-                        width, height, stride, raw = mono_frame
-                        with frame_path.open("wb") as handle:
-                            handle.write(f"P5\n{width} {height}\n255\n".encode("ascii"))
-                            if stride == width:
-                                handle.write(raw)
-                            else:
-                                for row in range(height):
-                                    handle.write(raw[row * stride : row * stride + width])
+                        _save_mono_pgm(frame_path, *mono_frame)
                     else:
                         self._check("spinImageSaveFromExt", image, os.fsencode(frame_path))
                         self._maybe_emit_saved_preview(
@@ -794,7 +865,10 @@ class _SpinnakerCRecorder:
                 except Exception:
                     self._save_errors += 1
                     raise
-                self._timestamps.write(frame_index, camera_timestamp_ns, filename)
+                self._timestamps.write(
+                    frame_index, camera_timestamp_ns, filename,
+                    received_wall_s=acquired_wall_s, received_mono_s=acquired_mono_s,
+                )
                 self._frame_count += 1
             except Exception as exc:
                 self._error = f"{type(exc).__name__}: {exc}"
@@ -946,6 +1020,8 @@ class HeadlessSpinnakerRecorder:
             thread_name="spinnaker-preview",
         )
         self.backend = "spinnaker_pyspin"
+        self._actual_roi: dict[str, int] | None = None
+        self._settings_readback: dict[str, Any] = {}
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -1002,6 +1078,17 @@ class HeadlessSpinnakerRecorder:
         if self._c_backend is not None:
             return dict(self._c_backend._device_info)
         return dict(self._device_info)
+
+    @property
+    def camera_settings(self) -> dict[str, Any]:
+        """Settings read back before acquisition, also available in crash journals."""
+        source = self._c_backend if self._c_backend is not None else self
+        return {
+            "roi": None if source._actual_roi is None else dict(source._actual_roi),
+            "requested_roi": source._roi_summary(),
+            "settings_readback": dict(source._settings_readback),
+            "exposure_control": "StreamDIO trigger pulse width; ExposureTime is the timed-mode setting",
+        }
 
     def _roi_summary(self) -> dict[str, int | None]:
         return {
@@ -1108,7 +1195,10 @@ class HeadlessSpinnakerRecorder:
             "target_trigger_hz": int(self._fps),
             "exposure_us": int(self._exposure_us),
             "pixel_format": self._pixel_format,
-            "roi": self._roi_summary(),
+            "roi": self._actual_roi,
+            "requested_roi": self._roi_summary(),
+            "settings_readback": dict(self._settings_readback),
+            "exposure_control": "StreamDIO trigger pulse width; ExposureTime is the timed-mode setting",
             "preview_frames": int(self._preview_count),
             "preview_frames_delivered": int(self._preview_dispatcher.delivered_count),
             "frame_timestamps_csv": str(self.session_dir / "frame_timestamps.csv"),
@@ -1184,50 +1274,53 @@ class HeadlessSpinnakerRecorder:
             return None
 
     def _configure_camera(self) -> None:
-        PySpin = self._pyspin
         nodemap = self._camera.GetNodeMap()
-
         self._set_pyspin_enum(nodemap, "ExposureMode", "Timed", required=True)
         self._set_pyspin_enum(nodemap, "TriggerSelector", "FrameStart", required=True)
         self._set_pyspin_enum(nodemap, "TriggerMode", "Off", required=True)
-        self._camera.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)
-
-        if not PySpin.IsWritable(self._camera.AcquisitionFrameRateEnable):
-            raise RuntimeError("Required PySpin AcquisitionFrameRateEnable is not writable")
-        self._camera.AcquisitionFrameRateEnable.SetValue(False)
-
-        if not PySpin.IsWritable(self._camera.ExposureAuto):
-            raise RuntimeError("Required PySpin ExposureAuto is not writable")
-        self._camera.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
-        if PySpin.IsWritable(self._camera.ExposureTime):
-            self._camera.ExposureTime.SetValue(float(self._exposure_us))
+        self._set_pyspin_enum(nodemap, "AcquisitionMode", "Continuous", required=True)
+        self._set_pyspin_value(nodemap, "AcquisitionFrameRateEnable", False, "Boolean")
+        self._set_pyspin_enum(nodemap, "ExposureAuto", "Off", required=True)
+        self._set_pyspin_value(nodemap, "ExposureTime", self._exposure_us, "Float")
         self._apply_pyspin_roi(nodemap)
-
-        if self._gain_db is not None and PySpin.IsWritable(self._camera.GainAuto):
-            self._camera.GainAuto.SetValue(PySpin.GainAuto_Off)
-        if self._gain_db is not None and PySpin.IsWritable(self._camera.Gain):
-            self._camera.Gain.SetValue(float(self._gain_db))
-
-        if self._gamma is not None and PySpin.IsWritable(self._camera.GammaEnable):
-            self._camera.GammaEnable.SetValue(True)
-        if self._gamma is not None and PySpin.IsWritable(self._camera.Gamma):
-            self._camera.Gamma.SetValue(float(self._gamma))
-
-        pixel_node = PySpin.CEnumerationPtr(nodemap.GetNode("PixelFormat"))
-        if not PySpin.IsAvailable(pixel_node) or not PySpin.IsWritable(pixel_node):
-            raise RuntimeError("Required PySpin PixelFormat node is unavailable or unwritable")
-        pixel_entry = pixel_node.GetEntryByName(self._pixel_format)
-        if not PySpin.IsAvailable(pixel_entry) or not PySpin.IsReadable(pixel_entry):
-            raise RuntimeError(f"Required PySpin PixelFormat {self._pixel_format!r} is unavailable")
-        pixel_node.SetIntValue(pixel_entry.GetValue())
+        self._set_pyspin_enum(nodemap, "PixelFormat", self._pixel_format, required=True)
+        if self._gain_db is not None:
+            self._set_pyspin_enum(nodemap, "GainAuto", "Off", required=True)
+            self._set_pyspin_value(nodemap, "Gain", self._gain_db, "Float")
+        if self._gamma is not None:
+            self._set_pyspin_value(nodemap, "GammaEnable", True, "Boolean")
+            self._set_pyspin_value(nodemap, "Gamma", self._gamma, "Float")
+        for name, kind in (("Gain", "Float"), ("Gamma", "Float"),
+                           ("GammaEnable", "Boolean"), ("GainAuto", "Enumeration")):
+            try:
+                self._settings_readback[name] = self._read_pyspin_value(nodemap, name, kind)
+            except Exception:
+                self._settings_readback[name] = None
         self._set_pyspin_enum(nodemap, "TriggerSelector", "FrameStart", required=True)
         self._set_pyspin_enum(nodemap, "TriggerSource", "Line0", required=True)
         self._set_pyspin_enum(nodemap, "TriggerActivation", "RisingEdge", required=True)
-        trigger_delay = PySpin.CFloatPtr(nodemap.GetNode("TriggerDelay"))
-        if PySpin.IsAvailable(trigger_delay) and PySpin.IsWritable(trigger_delay):
-            trigger_delay.SetValue(9.0)
+        self._set_pyspin_value(nodemap, "TriggerDelay", 9.0, "Float")
         self._set_pyspin_enum(nodemap, "TriggerMode", "On", required=True)
         self._set_pyspin_enum(nodemap, "ExposureMode", "TriggerWidth", required=True)
+
+    def _read_pyspin_value(self, nodemap: Any, name: str, kind: str) -> Any:
+        node = getattr(self._pyspin, f"C{kind}Ptr")(nodemap.GetNode(name))
+        if not self._pyspin.IsAvailable(node) or not self._pyspin.IsReadable(node):
+            raise RuntimeError(f"PySpin {name}: node unavailable or unreadable")
+        if kind == "Enumeration":
+            return str(node.GetCurrentEntry().GetSymbolic())
+        return node.GetValue()
+
+    def _set_pyspin_value(self, nodemap: Any, name: str, value: Any, kind: str) -> None:
+        node = getattr(self._pyspin, f"C{kind}Ptr")(nodemap.GetNode(name))
+        if not self._pyspin.IsAvailable(node) or not self._pyspin.IsWritable(node):
+            raise RuntimeError(f"Required PySpin {name}={value}: node unavailable or unwritable")
+        convert = {"Integer": int, "Float": float, "Boolean": bool}[kind]
+        node.SetValue(convert(value))
+        actual = self._read_pyspin_value(nodemap, name, kind)
+        if kind != "Float" and actual != value:
+            raise RuntimeError(f"PySpin {name} readback mismatch: requested {value}, got {actual}")
+        self._settings_readback[name] = actual
 
     def _set_pyspin_enum(
         self,
@@ -1246,6 +1339,10 @@ class HeadlessSpinnakerRecorder:
             if not PySpin.IsAvailable(entry) or not PySpin.IsReadable(entry):
                 raise RuntimeError("entry unavailable or unreadable")
             node.SetIntValue(entry.GetValue())
+            actual = self._read_pyspin_value(nodemap, node_name, "Enumeration")
+            if actual != entry_name:
+                raise RuntimeError(f"readback mismatch: got {actual}")
+            self._settings_readback[node_name] = actual
         except Exception as exc:
             if required:
                 raise RuntimeError(
@@ -1254,20 +1351,14 @@ class HeadlessSpinnakerRecorder:
             return
 
     def _set_pyspin_int(self, nodemap: Any, node_name: str, value: int) -> None:
-        PySpin = self._pyspin
-        node = PySpin.CIntegerPtr(nodemap.GetNode(node_name))
-        if PySpin.IsAvailable(node) and PySpin.IsWritable(node):
-            node.SetValue(max(0, int(value)))
+        self._set_pyspin_value(nodemap, node_name, value, "Integer")
 
     def _apply_pyspin_roi(self, nodemap: Any) -> None:
-        for node_name, value in (
-            ("OffsetX", self._roi_offset_x),
-            ("OffsetY", self._roi_offset_y),
-            ("Width", self._roi_width),
-            ("Height", self._roi_height),
-        ):
-            if value is not None:
-                self._set_pyspin_int(nodemap, node_name, value)
+        self._actual_roi = apply_roi(
+            self._roi_summary(),
+            lambda name: self._read_pyspin_value(nodemap, name, "Integer"),
+            lambda name, value: self._set_pyspin_int(nodemap, name, value),
+        )
 
     def _capture_loop(self) -> None:
         assert self._camera is not None
@@ -1276,31 +1367,47 @@ class HeadlessSpinnakerRecorder:
             image = None
             try:
                 image = self._camera.GetNextImage(int(self._acquisition_timeout_ms))
+                acquired_mono_s = time.perf_counter()
+                acquired_wall_s = time.time()
                 if image.IsIncomplete():
                     self._incomplete_frames += 1
                     continue
                 frame_index = self._frame_count
-                filename = f"frame_{frame_index:09d}.png"
+                # Mono8 uses the same direct, lossless writer as the C backend.
+                filename = f"frame_{frame_index:09d}.{'pgm' if self._pixel_format == 'Mono8' else 'png'}"
                 frame_path = self.session_dir / filename
-                try:
-                    image.Save(str(frame_path))
-                except Exception:
-                    self._save_errors += 1
-                    raise
                 camera_timestamp = None
                 try:
                     camera_timestamp = int(image.GetTimeStamp())
                 except Exception:
                     pass
-                self._timestamps.write(frame_index, camera_timestamp, filename)
-                self._maybe_emit_preview(
-                    image,
-                    frame_index=frame_index,
-                    camera_timestamp_ns=camera_timestamp,
+                try:
+                    array = None
+                    if self._pixel_format == "Mono8":
+                        array = image.GetNDArray()
+                        if len(array.shape) != 2 or str(array.dtype) != "uint8":
+                            raise ValueError("Invalid PySpin Mono8 array")
+                        array = array.copy()
+                    self._maybe_emit_preview(
+                        image, frame_index=frame_index, camera_timestamp_ns=camera_timestamp,
+                        array=array, acquired_mono_s=acquired_mono_s,
+                    )
+                    if array is None:
+                        image.Save(str(frame_path))
+                    else:
+                        height, width = array.shape
+                        _save_mono_pgm(frame_path, width, height, width, array.tobytes())
+                except Exception:
+                    self._save_errors += 1
+                    raise
+                self._timestamps.write(
+                    frame_index, camera_timestamp, filename,
+                    received_wall_s=acquired_wall_s, received_mono_s=acquired_mono_s,
                 )
                 self._frame_count += 1
             except Exception as exc:  # pragma: no cover - device-specific
-                if "timeout" in str(exc).lower() and self._running:
+                # A disk/encoder timeout is a save failure, not an empty camera wait.
+                if image is None and "timeout" in str(exc).lower():
                     self._acquisition_timeouts += 1
                     continue
                 self._error = f"{type(exc).__name__}: {exc}"
@@ -1316,13 +1423,16 @@ class HeadlessSpinnakerRecorder:
         *,
         frame_index: int,
         camera_timestamp_ns: int | None,
+        array: Any = None,
+        acquired_mono_s: float | None = None,
     ) -> None:
         if not self._preview_dispatcher.enabled:
             return
         if not self._preview_cadence.due(time.perf_counter()):
             return
         try:
-            array = image.GetNDArray()
+            if array is None:
+                array = image.GetNDArray()
             preview = _downsample_array_preview(
                 array,
                 max_width=self._preview_max_width,
@@ -1342,6 +1452,7 @@ class HeadlessSpinnakerRecorder:
                     "format": "L" if channels == 1 else "RGB",
                     "data": data,
                     "monotonic_s": self._last_preview_mono_s,
+                    "acquired_mono_s": acquired_mono_s,
                     "backend": "spinnaker_pyspin",
                 }
             ):

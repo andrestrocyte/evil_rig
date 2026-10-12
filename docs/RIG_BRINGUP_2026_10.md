@@ -47,3 +47,16 @@ A standalone eight-second hardware comparison on the same Blackfly S camera foun
 The fix bypasses `spinImageSaveFromExt` for Mono8, copies pixels before SDK image release, preserves stride/padding correctly, and writes the same PGM format directly. Other pixel formats/older SDKs retain the SDK fallback. Camera setup now temporarily selects Timed exposure before configuring trigger nodes, then restores TriggerWidth after enabling FrameStart/Line0; the connected camera makes TriggerMode unavailable in TriggerWidth mode. This preserves the stricter required-setting checks in `evil_rig` rather than suppressing their errors. Preview queues continue to keep the newest frame. The GUI age indicator now uses host acquisition time when available, so queue transit is included; it is not a calibrated sensor-exposure-to-screen latency measurement. Camera timestamps and StreamDIO trigger timestamps remain the scientific timing sources.
 
 A small visible preview delay remains from preview throttling, GUI refresh and screen scanout. The follow-up audit increased the preview target to 15 Hz and verified a one-minute GUI acquisition: 1,798 triggers matched 1,798 saved frames, maximum backlog growth was 20.83 ms and GUI frame age was 74 ms median / 92 ms p95. These are not calibrated exposure-to-display latency measurements. See [the audit](QUALITY_AUDIT_2026_10.md) for evidence and remaining physical checks. Previously missed/delayed video frames cannot be recovered by this change.
+
+Both backends now use direct Mono8 saving and publish the preview before disk
+writing. PySpin parity has unit coverage; this PC's live runs use the C backend.
+The latest 30-second live check saved 914 frames for 914 triggers, with preview
+age 77 ms median / 87 ms p95 and receipt-to-save time 2.92 / 5.89 ms. There were no
+incomplete frames, save errors or accumulating acquisition backlog.
+
+The timestamp CSV adds `received_wall_time_s` and `received_monotonic_s`, measured
+immediately after acquisition. Existing host columns still describe post-save
+time. Recording metadata and startup journals now include camera-setting
+readbacks and actual ROI. A live crop/expand/rejected-width check verified rollback
+to the original 1440 × 1080 view. Exposure remains controlled by trigger pulse
+width; a recorded `ExposureTime` readback describes Timed-mode configuration.

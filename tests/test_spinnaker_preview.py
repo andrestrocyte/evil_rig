@@ -269,7 +269,7 @@ def test_c_capture_copies_mono_pixels_preserves_padding_and_releases_image(tmp_p
     recorder._preview_dispatcher = types.SimpleNamespace(
         enabled=True, submit=lambda frame: previews.append(frame) or True,
     )
-    recorder._timestamps = types.SimpleNamespace(write=lambda *args: timestamps.append(args))
+    recorder._timestamps = types.SimpleNamespace(write=lambda *args, **kw: timestamps.append((args, kw)))
 
     def assign(value):
         def call(_image, pointer):
@@ -313,7 +313,8 @@ def test_c_capture_copies_mono_pixels_preserves_padding_and_releases_image(tmp_p
         assert recorder.error is None
         assert recorder.frame_count == 1
         assert target.read_bytes() == b"P5\n4 2\n255\n" + bytes(range(1, 9))
-        assert timestamps == [(0, 123456789, target.name)]
+        assert timestamps[0][0] == (0, 123456789, target.name)
+        assert timestamps[0][1]["received_mono_s"] == previews[0]["acquired_mono_s"]
         assert previews[0]["data"] == bytes(range(1, 9))
         assert previews[0]["acquired_mono_s"] <= previews[0]["monotonic_s"]
 
@@ -348,6 +349,7 @@ def test_c_camera_configuration_unlocks_trigger_nodes_before_required_writes():
     recorder._gain_db = recorder._gamma = None
     recorder._check = lambda *args: None
     recorder._apply_roi = lambda *args: None
+    recorder._record_optional_settings = lambda *args: None
     recorder._set_bool = recorder._set_float = lambda *args, **kwargs: None
     mode = "TriggerWidth"
     commands = []
@@ -366,3 +368,85 @@ def test_c_camera_configuration_unlocks_trigger_nodes_before_required_writes():
     assert commands.index(("ExposureMode", "Timed")) < commands.index(("TriggerMode", "Off"))
     assert commands.index(("TriggerSource", "Line0")) < commands.index(("TriggerMode", "On"))
     assert commands[-2:] == [("TriggerMode", "On"), ("ExposureMode", "TriggerWidth")]
+
+
+@pytest.mark.parametrize("save_fails", [False, True])
+def test_pyspin_copies_mono_pixels_previews_before_save_and_releases(tmp_path, monkeypatch, save_fails):
+    import csv
+    import numpy as np
+    from hf_dm.camera import spinnaker
+
+    r = HeadlessSpinnakerRecorder(tmp_path, "test", "test", preview_callback=lambda frame: None)
+    r.session_dir.mkdir()
+    pixels = np.arange(12, dtype=np.uint8).reshape(2, 6)[:, :4]  # padded, noncontiguous view
+    expected = pixels.tobytes()
+    previews, actions = [], []
+    r._preview_dispatcher = types.SimpleNamespace(enabled=True, submit=lambda frame: previews.append(frame) or True)
+    r._timestamps = spinnaker._FrameTimestampWriter(r.session_dir)
+
+    class Image:
+        def IsIncomplete(self):
+            return False
+
+        def GetTimeStamp(self):
+            return 123456789
+
+        def GetNDArray(self):
+            return pixels
+
+        def Save(self, path):
+            pytest.fail("Mono8 must bypass the SDK encoder")
+
+        def Release(self):
+            actions.append("release")
+            pixels[:] = 0
+
+    def next_image(timeout):
+        r._running = False
+        return Image()
+
+    save = spinnaker._save_mono_pgm
+
+    def checked_save(*args):
+        assert previews[0]["data"] == expected
+        actions.append("save")
+        if save_fails:
+            raise TimeoutError("disk timeout")
+        save(*args)
+
+    monkeypatch.setattr(spinnaker, "_save_mono_pgm", checked_save)
+    r._camera = types.SimpleNamespace(GetNextImage=next_image)
+    r._running = True
+    r._capture_loop()
+    r._timestamps.close()
+    assert actions == ["save", "release"]
+    assert previews[0]["data"] == expected
+    assert r._acquisition_timeouts == 0
+    with r._timestamps.path.open() as handle:
+        rows = list(csv.DictReader(handle))
+    if save_fails:
+        assert r._save_errors == 1
+        assert "disk timeout" in r.error
+        assert rows == []
+    else:
+        assert r.error is None
+        assert r.frame_count == 1
+        assert (r.session_dir / rows[0]["filename"]).read_bytes() == b"P5\n4 2\n255\n" + expected
+        assert int(rows[0]["camera_timestamp_ns"]) == 123456789
+        assert float(rows[0]["received_monotonic_s"]) == previews[0]["acquired_mono_s"]
+        assert float(rows[0]["received_monotonic_s"]) <= float(rows[0]["monotonic_s"])
+
+
+def test_pyspin_timeout_after_stop_is_normal_end_of_trigger_stream(tmp_path):
+    r = HeadlessSpinnakerRecorder(tmp_path, "test", "test")
+
+    def next_image(timeout):
+        r._running = False
+        raise RuntimeError("Spinnaker timeout")
+
+    r._timestamps = object()
+    r._camera = types.SimpleNamespace(GetNextImage=next_image)
+    r._running = True
+    r._capture_loop()
+    assert r.error is None
+    assert r._acquisition_timeouts == 1

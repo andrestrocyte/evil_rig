@@ -292,6 +292,22 @@ Install the **Teledyne/FLIR Spinnaker SDK** and set `camera.backend: spinnaker`.
 bringup trigger contract (`FrameStart`, `Line0`, rising edge, `TriggerWidth` exposure). With
 `camera.required: true`, the task refuses to run if recording cannot start.
 
+Both backends save Mono8 pixels directly as full-resolution, lossless PGM and
+publish previews before writing the image. The preview keeps the latest frame;
+the recording preserves all acquired frames. Required enum/bool settings and ROI
+are checked by readback. ROI changes restore the original crop on failure;
+unspecified ROI values retain the camera's current crop. Recording metadata and
+the startup journal distinguish requested ROI from actual settings, including
+gain and gamma state. Float readbacks preserve camera quantization. Exposure is
+controlled by the StreamDIO trigger width; `ExposureTime` readback describes the
+temporary Timed-mode setting, not a separate measurement of exposure duration.
+
+`frame_timestamps.csv` retains its existing camera timestamp and post-save host
+columns. New `received_wall_time_s` and `received_monotonic_s` columns record host
+receipt immediately after image acquisition, before preview/copy/save work.
+Neither host timestamp is the physical exposure time; use camera and StreamDIO
+timestamps for scientific timing. Non-Mono8 formats retain SDK saving.
+
 Teledyne distributes `PySpin` separately from PyPI. Install only the `spinnaker_python` wheel whose
 SDK version, operating system, architecture, and CPython tag exactly match the rig (for the installed
 Spinnaker 4.0.0.116 SDK, the vendor Windows wheel is a CPython 3.10 build). Do **not** install the
@@ -860,7 +876,7 @@ tests/                      # hardware-free pytest suite
 | bpod-core settings lock held | This task uses `data/runtime/bpod-core`; override with `HF_DM_BPOD_CORE_CONFIG_DIR`. Close the older `hf_dm.cli` process and rerun preflight |
 | StreamDIO `Access is denied` (COM7/COM8) | Another process owns the port — close notebooks/serial monitors/task processes; unplug/replug StreamDIO |
 | Detector LED changes but no licks | Flash the vendored `firmware/`; check cap-touch wiring/power, then thresholds |
-| Camera preview falls seconds behind | Mono8 C-API capture now writes raw PGM directly and previews from memory, bypassing the slow SDK image encoder. The Video age indicator includes acquisition-to-GUI transit. See [rig bringup notes](docs/RIG_BRINGUP_2026_10.md) for measured results |
+| Camera preview falls seconds behind | Both Mono8 backends now write raw PGM directly and preview from memory before saving, bypassing the slow SDK image encoder. The Video age indicator includes acquisition-to-GUI transit. See [rig bringup notes](docs/RIG_BRINGUP_2026_10.md) for measured results |
 | Frame2TTL sees no transitions | Run `--frame2ttl-diagnostic`; confirm the photodiode is over the lower-right patch |
 | No `bpod_state` markers | Run `--bpod-opcode-diagnostic` to verify state markers reach StreamDIO |
 

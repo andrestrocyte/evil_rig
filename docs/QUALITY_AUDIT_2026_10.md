@@ -62,6 +62,14 @@ and Linux; the preceding commit also passed all 362 tests on both platforms.
   deadline, using a per-launch token and a verified-cleanup signal. Data validation
   also has a five-minute process timeout. Stop no longer kills a healthy large
   export merely because its hardware shutdown grace period expired.
+- Verify required camera enums, booleans and explicit ROI by readback. Apply ROI
+  in an order that permits shrinking/moving and expanding; restore the original
+  crop after rejected writes. Record inherited and actual settings at startup and
+  shutdown instead of reporting requested values as if they were applied.
+- Give PySpin the same direct Mono8 PGM saving and preview-before-save behavior as
+  the C backend. Retain post-save CSV clock semantics and add separate host receipt
+  clocks. A PySpin save timeout now fails capture instead of being confused with
+  an ordinary acquisition wait; a stopped camera wait no longer invents an error.
 
 ## Evidence on this PC
 
@@ -85,6 +93,9 @@ and Linux; the preceding commit also passed all 362 tests on both platforms.
 | Export equivalence | All 1,000,000 NPZ rows and dtype equal; raw/force/camera/Frame2TTL CSVs byte-identical to prior exporter | Metadata/timing fields intentionally vary by benchmark run |
 | 3.6-million-row export | Finalize 58.04 s / 139.5 MiB peak RSS; validation 31.96 s / 103.8 MiB; complete bundle validates | Synthetic 1 kHz record volume for one hour; not a live one-hour hardware soak |
 | Stop with block exports | 225 triggers = 225 images; clean shutdown, valid data and clear interlock 2.41 s after Stop | Short live optical observation; no physical beam gestures |
+| Camera settings | Actual 1440 × 1080 Mono8; 640 × 480 crop at (32, 24), full-frame restoration and deliberately invalid width all behave correctly; clean SDK cleanup | Live C backend; alternate PySpin adapters exercised with fakes |
+| Camera after readback changes | 914 triggers = 914 images; preview 77 / 87 ms median/p95; receipt-to-save 2.92 / 5.89 ms; all 25 artifacts validate | Thirty-second input observation; no incomplete/save errors, clean cleanup; not calibrated exposure-to-display timing |
+| Compression experiment | Lossless level-1 compression retains about 24% of original image bytes; minimum tested PNG filtering takes about 22 ms/frame | Eight saved frames; insufficient margin to change the live default without further throughput testing |
 
 Local evidence (recordings are intentionally excluded from Git):
 
@@ -103,6 +114,9 @@ Local evidence (recordings are intentionally excluded from Git):
 - `data/runtime/audit/export_equivalence.json` (complete raw values and CSV comparison)
 - `data/runtime/audit/export_one_hour/benchmark.json` (3.6 million synthetic records)
 - `data/runtime/operator/runs/20261012_223247_869969/stop_result.json` (live block-export Stop)
+- `data/runtime/audit/camera_settings_readback.json` (live readback and ROI rollback)
+- `data/runtime/audit/camera_receipt_result.json` (live counts, GUI age and receipt-to-save timing)
+- `data/runtime/audit/png_compression.json` (read-only compression benchmark)
 
 The earlier rig check at `20261012_211459_030909` incorrectly reported overall
 success despite only four of six barcode matches. The earlier Stop check at
@@ -131,6 +145,7 @@ Windows reported unavailable directory fsync support: file flushes, atomic write
 and process-crash recovery are tested, but sudden-power-loss durability is not
 established. These limits prevent a defensible "10/10, bug-free" claim.
 
-Camera configuration also needs a further audit: explicit ROI writes currently
-lack full readback verification, and the alternate PySpin saving path has not had
-the live timing validation performed on this rig's C API backend.
+Camera settings readback and ROI rollback now pass on the connected C backend.
+The alternate PySpin path has unit coverage for setting failures, pixel fidelity,
+preview-before-save order, timestamps and image release, but has not had live SDK
+validation on this Python 3.12 installation (vendor bindings are unavailable).
