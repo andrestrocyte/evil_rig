@@ -17,7 +17,7 @@ import time
 import zlib
 from collections import Counter, deque
 from collections.abc import Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, distribution as installed_distribution, version
@@ -34,6 +34,9 @@ from hf_dm.data.raw_stream import (
     WAL_MAGIC_V1,
     WAL_PAYLOAD as _STREAMDIO_WAL_PAYLOAD,
     WAL_RECORD,
+)
+from hf_dm.data.session_journal import (
+    backup_checksums, iter_journal, journal_backups, prepare_journal, scan_journal,
 )
 from hf_dm.timing_heartbeat import (
     analyze_timing_heartbeats,
@@ -1487,71 +1490,12 @@ def load_session_journal(
     *,
     repair_trailing: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
-    journal_path = resolve_session_journal(path)
-    original = journal_path.read_text(encoding="utf-8")
-    lines = original.splitlines()
-    nonempty = [index for index, line in enumerate(lines) if line.strip()]
-    last_nonempty = nonempty[-1] if nonempty else -1
-    rows: list[dict[str, Any]] = []
-    repaired = False
-    valid_lines: list[str] = []
-    for index, line in enumerate(lines):
-        text = line.strip()
-        if not text:
-            continue
-        try:
-            row = json.loads(text)
-        except json.JSONDecodeError as exc:
-            if repair_trailing and index == last_nonempty:
-                repaired = True
-                break
-            raise ValueError(
-                f"Invalid session journal JSON at {journal_path}:{index + 1}: {exc.msg}"
-            ) from exc
-        if not isinstance(row, dict):
-            raise ValueError(f"Session journal row is not an object: {journal_path}:{index + 1}")
-        if row.get("schema_version") != 1:
-            raise ValueError(f"Unsupported session journal schema: {journal_path}:{index + 1}")
-        if row.get("sequence") != len(rows):
-            raise ValueError(
-                f"Session journal sequence mismatch: {journal_path}:{index + 1}: "
-                f"{row.get('sequence')} != {len(rows)}"
-            )
-        if not isinstance(row.get("payload"), dict):
-            raise ValueError(f"Session journal payload is not an object: {journal_path}:{index + 1}")
-        rows.append(row)
-        valid_lines.append(json.dumps(row, separators=(",", ":")))
-    if not rows or rows[0].get("kind") != "session_header":
-        raise ValueError(f"Session journal is missing its header: {journal_path}")
-    if repaired:
-        _backup_recovery_journal(journal_path, original)
-        _atomic_write_text(journal_path, "\n".join(valid_lines) + "\n")
-    return rows, repaired
-
-
-def _backup_recovery_journal(path: Path, original: str) -> Path:
-    backup = path.with_name(f"{path.name}.recovery-backup")
-    if not backup.exists():
-        _atomic_write_text(backup, original)
-    return backup
-
-
-def _remove_prior_journal_summaries(
-    path: Path,
-    rows: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], bool]:
-    filtered = [row for row in rows if row.get("kind") != "session_summary"]
-    if len(filtered) == len(rows):
-        return rows, False
-    original = path.read_text(encoding="utf-8")
-    _backup_recovery_journal(path, original)
-    for sequence, row in enumerate(filtered):
-        row["sequence"] = sequence
-    _atomic_write_text(
-        path,
-        "\n".join(json.dumps(row, separators=(",", ":")) for row in filtered) + "\n",
-    )
-    return filtered, True
+    """Compatibility loader; recovery itself streams rows instead of building a list."""
+    scan = scan_journal(resolve_session_journal(path), tolerate_tail=repair_trailing)
+    repaired = bool(repair_trailing and (scan.trailing_bytes or scan.needs_newline))
+    if repair_trailing:
+        scan = prepare_journal(scan)
+    return list(iter_journal(scan)), repaired
 
 
 def _reconcile_streamdio_recovery_rows(
@@ -1630,16 +1574,19 @@ def recover_session_journal(
             f"Session is already finalized; refusing recovery without an incomplete marker: "
             f"{journal_path.parent}"
         )
-    rows, repaired_tail = load_session_journal(journal_path, repair_trailing=True)
-    if not incomplete_marker.exists() and any(
-        row.get("kind") == "session_summary" for row in rows
-    ):
+    scan = scan_journal(journal_path, tolerate_tail=True)
+    if not incomplete_marker.exists() and scan.summary_count:
         raise RuntimeError(
             f"Session journal already contains a final summary; refusing recovery without an "
             f"incomplete marker: {journal_path.parent}"
         )
-    rows, removed_summary = _remove_prior_journal_summaries(journal_path, rows)
-    header = dict(rows[0]["payload"])
+    repaired_tail = bool(scan.trailing_bytes or scan.needs_newline)
+    removed_summary = bool(scan.summary_count)
+    journal_trailing_bytes = scan.trailing_bytes
+    journal_newline_added = scan.needs_newline
+    scan = prepare_journal(scan, remove_summaries=True)
+    journal_recovery_backups = [str(item) for item in journal_backups(journal_path)]
+    header = dict(scan.header)
     subject_id = str(header.get("subject_id") or "unknown")
     phase = str(header.get("phase") or "unknown")
     wal_name = str(header.get("streamdio_wal") or f"{base_name}.streamdio.wal")
@@ -1672,29 +1619,30 @@ def recover_session_journal(
             header.get("session_start_mono_s", recorder._session_start_mono)
         )
 
-        for row in rows[1:]:
-            kind = row.get("kind")
-            payload = dict(row["payload"])
-            if kind == "event":
-                recorder.events.append(SessionEvent(**payload))
-            elif kind == "trial":
-                recorder.trials.append(TrialRecord(**payload))
-            elif kind == "bpod_trial":
-                recorder.bpod_trials.append(payload)
-            elif kind == "metadata":
-                recorder.metadata.update(payload)
-            elif kind == "export_options":
-                recorder.export_options.update(payload)
-            elif kind == "stream_summary":
-                name = str(payload.get("name") or "unknown")
-                stream_summary = payload.get("summary")
-                if isinstance(stream_summary, dict):
-                    recorder.stream_summaries[name] = dict(stream_summary)
-            elif kind == "fsm_definition":
-                fsm_name = payload.get("fsm_name")
-                fsm_json = payload.get("fsm_json")
-                if fsm_name is not None and fsm_json is not None:
-                    recorder.fsm_definitions[str(fsm_name)] = str(fsm_json)
+        with closing(iter_journal(scan)) as rows:
+            for row in rows:
+                kind = row.get("kind")
+                payload = row["payload"]
+                if kind == "event":
+                    recorder.events.append(SessionEvent(**payload))
+                elif kind == "trial":
+                    recorder.trials.append(TrialRecord(**payload))
+                elif kind == "bpod_trial":
+                    recorder.bpod_trials.append(payload)
+                elif kind == "metadata":
+                    recorder.metadata.update(payload)
+                elif kind == "export_options":
+                    recorder.export_options.update(payload)
+                elif kind == "stream_summary":
+                    name = str(payload.get("name") or "unknown")
+                    stream_summary = payload.get("summary")
+                    if isinstance(stream_summary, dict):
+                        recorder.stream_summaries[name] = dict(stream_summary)
+                elif kind == "fsm_definition":
+                    fsm_name = payload.get("fsm_name")
+                    fsm_json = payload.get("fsm_json")
+                    if fsm_name is not None and fsm_json is not None:
+                        recorder.fsm_definitions[str(fsm_name)] = str(fsm_json)
 
         if recorder.stream_summaries:
             recorder.metadata["stream_summaries"] = dict(recorder.stream_summaries)
@@ -1727,6 +1675,8 @@ def recover_session_journal(
         recorder._streamdio_memory_bounded = True
         recorder._streamdio_chunk_dir = chunk_dir
         wal_backup = _preserve_damaged_wal(wal_path) if wal_trailing_bytes else None
+        recovery_backup_sha256 = backup_checksums(
+            [Path(item) for item in journal_recovery_backups] + ([wal_backup] if wal_backup else []))
         recorder._complete_recovery_chunks(recovered_streamdio, existing_count=len(chunk_streamdio))
 
         recorder.log_event(
@@ -1735,6 +1685,10 @@ def recover_session_journal(
                 "journal": str(journal_path),
                 "repaired_trailing_record": repaired_tail,
                 "replaced_prior_summary": removed_summary,
+                "journal_trailing_bytes": journal_trailing_bytes,
+                "journal_newline_added": journal_newline_added,
+                "journal_recovery_backups": journal_recovery_backups,
+                "recovery_backup_sha256": recovery_backup_sha256,
                 "manifest_enabled_for_recovery": recovery_manifest_added,
                 "recovered_trials": len(recorder.trials),
                 "recovered_bpod_trials": len(recorder.bpod_trials),
@@ -1781,6 +1735,10 @@ def recover_session_journal(
             "validation": validation,
             "repaired_trailing_record": repaired_tail,
             "replaced_prior_summary": removed_summary,
+            "journal_trailing_bytes": journal_trailing_bytes,
+            "journal_newline_added": journal_newline_added,
+            "journal_recovery_backups": journal_recovery_backups,
+            "recovery_backup_sha256": recovery_backup_sha256,
             "recovered_trials": len(recorder.trials),
             "recovered_bpod_trials": len(recorder.bpod_trials),
             "recovered_streamdio_events": len(recovered_streamdio),

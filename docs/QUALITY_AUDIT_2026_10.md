@@ -7,9 +7,9 @@ session selection, on-demand diagnostics, cooperative Stop and saved results.
 This audit does not establish that every hardware component is calibrated or
 that the system is bug-free.
 
-Local verification: full suite 434 passed. Ruff and type checks for config,
-recorder, session export and block I/O passed. CI checks Windows and Linux;
-the preceding commit passed all 405 tests on both platforms.
+Local verification: full suite 456 passed. Ruff and type checks for config,
+recorder, session export, block I/O and session-journal I/O passed. CI checks
+Windows and Linux; the preceding commit passed all 434 tests on both platforms.
 
 ## Repairs
 
@@ -83,6 +83,14 @@ the preceding commit passed all 405 tests on both platforms.
   Close timestamp files even when flushing fails. Reject recorder-instance reuse
   before it can overwrite data. Camera cleanup errors now reach the session's
   cleanup interlock instead of being ignored in the recording summary.
+- Stream session-journal scanning, repair and replay without full text/row copies.
+  Retain a complete last row when only its newline is missing. Repair a malformed
+  unterminated final record, including a torn UTF-8 character, but refuse malformed
+  terminated lines, invalid schemas and sequence errors. Preserve exact original
+  bytes, including line endings, before atomic repair. Distinct retry inputs get
+  distinct backups; recovery and offline export verify recorded backup checksums.
+  Moved sessions use their local evidence. Refuse completed sessions before any
+  repair, and detect source-file changes during scanning or replay.
 
 ## Evidence on this PC
 
@@ -114,6 +122,9 @@ the preceding commit passed all 405 tests on both platforms.
 | 3.6-million-row crash recovery | Recovery and validation complete in 97.44 s at 139.3 MiB peak RSS; all 3.6 million records retained, bundle valid | Synthetic one-hour volume at 1 kHz; semantic camera timeline still grows with record duration |
 | Camera startup recovery | Missing serial and rejected ROI both release all native handles; subsequent recording saves 466 images for 466 triggers, all 25 artifacts validate, cleanup succeeds | Live C backend; PySpin startup and failed-release paths use unit fakes |
 | Preview after cleanup changes | Host frame age 74 / 89 ms median/p95; receipt-to-save 2.31 / 3.70 ms; maximum backlog growth 0.92 ms, ending -0.50 ms relative to start | Fifteen-second GUI observation; excludes calibrated exposure/display latency |
+| Journal boundary faults | Missing newline now yields a valid recovery; torn UTF-8 tail recovers; newline-terminated malformed JSON is refused. Missing or altered prior backups stop retries; altered backups cannot become a valid offline re-export | File/process fault injection; not physical storage failure |
+| Journal scan / replay | 50,006 rows produce identical hashes; parser peak RSS 181.7 to 35.5 MiB, scan/consume time 1.18 / 1.13 s | Synthetic journal; this isolates parsing, not total recovery memory |
+| Semantic-event recovery | All 50,000 events and payload values retained exactly; both full recovered bundles validate; total recovery/validation 6.67 / 6.48 s, peak RSS 351.7 / 348.7 MiB | Final semantic-event export dominates peak memory; no large overall memory reduction claimed |
 
 Local evidence (recordings are intentionally excluded from Git):
 
@@ -139,6 +150,9 @@ Local evidence (recordings are intentionally excluded from Git):
 - `data/runtime/audit/recovery_equivalence.json` (one-million-row exact comparison)
 - `data/runtime/audit/recovery_one_hour/benchmark.json` (3.6-million-row recovery)
 - `data/runtime/audit/camera_start_failure_result.json` (startup failures, resource release and subsequent live recording)
+- `data/runtime/audit/journal_boundaries_before.json` and `journal_boundaries_after.json`
+- `data/runtime/audit/journal_scan_before.json` and `journal_scan_after.json`
+- `data/runtime/audit/journal_recovery_before/benchmark.json` and `journal_recovery_after/benchmark.json`
 
 The earlier rig check at `20261012_211459_030909` incorrectly reported overall
 success despite only four of six barcode matches. The earlier Stop check at
@@ -160,7 +174,8 @@ This does not mean repeating the full diagnostics before each bench session.
 
 Normal finalization, validation and crash recovery stream high-rate raw data in blocks; the
 lower-rate semantic timeline and heartbeat analysis still grow with session size.
-The semantic journal is still loaded in memory during recovery. Full-resolution PGM video
+Journal parsing and repair now stream, but reconstructed semantic events and their
+final exports still grow in memory with session size. Full-resolution PGM video
 uses about 2.8 GB/min on this camera. A stalled optional writer is fault-injected in
 tests; a physical storage-device hang has not been tested.
 Windows reported unavailable directory fsync support: file flushes, atomic writes

@@ -18,7 +18,7 @@ Use the checkout's virtualenv Python:
 
 ```text
 python -m ruff check src tests
-python -m mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_export.py src/hf_dm/data/raw_stream.py
+python -m mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_export.py src/hf_dm/data/raw_stream.py src/hf_dm/data/session_journal.py
 python -m pytest
 ```
 

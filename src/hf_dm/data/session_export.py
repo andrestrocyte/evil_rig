@@ -434,13 +434,29 @@ def make_session_bundle(
         *_video_artifact_paths(bundle_dir, event_dicts),
         *chunk_paths,
     ]
-    # Damaged WAL tails are retained verbatim by recovery. Include that evidence
-    # in the manifest so copying/validating a recovered bundle also checks it.
+    # Recovery retains original journals and damaged WAL tails verbatim. Include
+    # that evidence in the manifest so copying/validating a bundle also checks it.
+    backup_hashes: dict[Path, str] = {}
     for event in event_dicts:
         if event.get("event_type") == "session_recovered":
-            backup = (event.get("payload") or {}).get("streamdio_wal_recovery_backup")
-            if backup and Path(backup) not in artifact_paths:
-                artifact_paths.append(Path(backup))
+            recovery_payload = event.get("payload") or {}
+            backups = list(recovery_payload.get("journal_recovery_backups") or [])
+            if backup := recovery_payload.get("streamdio_wal_recovery_backup"):
+                backups.append(backup)
+            for backup in backups:
+                # Recovery provenance keeps the old path, but copied sessions
+                # must hash their local evidence, not files left on the old rig.
+                backup_path = journal_path.parent / _relative_name(str(backup))
+                if not backup_path.is_file():
+                    raise FileNotFoundError(f"Recovery backup missing: {backup_path}")
+                expected_hash = (recovery_payload.get("recovery_backup_sha256") or {}).get(backup_path.name)
+                if expected_hash:
+                    if backup_path not in backup_hashes:
+                        backup_hashes[backup_path] = sha256_file(backup_path)
+                    if backup_hashes[backup_path] != expected_hash:
+                        raise RuntimeError(f"Recovery backup checksum mismatch: {backup_path}")
+                if backup_path not in artifact_paths:
+                    artifact_paths.append(backup_path)
     if npz_path is not None and npz_path.exists():
         artifact_paths.insert(0, npz_path)
     manifest = _manifest(

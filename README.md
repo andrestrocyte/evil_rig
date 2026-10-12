@@ -803,8 +803,15 @@ the marker, or the journal:
 hf-dm recover-session data/sessions/decision_making/mouse01/2026-06-28/001
 ```
 
-Recovery preserves the original journal, repairs a truncated final line, restores
-completed trials and Bpod rows, and compares the WAL and completed chunks in
+Recovery streams the journal and preserves its exact original bytes before repair.
+It repairs only an unfinished final record, including a torn UTF-8 character;
+a complete final row missing just its newline is kept. Malformed newline-terminated
+rows, invalid schemas and sequence gaps stop recovery. Backups are included in the
+manifest, and subsequent recovery attempts and offline exports verify their recorded
+checksums. Changed originals get separate backups. Copied sessions require the local
+backup files; old absolute paths remain provenance only.
+
+Recovery restores completed trials and Bpod rows and compares the WAL and completed chunks in
 blocks. Their common prefix must agree; missing chunk indices, corrupt chunks,
 or interior WAL checksum failures stop recovery explicitly. A damaged final WAL
 record can be excluded, with its byte count reported and an exact
@@ -840,7 +847,7 @@ timeline anchors, and stream/module/status consistency.
 ```bash
 pytest                              # hardware-free, headless
 ruff check src tests                # correctness lint
-mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_export.py
+mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_export.py src/hf_dm/data/raw_stream.py src/hf_dm/data/session_journal.py
 ```
 
 GitHub Actions runs Ruff, the stable-module mypy gate, and the full pytest suite on **Windows and
