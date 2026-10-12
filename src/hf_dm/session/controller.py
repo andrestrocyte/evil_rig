@@ -2019,7 +2019,7 @@ class HFDecisionSession:
                 },
             )
             self.recorder.log_event("video_recording_stopped", summary)
-            return None
+            return str(summary["cleanup_error"]) if summary.get("cleanup_error") else None
         except Exception as exc:
             logger.exception("Failed to stop headless Spinnaker recording")
             self.recorder.log_event(

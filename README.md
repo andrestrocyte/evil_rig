@@ -308,6 +308,13 @@ receipt immediately after image acquisition, before preview/copy/save work.
 Neither host timestamp is the physical exposure time; use camera and StreamDIO
 timestamps for scientific timing. Non-Mono8 formats retain SDK saving.
 
+Startup failures release the resources already opened and preserve the original
+error. Shutdown releases images before cameras and SDK resources; a failed release
+retains its handle for a retry and prevents a successful cleanup report. Recording
+summaries separate the current `cleanup_error` from `cleanup_error_history`, which
+survives successful retries. Create a new recorder for each recording; restarting
+the same instance is rejected before it can overwrite frames or timestamp files.
+
 Teledyne distributes `PySpin` separately from PyPI. Install only the `spinnaker_python` wheel whose
 SDK version, operating system, architecture, and CPython tag exactly match the rig (for the installed
 Spinnaker 4.0.0.116 SDK, the vendor Windows wheel is a CPython 3.10 build). Do **not** install the

@@ -707,6 +707,30 @@ def test_camera_is_owned_before_start_failure_and_can_be_stopped(monkeypatch):
     assert session.camera_recorder is None
 
 
+def test_camera_cleanup_summary_failure_is_propagated_to_session_interlock(tmp_path):
+    marker = tmp_path / "rig-interlock.json"
+    session = HFDecisionSession(SessionConfig())
+    session._safety_interlock_path = marker
+    arm_safety_interlock({"subject_id": "S1"}, marker)
+    session._safety_interlock_armed = True
+    session.recorder = MagicMock()
+    session.relay = FakeRelay()
+    session.dio = FakeDIO()
+    session.camera_recorder = MagicMock()
+    session.camera_recorder.stop.return_value = {"cleanup_error": "Camera DeInit failed"}
+
+    with pytest.raises(HardwareCleanupError, match="camera_recording_stop") as caught:
+        session.close()
+    assert "Camera DeInit failed" in caught.value.errors[0]["error"]
+    assert marker.exists()
+    assert json.loads(marker.read_text())["state"] == "cleanup_failed"
+    assert session.relay.ops == ["task_outputs_off", ("cap_touch_power", False)]
+    assert session.dio.ops == ["stop_camera", "close"]
+    video = [call.args[1] for call in session.recorder.register_stream.call_args_list
+             if call.args[0] == "spinnaker_video"]
+    assert video[0]["cleanup_error"] == "Camera DeInit failed"
+
+
 def test_operator_interrupt_during_cleanup_is_deferred_until_all_off_attempts_finish(tmp_path):
     marker = tmp_path / "rig-interlock.json"
     session = HFDecisionSession(SessionConfig())

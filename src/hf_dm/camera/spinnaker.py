@@ -22,6 +22,28 @@ logger = logging.getLogger(__name__)
 PreviewCallback = Callable[[dict[str, Any]], None]
 
 
+def _cleanup_step(errors: list[str], name: str, action: Callable[[], Any]) -> bool:
+    try:
+        action()
+        return True
+    except Exception as exc:
+        errors.append(f"{name}: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _remember_cleanup_errors(history: list[str], errors: list[str]) -> None:
+    history.extend(error for error in errors if error not in history)
+
+
+def _join_capture_thread(thread: threading.Thread | None, timeout_ms: int) -> None:
+    # Thread.start() can fail after assignment. Joining an unstarted thread raises
+    # another exception and used to prevent release of the camera and timestamp file.
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=max(5.0, timeout_ms / 1000.0 + 2.0))
+        if thread.is_alive():
+            raise TimeoutError("capture thread did not stop before SDK teardown")
+
+
 class _PreviewCadence:
     """Keep preview cadence despite small acquisition jitter; never catch up stale frames."""
 
@@ -274,10 +296,17 @@ class _FrameTimestampWriter:
         self.path = session_dir / "frame_timestamps.csv"
         self._handle = self.path.open("w", newline="", encoding="utf-8")
         self._writer = csv.writer(self._handle)
-        self._writer.writerow(
-            ["frame_index", "camera_timestamp_ns", "wall_time_s", "monotonic_s", "filename",
-             "received_wall_time_s", "received_monotonic_s"]
-        )
+        try:
+            self._writer.writerow(
+                ["frame_index", "camera_timestamp_ns", "wall_time_s", "monotonic_s", "filename",
+                 "received_wall_time_s", "received_monotonic_s"]
+            )
+        except BaseException as exc:
+            errors: list[str] = []
+            _cleanup_step(errors, "timestamp_header_cleanup", self._handle.close)
+            if errors:
+                exc.add_note("; ".join(errors))
+            raise
 
     def write(
         self, frame_index: int, camera_timestamp_ns: int | None, filename: str,
@@ -299,8 +328,10 @@ class _FrameTimestampWriter:
 
     def close(self) -> None:
         if not self._handle.closed:
-            self._handle.flush()
-            self._handle.close()
+            try:
+                self._handle.flush()
+            finally:
+                self._handle.close()
 
 
 class _SpinnakerCRecorder:
@@ -378,6 +409,10 @@ class _SpinnakerCRecorder:
         self._dll_path: str | None = None
         self._camera_initialized = False
         self._acquisition_started = False
+        self._camera_list_cleared = False
+        self._start_attempted = False
+        self._cleanup_errors: list[str] = []
+        self._unreleased_images: list[ctypes.c_void_p] = []
         self._timestamps: _FrameTimestampWriter | None = None
 
     @property
@@ -408,6 +443,9 @@ class _SpinnakerCRecorder:
         }
 
     def start(self) -> Path:
+        if self._start_attempted:
+            raise RuntimeError("Camera recorder is single-use; create a new recorder for another recording")
+        self._start_attempted = True
         try:
             self._load_api()
             self._check("spinSystemGetInstance", ctypes.byref(self._system))
@@ -445,29 +483,43 @@ class _SpinnakerCRecorder:
             self._thread.start()
             logger.info("Spinnaker C API recording started: %s", self.session_dir)
             return self.session_dir
-        except Exception:
+        except BaseException as exc:
+            self._error = f"{type(exc).__name__}: {exc}"
             self._running = False
-            self._preview_dispatcher.stop()
-            if self._timestamps is not None:
-                self._timestamps.close()
-            cleanup_errors = self._cleanup()
+            cleanup_errors: list[str] = []
+            stopped = _cleanup_step(cleanup_errors, "capture_thread_stop", lambda: _join_capture_thread(
+                self._thread, self._acquisition_timeout_ms))
+            _cleanup_step(cleanup_errors, "preview_stop", self._preview_dispatcher.stop)
+            if stopped:
+                cleanup_errors.extend(self._cleanup())
+                if self._timestamps is not None:
+                    _cleanup_step(cleanup_errors, "timestamp_close", self._timestamps.close)
+            _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
             if cleanup_errors:
                 logger.error("Spinnaker C startup cleanup errors: %s", "; ".join(cleanup_errors))
+                exc.add_note("Camera startup cleanup: " + "; ".join(cleanup_errors))
             raise
 
     def stop(self) -> dict[str, Any]:
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=max(5.0, self._acquisition_timeout_ms / 1000.0 + 2.0))
-            if self._thread.is_alive():
-                self._error = "capture thread did not stop before SDK teardown"
-                self._preview_dispatcher.stop()
-                raise TimeoutError(self._error)
-        self._preview_dispatcher.stop()
+        try:
+            _join_capture_thread(self._thread, self._acquisition_timeout_ms)
+        except TimeoutError as exc:
+            self._error = self._error or str(exc)
+            cleanup_errors = [f"capture_thread_stop: {exc}"]
+            _cleanup_step(cleanup_errors, "preview_stop", self._preview_dispatcher.stop)
+            _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
+            if len(cleanup_errors) > 1:
+                exc.add_note("; ".join(cleanup_errors[1:]))
+            raise
+        cleanup_errors: list[str] = []
+        _cleanup_step(cleanup_errors, "preview_stop", self._preview_dispatcher.stop)
         self._stop_wall_s = time.time()
-        cleanup_errors = self._cleanup()
+        cleanup_errors.extend(self._cleanup())
         if self._timestamps is not None:
-            self._timestamps.close()
+            if not _cleanup_step(cleanup_errors, "timestamp_close", self._timestamps.close):
+                self._error = self._error or cleanup_errors[-1]
+        _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
 
         summary = {
             "backend": "spinnaker_c",
@@ -503,6 +555,7 @@ class _SpinnakerCRecorder:
             "estimated_missing_triggers": None,
             "capture_error": self._error,
             "cleanup_error": "; ".join(cleanup_errors) or None,
+            "cleanup_error_history": list(self._cleanup_errors),
         }
         (self.session_dir / "recording_summary.json").write_text(
             json.dumps(summary, indent=2),
@@ -612,22 +665,22 @@ class _SpinnakerCRecorder:
         if count.value == 0:
             raise RuntimeError("No Spinnaker cameras found")
         if self._serial_number is None:
-            camera = ctypes.c_void_p()
-            self._check("spinCameraListGet", self._camera_list, 0, ctypes.byref(camera))
-            return camera
+            self._check("spinCameraListGet", self._camera_list, 0, ctypes.byref(self._camera))
+            return self._camera
 
         for index in range(count.value):
-            camera = ctypes.c_void_p()
+            self._camera = ctypes.c_void_p()
             self._check(
                 "spinCameraListGet",
                 self._camera_list,
                 index,
-                ctypes.byref(camera),
+                ctypes.byref(self._camera),
             )
-            serial = self._camera_string(camera, "DeviceSerialNumber")
+            serial = self._camera_string(self._camera, "DeviceSerialNumber")
             if serial == self._serial_number:
-                return camera
-            self._fn["spinCameraRelease"](camera)
+                return self._camera
+            self._check("spinCameraRelease", self._camera)
+            self._camera = ctypes.c_void_p()
         raise RuntimeError(f"Spinnaker camera serial not found: {self._serial_number}")
 
     def _camera_string(self, camera: ctypes.c_void_p, node_name: str) -> str | None:
@@ -875,7 +928,15 @@ class _SpinnakerCRecorder:
                 logger.error("Spinnaker C capture loop error: %s", self._error)
                 break
             finally:
-                self._fn["spinImageRelease"](image)
+                try:
+                    self._check("spinImageRelease", image)
+                except Exception as exc:
+                    error = f"Image release failed: {type(exc).__name__}: {exc}"
+                    self._error = self._error or error
+                    self._unreleased_images.append(image)
+                    _remember_cleanup_errors(self._cleanup_errors, [error])
+                    self._running = False
+                    logger.error("Spinnaker image release failed: %s", error)
 
     def _read_mono_image(self, image: ctypes.c_void_p) -> tuple[int, int, int, bytes] | None:
         """Copy Mono8 pixels before release; avoid the SDK's slow image encoder."""
@@ -939,31 +1000,38 @@ class _SpinnakerCRecorder:
 
     def _cleanup(self) -> list[str]:
         errors: list[str] = []
-        steps = [
-            ("spinCameraEndAcquisition", self._acquisition_started, self._camera),
-            ("spinCameraDeInit", self._camera_initialized, self._camera),
-            ("spinCameraRelease", bool(self._camera.value), self._camera),
-            ("spinCameraListClear", bool(self._camera_list.value), self._camera_list),
-            ("spinCameraListDestroy", bool(self._camera_list.value), self._camera_list),
-            ("spinSystemReleaseInstance", bool(self._system.value), self._system),
-        ]
-        for name, enabled, handle in steps:
-            if not enabled:
-                continue
-            try:
-                result = int(self._fn[name](handle))
-                if result != 0:
-                    errors.append(f"{name}: {result}")
-            except Exception as exc:
-                errors.append(f"{name}: {type(exc).__name__}: {exc}")
-        self._acquisition_started = False
-        self._camera_initialized = False
-        self._camera = ctypes.c_void_p()
-        self._camera_list = ctypes.c_void_p()
-        self._system = ctypes.c_void_p()
-        if self._dll_dir_handle is not None:
-            self._dll_dir_handle.close()
-            self._dll_dir_handle = None
+
+        def release(name: str, handle: ctypes.c_void_p) -> bool:
+            return _cleanup_step(errors, name, lambda: self._check(name, handle))
+
+        for image in list(self._unreleased_images):
+            if release("spinImageRelease", image):
+                self._unreleased_images.remove(image)
+        if self._unreleased_images:
+            _remember_cleanup_errors(self._cleanup_errors, errors)
+            return errors
+        # Retain failed handles for a subsequent stop attempt. Parent resources
+        # cannot be released while their camera/list is still in use.
+        if self._acquisition_started and release("spinCameraEndAcquisition", self._camera):
+            self._acquisition_started = False
+        if not self._acquisition_started:
+            if self._camera_initialized and release("spinCameraDeInit", self._camera):
+                self._camera_initialized = False
+            if not self._camera_initialized and self._camera.value:
+                if release("spinCameraRelease", self._camera):
+                    self._camera = ctypes.c_void_p()
+        if not self._camera.value and self._camera_list.value:
+            if not self._camera_list_cleared:
+                self._camera_list_cleared = release("spinCameraListClear", self._camera_list)
+            if self._camera_list_cleared and release("spinCameraListDestroy", self._camera_list):
+                self._camera_list = ctypes.c_void_p()
+        if not self._camera.value and not self._camera_list.value and self._system.value:
+            if release("spinSystemReleaseInstance", self._system):
+                self._system = ctypes.c_void_p()
+        if not self._system.value and self._dll_dir_handle is not None:
+            if _cleanup_step(errors, "dll_directory_close", self._dll_dir_handle.close):
+                self._dll_dir_handle = None
+        _remember_cleanup_errors(self._cleanup_errors, errors)
         return errors
 
 
@@ -1036,6 +1104,12 @@ class HeadlessSpinnakerRecorder:
         self._pyspin: Any = None
         self._system: Any = None
         self._camera: Any = None
+        self._camera_list: Any = None
+        self._camera_initialized = False
+        self._acquisition_started = False
+        self._start_attempted = False
+        self._cleanup_errors: list[str] = []
+        self._unreleased_images: list[Any] = []
         self._device_info: dict[str, str | None] = {
             "serial_number": None,
             "model_name": None,
@@ -1100,6 +1174,9 @@ class HeadlessSpinnakerRecorder:
 
     def start(self) -> Path:
         """Start camera acquisition and background frame saving."""
+        if self._start_attempted:
+            raise RuntimeError("Camera recorder is single-use; create a new recorder for another recording")
+        self._start_attempted = True
         self.session_dir.mkdir(parents=True, exist_ok=True)
         try:
             self._pyspin = self._load_pyspin()
@@ -1128,12 +1205,11 @@ class HeadlessSpinnakerRecorder:
 
         try:
             self._system = self._pyspin.System.GetInstance()
-            cam_list = self._system.GetCameras()
-            if cam_list.GetSize() == 0:
-                cam_list.Clear()
+            self._camera_list = self._system.GetCameras()
+            if self._camera_list.GetSize() == 0:
                 raise RuntimeError("No Spinnaker cameras found")
 
-            self._camera = self._select_camera(cam_list)
+            self._camera = self._select_camera(self._camera_list)
             device_version = self._pyspin_device_value("DeviceVersion")
             firmware_version = self._pyspin_device_value("DeviceFirmwareVersion")
             self._device_info = {
@@ -1143,10 +1219,13 @@ class HeadlessSpinnakerRecorder:
                 "device_version": device_version,
                 "firmware_version": firmware_version or device_version,
             }
-            cam_list.Clear()
+            self._camera_list.Clear()
+            self._camera_list = None
             self._camera.Init()
+            self._camera_initialized = True
             self._configure_camera()
             self._camera.BeginAcquisition()
+            self._acquisition_started = True
             self._timestamps = _FrameTimestampWriter(self.session_dir)
             self._preview_dispatcher.start()
             self._running = True
@@ -1159,8 +1238,23 @@ class HeadlessSpinnakerRecorder:
             self._thread.start()
             logger.info("Headless Spinnaker recording started: %s", self.session_dir)
             return self.session_dir
-        except Exception:
-            self._cleanup_pyspin()
+        except BaseException as exc:
+            self._error = f"{type(exc).__name__}: {exc}"
+            self._running = False
+            cleanup_errors: list[str] = []
+            stopped = _cleanup_step(cleanup_errors, "capture_thread_stop", lambda: _join_capture_thread(
+                self._thread, self._acquisition_timeout_ms))
+            _cleanup_step(cleanup_errors, "preview_stop", self._preview_dispatcher.stop)
+            if stopped:
+                cleanup_error = self._cleanup_pyspin()
+                if cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                if self._timestamps is not None:
+                    _cleanup_step(cleanup_errors, "timestamp_close", self._timestamps.close)
+            _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
+            if cleanup_errors:
+                logger.error("PySpin startup cleanup errors: %s", "; ".join(cleanup_errors))
+                exc.add_note("Camera startup cleanup: " + "; ".join(cleanup_errors))
             raise
 
     def stop(self) -> dict[str, Any]:
@@ -1169,17 +1263,26 @@ class HeadlessSpinnakerRecorder:
             return self._c_backend.stop()
 
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=max(5.0, self._acquisition_timeout_ms / 1000.0 + 2.0))
-            if self._thread.is_alive():
-                self._error = "capture thread did not stop before SDK teardown"
-                self._preview_dispatcher.stop()
-                raise TimeoutError(self._error)
-        self._preview_dispatcher.stop()
+        try:
+            _join_capture_thread(self._thread, self._acquisition_timeout_ms)
+        except TimeoutError as exc:
+            self._error = self._error or str(exc)
+            cleanup_errors = [f"capture_thread_stop: {exc}"]
+            _cleanup_step(cleanup_errors, "preview_stop", self._preview_dispatcher.stop)
+            _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
+            if len(cleanup_errors) > 1:
+                exc.add_note("; ".join(cleanup_errors[1:]))
+            raise
+        cleanup_errors: list[str] = []
+        _cleanup_step(cleanup_errors, "preview_stop", self._preview_dispatcher.stop)
         self._stop_wall_s = time.time()
         cleanup_error = self._cleanup_pyspin()
+        if cleanup_error:
+            cleanup_errors.append(cleanup_error)
         if self._timestamps is not None:
-            self._timestamps.close()
+            if not _cleanup_step(cleanup_errors, "timestamp_close", self._timestamps.close):
+                self._error = self._error or cleanup_errors[-1]
+        _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
 
         summary = {
             "backend": self.backend,
@@ -1211,7 +1314,8 @@ class HeadlessSpinnakerRecorder:
             ),
             "estimated_missing_triggers": None,
             "capture_error": self._error,
-            "cleanup_error": cleanup_error,
+            "cleanup_error": "; ".join(cleanup_errors) or None,
+            "cleanup_error_history": list(self._cleanup_errors),
         }
         (self.session_dir / "recording_summary.json").write_text(
             json.dumps(summary, indent=2),
@@ -1226,25 +1330,31 @@ class HeadlessSpinnakerRecorder:
 
     def _cleanup_pyspin(self) -> str | None:
         cleanup_errors: list[str] = []
-        try:
-            if self._camera is not None:
-                self._camera.EndAcquisition()
-        except Exception as exc:  # pragma: no cover - device-specific
-            cleanup_errors.append(f"EndAcquisition: {type(exc).__name__}: {exc}")
-        try:
-            if self._camera is not None:
-                self._camera.DeInit()
-        except Exception as exc:  # pragma: no cover - device-specific
-            cleanup_errors.append(f"DeInit: {type(exc).__name__}: {exc}")
-        finally:
-            self._camera = None
-        try:
-            if self._system is not None:
-                self._system.ReleaseInstance()
-        except Exception as exc:  # pragma: no cover - device-specific
-            cleanup_errors.append(f"ReleaseInstance: {type(exc).__name__}: {exc}")
-        finally:
-            self._system = None
+        for image in list(self._unreleased_images):
+            if _cleanup_step(cleanup_errors, "Image.Release", image.Release):
+                self._unreleased_images.remove(image)
+        if self._unreleased_images:
+            _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
+            return "; ".join(cleanup_errors)
+        if self._camera is not None:
+            if self._acquisition_started and _cleanup_step(
+                cleanup_errors, "EndAcquisition", self._camera.EndAcquisition,
+            ):
+                self._acquisition_started = False
+            if not self._acquisition_started:
+                if self._camera_initialized and _cleanup_step(
+                    cleanup_errors, "DeInit", self._camera.DeInit,
+                ):
+                    self._camera_initialized = False
+                if not self._camera_initialized:
+                    self._camera = None
+        if self._camera is None and self._camera_list is not None:
+            if _cleanup_step(cleanup_errors, "CameraList.Clear", self._camera_list.Clear):
+                self._camera_list = None
+        if self._camera is None and self._camera_list is None and self._system is not None:
+            if _cleanup_step(cleanup_errors, "ReleaseInstance", self._system.ReleaseInstance):
+                self._system = None
+        _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
         return "; ".join(cleanup_errors) or None
 
     def _load_pyspin(self) -> Any:
@@ -1262,8 +1372,13 @@ class HeadlessSpinnakerRecorder:
             return cam_list.GetByIndex(0)
         for idx in range(cam_list.GetSize()):
             cam = cam_list.GetByIndex(idx)
-            if str(cam.TLDevice.DeviceSerialNumber.GetValue()) == self._serial_number:
-                return cam
+            try:
+                if str(cam.TLDevice.DeviceSerialNumber.GetValue()) == self._serial_number:
+                    return cam
+            finally:
+                # A retained exception traceback must not keep an unmatched
+                # camera reference alive when the parent SDK is released.
+                del cam
         raise RuntimeError(f"Spinnaker camera serial not found: {self._serial_number}")
 
     def _pyspin_device_value(self, name: str) -> str | None:
@@ -1415,7 +1530,15 @@ class HeadlessSpinnakerRecorder:
                 break
             finally:
                 if image is not None:
-                    image.Release()
+                    try:
+                        image.Release()
+                    except Exception as exc:
+                        error = f"Image release failed: {type(exc).__name__}: {exc}"
+                        self._error = self._error or error
+                        self._unreleased_images.append(image)
+                        _remember_cleanup_errors(self._cleanup_errors, [error])
+                        self._running = False
+                        logger.error("PySpin image release failed: %s", error)
 
     def _maybe_emit_preview(
         self,

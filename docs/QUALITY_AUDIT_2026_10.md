@@ -7,9 +7,9 @@ session selection, on-demand diagnostics, cooperative Stop and saved results.
 This audit does not establish that every hardware component is calibrated or
 that the system is bug-free.
 
-Local verification: full suite 373 passed. Ruff and type checks for config,
-recorder, session export and the new block I/O module passed. CI checks Windows
-and Linux; the preceding commit also passed all 362 tests on both platforms.
+Local verification: full suite 434 passed. Ruff and type checks for config,
+recorder, session export and block I/O passed. CI checks Windows and Linux;
+the preceding commit passed all 405 tests on both platforms.
 
 ## Repairs
 
@@ -76,6 +76,13 @@ and Linux; the preceding commit also passed all 362 tests on both platforms.
   corrupt chunks, missing indices or interior WAL CRC damage. Preserve damaged
   final WAL bytes in a manifest-hashed backup. Close readers on early failure and
   sort chunk numbers numerically beyond 999.
+- Preserve camera resource ownership through startup and cleanup failures. Stop
+  capture before releasing SDK objects; release failed images before their camera,
+  clear/destroy camera lists and retain failed handles for a later cleanup attempt.
+  Preserve the original startup error and historical cleanup errors after a retry.
+  Close timestamp files even when flushing fails. Reject recorder-instance reuse
+  before it can overwrite data. Camera cleanup errors now reach the session's
+  cleanup interlock instead of being ignored in the recording summary.
 
 ## Evidence on this PC
 
@@ -105,6 +112,8 @@ and Linux; the preceding commit also passed all 362 tests on both platforms.
 | Million-row crash recovery | Peak RSS 353.6 to 68.2 MiB; recovery plus validation 25.13 to 27.23 s; complete bundle validates | Synthetic source records; more sequential verification trades some time for bounded raw-data memory |
 | Recovery equivalence / failures | All one million raw NPZ rows and dtype equal; four raw CSVs byte-identical. Injected disk failure and failed validation retry successfully; original prefix chunks unchanged | Process/file fault injection, not storage hardware failure or sudden power loss |
 | 3.6-million-row crash recovery | Recovery and validation complete in 97.44 s at 139.3 MiB peak RSS; all 3.6 million records retained, bundle valid | Synthetic one-hour volume at 1 kHz; semantic camera timeline still grows with record duration |
+| Camera startup recovery | Missing serial and rejected ROI both release all native handles; subsequent recording saves 466 images for 466 triggers, all 25 artifacts validate, cleanup succeeds | Live C backend; PySpin startup and failed-release paths use unit fakes |
+| Preview after cleanup changes | Host frame age 74 / 89 ms median/p95; receipt-to-save 2.31 / 3.70 ms; maximum backlog growth 0.92 ms, ending -0.50 ms relative to start | Fifteen-second GUI observation; excludes calibrated exposure/display latency |
 
 Local evidence (recordings are intentionally excluded from Git):
 
@@ -129,6 +138,7 @@ Local evidence (recordings are intentionally excluded from Git):
 - `data/runtime/audit/recovery_before/benchmark.json` and `recovery_after/benchmark.json`
 - `data/runtime/audit/recovery_equivalence.json` (one-million-row exact comparison)
 - `data/runtime/audit/recovery_one_hour/benchmark.json` (3.6-million-row recovery)
+- `data/runtime/audit/camera_start_failure_result.json` (startup failures, resource release and subsequent live recording)
 
 The earlier rig check at `20261012_211459_030909` incorrectly reported overall
 success despite only four of six barcode matches. The earlier Stop check at
