@@ -9,6 +9,25 @@ from hf_dm.certification import REQUIRED_CERTIFICATION_CHECKS
 from hf_dm.rig_certification import run_rig_certification
 
 
+def test_optical_certification_requires_both_edges_on_selected_clock():
+    from hf_dm.config import SessionConfig
+    from hf_dm.certification import required_certification_checks
+    from hf_dm.rig_certification import _machine_checks
+    config = SessionConfig()
+    config.licks.source = "optical"
+    config.licks.optical_clock = "streamdio"
+    assert "cap_touch" not in required_certification_checks(config)
+    assert "optical_lick" in required_certification_checks(config)
+    for clock, values, passed in [("bpod_session", [0, 1], False), ("streamdio", [1], False),
+                                  ("streamdio", [1, 0], True)]:
+        events = [{"event_type": "lick_edge", "payload": {
+            "source": "bpod_optical", "clock": clock, "value": value,
+        }} for value in values]
+        checks = _machine_checks({"preflight": {"status": "PASS", "session": {"events": events}}}, {}, config)
+        lick = next(check for check in checks if check["name"] == "optical_lick")
+        assert (lick["status"] == "PASS") is passed
+
+
 CONFIRMATIONS = {
     "no_animal_present": True,
     "collection_vessel_installed": True,

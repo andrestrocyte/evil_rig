@@ -69,7 +69,8 @@ from hf_dm.session.runners import (
     BpodDecisionTrialRunner,
     CenteringTrialRunner,
 )
-from hf_dm.session.optical_licks import BpodLickReader, BpodLickForwarder
+from hf_dm.session.optical_licks import BpodLickReader, BpodLickForwarder, BpodLickWorker
+from hf_dm.session.run_control import RunControl, bounded_close
 from hf_dm.valve_calibration import (
     RewardCalibration,
     resolve_reward_calibration_path,
@@ -104,6 +105,7 @@ class HFDecisionSession:
         animal_use_confirmed: bool = False,
     ):
         self.config = validate_session_config(config)
+        self._run_control = RunControl()
         # A disabled animal-use gate is an explicit bench configuration.  Keep
         # the task runnable as requested, but never label that acquisition as an
         # animal-certified run.
@@ -131,6 +133,7 @@ class HFDecisionSession:
         self._lick_events: list[dict[str, Any]] = []
         self._bpod_lick_reader: BpodLickReader | None = None
         self._bpod_lick_forwarder: BpodLickForwarder | None = None
+        self._bpod_lick_worker: BpodLickWorker | None = None
         self._frame2ttl_lock = threading.Lock()
         self._frame2ttl_events: list[dict[str, float | int]] = []
         self._closed = False
@@ -331,6 +334,9 @@ class HFDecisionSession:
                 timeout_s=self.config.timing.output_verification_timeout_s,
             )
         self.speaker_relay.speaker_gate(False)
+        if self._bpod_lick_reader is not None:
+            self._bpod_lick_worker = BpodLickWorker(self._bpod_lick_reader)
+            self._bpod_lick_worker.start()
         self.white_noise_player = WhiteNoisePlayer(
             frequency_hz=self.config.speaker.frequency_hz,
             volume=self.config.speaker.volume,
@@ -415,6 +421,18 @@ class HFDecisionSession:
                 "speaker_control": "bpod_fsm_serial_pin26_gate_plus_pc_white_noise",
             },
         )
+        if self.config.frame2ttl.enabled:
+            # The detector can begin latched high while the desktop is visible.
+            # Establish a logged bright-to-dark baseline before trial barcodes.
+            for state in (True, False):
+                flip = self.display.draw_sync_square_frame(state)
+                self._notify_frame2ttl_display_state(
+                    state, flip, trial_index=0, source="baseline", frame_index=-1,
+                )
+                self.recorder.log_event("frame2ttl_baseline", {
+                    "state": int(state), "display_flip_mono_s": flip,
+                })
+                self._wait_display(0.25)
 
     def close(
         self,
@@ -448,6 +466,11 @@ class HFDecisionSession:
                 except BaseException as exc:
                     logger.exception("Failed to abort active Bpod trial during cleanup")
                     cleanup_failed("bpod_abort", exc)
+            if self._bpod_lick_worker is not None:
+                try:
+                    self._bpod_lick_worker.stop()
+                except BaseException as exc:
+                    cleanup_failed("optical_lick_worker_stop", exc)
             try:
                 self._stop_streamdio_status_poll()
             except BaseException as exc:
@@ -561,7 +584,7 @@ class HFDecisionSession:
                     logger.exception("Failed to detach Bpod softcode handler")
                     cleanup_failed("bpod_softcode_handler_detach", exc)
                 try:
-                    self.bpod.close()
+                    bounded_close(self.bpod.close)
                 except BaseException as exc:
                     logger.exception("Failed to close Bpod")
                     cleanup_failed("bpod_close", exc)
@@ -631,7 +654,10 @@ class HFDecisionSession:
             logger.exception("Failed to record cleanup event %s", event_type)
 
     def _check_recorder_health(self) -> None:
-        if self._bpod_lick_reader is not None:
+        self._run_control.check()
+        if self._bpod_lick_worker is not None:
+            self._bpod_lick_worker.raise_if_error()
+        elif self._bpod_lick_reader is not None:
             self._bpod_lick_reader.poll()
         if self.recorder is not None:
             self.recorder.raise_if_background_error()
@@ -2347,6 +2373,7 @@ class HFDecisionSession:
                     )
                     self._publish_monitor("frame2ttl_barcode", start_payload)
                     for frame_index, state in enumerate(states):
+                        self._check_recorder_health()
                         flip_mono_s = self.display.draw_sync_square_frame(bool(state))
                         self._notify_frame2ttl_display_state(
                             bool(state),
@@ -2695,18 +2722,35 @@ class HFDecisionSession:
         """Wait for bpod-core's read, event, and output-handler work to finish."""
         if self.bpod is None:
             return
-        self.bpod.wait()
+        deadline = time.perf_counter() + max(0.0, float(timeout_s))
+        read_thread = getattr(self.bpod, "_read_thread", None)
+        if read_thread is None:
+            read_thread = getattr(self.bpod, "_thread", None)  # simulation
+        if read_thread is not None and read_thread.is_alive():
+            read_thread.join(timeout=max(0.0, deadline - time.perf_counter()))
+            if read_thread.is_alive():
+                raise RuntimeError("Timed out waiting for Bpod state-machine reader")
 
         event_thread = getattr(self.bpod, "_event_thread", None)
         if event_thread is not None and event_thread.is_alive():
-            event_thread.join(timeout=max(0.0, float(timeout_s)))
+            event_thread.join(timeout=max(0.0, deadline - time.perf_counter()))
             if event_thread.is_alive():
                 raise RuntimeError("Timed out waiting for bpod-core trial data")
 
         softcode_thread = getattr(self.bpod, "_softcode_thread", None)
         if softcode_thread is not None and hasattr(softcode_thread, "drain"):
-            softcode_thread.drain()
-        if self._bpod_lick_reader is not None:
+            idle = getattr(softcode_thread, "_idle", None)
+            if idle is not None:
+                while not (idle.is_set() and softcode_thread.queue.empty()):
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        raise RuntimeError("Timed out waiting for Bpod softcode handlers")
+                    time.sleep(min(0.001, remaining))
+            else:
+                bounded_close(softcode_thread.drain, timeout_s=max(0.0, deadline - time.perf_counter()))
+        if self._bpod_lick_worker is not None:
+            self._bpod_lick_worker.drain()
+        elif self._bpod_lick_reader is not None:
             self._bpod_lick_reader.poll()
 
     def _start_output_verifier(self) -> None:
@@ -3611,14 +3655,19 @@ class HFDecisionSession:
         assert self.bpod is not None and self.recorder is not None
         fsm = StateMachine(name="OpticalLickObservation")
         fsm.add_state(
-            name="Observe", timer=duration_s, transitions={"Tup": ">exit"}, actions={}
+            name="Observe", timer=duration_s,
+            transitions={"Tup": ">exit", f"SoftCode{sc.SESSION_ABORT}": ">exit"}, actions={}
         )
         self._prepare_bpod_run(0)
         self.bpod.run(fsm, trial_number=0)
-        while self.bpod.is_running:
-            self._show_black_with_recorder_health(0.02)
-        self._wait_for_bpod_trial_threads()
-        self.recorder.log_bpod_trial(0, self.bpod.get_data(concat=False))
+        try:
+            while self.bpod.is_running:
+                self._show_black_with_recorder_health(0.02)
+        finally:
+            if self.bpod.is_running:
+                self.bpod.send_softcode(sc.SESSION_ABORT)
+            self._wait_for_bpod_trial_threads()
+            self.recorder.log_bpod_trial(0, self.bpod.get_data(concat=False))
 
     def _run_dm_trial_legacy(self, trial_index: int) -> bool:
         assert (

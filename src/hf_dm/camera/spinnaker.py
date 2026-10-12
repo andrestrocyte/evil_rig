@@ -20,8 +20,23 @@ logger = logging.getLogger(__name__)
 PreviewCallback = Callable[[dict[str, Any]], None]
 
 
-def _preview_due(last_preview_mono_s: float, min_interval_s: float) -> bool:
-    return time.perf_counter() - last_preview_mono_s >= max(0.0, float(min_interval_s))
+class _PreviewCadence:
+    """Keep preview cadence despite small acquisition jitter; never catch up stale frames."""
+
+    def __init__(self, interval_s: float):
+        self.interval_s = max(0.0, float(interval_s))
+        self.next_s: float | None = None
+
+    def due(self, now: float) -> bool:
+        if self.interval_s == 0:
+            return True
+        if self.next_s is None:
+            self.next_s = now + self.interval_s
+            return True
+        if now < self.next_s:
+            return False
+        self.next_s += (math.floor((now - self.next_s) / self.interval_s) + 1) * self.interval_s
+        return True
 
 
 def _duration_s(start_wall_s: float | None, stop_wall_s: float | None) -> float | None:
@@ -54,7 +69,9 @@ def _capture_stats(
     acquisition_timeouts: int,
     save_errors: int = 0,
 ) -> dict[str, int]:
-    skipped = max(0, int(incomplete_frames)) + max(0, int(acquisition_timeouts))
+    # A timed-out wait can occur before triggers start or after they stop; it
+    # does not identify a missing frame. Keep it separate from observed losses.
+    skipped = max(0, int(incomplete_frames)) + max(0, int(save_errors))
     return {
         "frames_saved": max(0, int(frames_saved)),
         "incomplete_frames": max(0, int(incomplete_frames)),
@@ -299,7 +316,7 @@ class _SpinnakerCRecorder:
         preview_callback: PreviewCallback | None = None,
         preview_max_width: int = 520,
         preview_max_height: int = 390,
-        preview_min_interval_s: float = 0.125,
+        preview_min_interval_s: float = 1 / 15,
     ) -> None:
         self.session_dir = session_dir
         self._serial_number = serial_number
@@ -317,6 +334,7 @@ class _SpinnakerCRecorder:
         self._preview_max_width = int(preview_max_width)
         self._preview_max_height = int(preview_max_height)
         self._preview_min_interval_s = float(preview_min_interval_s)
+        self._preview_cadence = _PreviewCadence(preview_min_interval_s)
         self._last_preview_mono_s = 0.0
         self._preview_count = 0
         self._preview_dispatcher = _PreviewDispatcher(
@@ -822,7 +840,7 @@ class _SpinnakerCRecorder:
     ) -> None:
         if not self._preview_dispatcher.enabled:
             return
-        if not _preview_due(self._last_preview_mono_s, self._preview_min_interval_s):
+        if not self._preview_cadence.due(time.perf_counter()):
             return
         try:
             if mono_frame is not None:
@@ -911,7 +929,7 @@ class HeadlessSpinnakerRecorder:
         preview_callback: PreviewCallback | None = None,
         preview_max_width: int = 520,
         preview_max_height: int = 390,
-        preview_min_interval_s: float = 0.125,
+        preview_min_interval_s: float = 1 / 15,
     ) -> None:
         # Native camera SDK calls run on a capture thread.  Use an absolute path
         # so a process-wide working-directory change cannot redirect frame data.
@@ -933,6 +951,7 @@ class HeadlessSpinnakerRecorder:
         self._preview_max_width = int(preview_max_width)
         self._preview_max_height = int(preview_max_height)
         self._preview_min_interval_s = float(preview_min_interval_s)
+        self._preview_cadence = _PreviewCadence(preview_min_interval_s)
         self._last_preview_mono_s = 0.0
         self._preview_count = 0
         self._preview_dispatcher = _PreviewDispatcher(
@@ -1317,7 +1336,7 @@ class HeadlessSpinnakerRecorder:
     ) -> None:
         if not self._preview_dispatcher.enabled:
             return
-        if not _preview_due(self._last_preview_mono_s, self._preview_min_interval_s):
+        if not self._preview_cadence.due(time.perf_counter()):
             return
         try:
             array = image.GetNDArray()

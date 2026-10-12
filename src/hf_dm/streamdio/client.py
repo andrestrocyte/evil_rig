@@ -60,15 +60,11 @@ class StreamDIOClient:
         # ArCOM logger can emit byte-level DEBUG messages. Both streams can stall
         # the task/display loop even though experiment data are already retained
         # by StreamDIO and this session recorder.
-        driver_logger = logging.getLogger(
-            "pybpod_streamDIO_module.stream_dio_protocol"
-        )
-        driver_logger.setLevel(logging.WARNING)
-        if not any(
-            isinstance(item, _TimingHeartbeatLogFilter)
-            for item in driver_logger.filters
-        ):
-            driver_logger.addFilter(_TimingHeartbeatLogFilter())
+        for name in ("stream_dio_protocol", "stream_dio_base"):
+            driver_logger = logging.getLogger(f"pybpod_streamDIO_module.{name}")
+            driver_logger.setLevel(logging.WARNING)
+            if not any(isinstance(item, _TimingHeartbeatLogFilter) for item in driver_logger.filters):
+                driver_logger.addFilter(_TimingHeartbeatLogFilter())
         logging.getLogger("pybpodapi.com.arcom").setLevel(logging.WARNING)
         try:
             from pybpod_streamDIO_module.stream_dio_protocol import StreamDIOProtocol
@@ -116,6 +112,10 @@ class StreamDIOClient:
         self._dio = self._protocol_cls(config_port=cfg, stream_port=stream, connect=False)
         try:
             self._dio.open()
+            # The driver supplies a historical pin-27 default. Read the actual
+            # firmware value before recording hardware identity or certification.
+            speaker_status = self._dio.get_speaker_status()
+            self._dio.module_info["speaker_pin"] = int(speaker_status["pin"])
             # Firmware initialization drives all module outputs low.
             n_outputs = int(self._dio.module_info["n_output_channels"])
             with self._output_condition:
@@ -124,7 +124,7 @@ class StreamDIOClient:
                 self._output_events = {}
                 self._output_event_history = defaultdict(lambda: deque(maxlen=64))
         except Exception as exc:
-            self._dio = None
+            # Retain the handle so session cleanup can close a partial connection.
             raise RuntimeError(
                 f"Failed to open StreamDIO config={cfg}, stream={stream}. "
                 "If Windows reports 'Access is denied', close old hf-dm-run/python "

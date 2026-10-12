@@ -116,9 +116,16 @@ def test_capture_stats_counts_saved_skipped_and_observed_frames():
         "incomplete_frames": 2,
         "acquisition_timeouts": 3,
         "save_errors": 1,
-        "frames_skipped": 5,
-        "frames_observed": 15,
+        "frames_skipped": 3,
+        "frames_observed": 13,
     }
+
+
+def test_camera_wait_timeouts_do_not_invent_lost_frames():
+    stats = _capture_stats(frames_saved=10, incomplete_frames=0, acquisition_timeouts=3)
+    assert stats["frames_observed"] == 10
+    assert stats["frames_skipped"] == 0
+    assert stats["acquisition_timeouts"] == 3
 
 
 def test_spinnaker_does_not_teardown_sdk_while_capture_thread_is_alive():
@@ -309,6 +316,18 @@ def test_c_capture_copies_mono_pixels_preserves_padding_and_releases_image(tmp_p
         assert timestamps == [(0, 123456789, target.name)]
         assert previews[0]["data"] == bytes(range(1, 9))
         assert previews[0]["acquired_mono_s"] <= previews[0]["monotonic_s"]
+
+
+def test_preview_cadence_keeps_target_rate_under_jitter_without_catchup():
+    from hf_dm.camera.spinnaker import _PreviewCadence
+
+    cadence = _PreviewCadence(1 / 15)
+    emitted = [index for index in range(300) if cadence.due(
+        100 + index / 30 + (0.002 if index % 2 else 0)
+    )]
+    assert 149 <= len(emitted) <= 151
+    assert cadence.due(200)
+    assert not cadence.due(200.001)
 
 
 def test_c_mono_fast_path_retains_sdk_fallback_for_other_pixel_formats(tmp_path):

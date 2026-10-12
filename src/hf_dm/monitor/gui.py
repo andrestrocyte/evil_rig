@@ -1066,6 +1066,7 @@ class _MonitorWindow:
         self.height = max(720, int(event.height))
 
     def _tick(self) -> None:
+        started = time.perf_counter()
         try:
             shutdown = self._drain_queue()
             self._render()
@@ -1079,7 +1080,8 @@ class _MonitorWindow:
         if shutdown:
             self.root.quit()
             return
-        delay_ms = max(20, int(round(1000.0 / max(1, int(self.config.fps)))))
+        period_s = 1.0 / max(1, int(self.config.fps))
+        delay_ms = max(1, int(round(1000 * (period_s - (time.perf_counter() - started)))))
         self.root.after(delay_ms, self._tick)
 
     def _drain_queue(self) -> bool:

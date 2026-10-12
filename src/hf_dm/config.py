@@ -249,7 +249,7 @@ class MonitorConfig:
     force_sample_hz: float = 80.0
     wheel_sample_hz: float = 60.0
     screen_fps: float = 12.0
-    camera_fps: float = 10.0
+    camera_fps: float = 15.0
     camera_preview_width: int = 520
     camera_preview_height: int = 390
     task_preview_width: int = 220
@@ -734,7 +734,7 @@ class SessionConfig:
                 force_sample_hz=float(monitor_raw.get("force_sample_hz", 80.0)),
                 wheel_sample_hz=float(monitor_raw.get("wheel_sample_hz", 60.0)),
                 screen_fps=float(monitor_raw.get("screen_fps", 12.0)),
-                camera_fps=float(monitor_raw.get("camera_fps", 10.0)),
+                camera_fps=float(monitor_raw.get("camera_fps", 15.0)),
                 camera_preview_width=int(monitor_raw.get("camera_preview_width", 520)),
                 camera_preview_height=int(monitor_raw.get("camera_preview_height", 390)),
                 task_preview_width=int(monitor_raw.get("task_preview_width", 220)),

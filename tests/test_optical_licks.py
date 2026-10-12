@@ -11,7 +11,7 @@ from hf_dm.config import ConfigValidationError, SessionConfig, validate_session_
 from hf_dm.data.session_export import _flags, _write_licks_csv
 from hf_dm.monitor.gui import OperatorMonitorState
 from hf_dm.session.controller import HFDecisionSession
-from hf_dm.session.optical_licks import BpodLickReader, BpodLickForwarder
+from hf_dm.session.optical_licks import BpodLickReader, BpodLickForwarder, BpodLickWorker
 from hf_dm.session.simulated import (
     SimulatedHFDecisionSession,
     SimulationOptions,
@@ -60,6 +60,31 @@ def test_optical_reader_keeps_hardware_times_without_duplicate_or_lost_final_edg
     reader.poll()
     assert [e["timestamp_us"] for e in edges] == [100, 150, 200]
     assert reader.edge_count == 3
+
+
+def test_lick_worker_surfaces_failure_without_blocking_display():
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    def poll():
+        entered.set()
+        release.wait(1)
+        raise ValueError("receipt missing")
+    worker = BpodLickWorker(SimpleNamespace(poll=poll))
+    worker.start()
+    assert entered.wait(1)
+    worker.raise_if_error()  # display continues while a receipt is outstanding
+    release.set()
+    worker.stop()
+    with pytest.raises(RuntimeError, match="Optical lick acquisition"):
+        worker.raise_if_error()
+
+
+def test_lick_reader_drain_has_a_lock_timeout():
+    bpod = SimpleNamespace(_time_reference=SimpleNamespace(reset_system_time_ns=0))
+    reader = BpodLickReader(bpod, 1, lambda event: None)
+    with reader._poll_lock:
+        with pytest.raises(TimeoutError, match="previous events"):
+            reader.poll(timeout_s=0.001)
 
 
 def test_optical_selection_ignores_streamdio_touch_and_counts_only_beam_entries():
@@ -133,6 +158,7 @@ def test_optical_iti_acquires_inputs_with_a_timed_output_free_fsm():
     session._observe_licks_during_black(3.0)
     assert fsms[0].states["Observe"].timer == 3.0
     assert fsms[0].states["Observe"].actions == {}
+    assert fsms[0].states["Observe"].transitions["SoftCode3"] == ">exit"
     session._bpod_lick_reader.poll.assert_called_once()
     session.recorder.log_bpod_trial.assert_called_once_with(0, "captured optical events")
 

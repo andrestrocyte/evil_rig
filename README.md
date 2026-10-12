@@ -19,6 +19,28 @@ post-session quality control.
 
 ---
 
+## Windows rig launcher
+
+For daily Windows operation, open **evil_rig** on the desktop or double-click
+`Start-Rig.cmd`. Choose the subject, trial counts and lick sensor, then **Start
+session**. **Check rig** runs a finite bench check (about 50 seconds here);
+**Watch inputs (20 s)** displays physical sensor responses. **Stop** saves the
+interrupted session and verifies cleanup. These diagnostics are on-demand;
+ordinary sessions retain lightweight acquisition health checks.
+
+To install a new checkout with Python 3.12 and the camera SDK already installed:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_rig.ps1
+```
+
+This creates a local `.venv`, installs locked runtime dependencies and the pinned
+StreamDIO driver, and adds a desktop shortcut. Add `-Dev` for test tools. Each
+launch saves its configuration, console log, result and data validation under
+`data/runtime/operator/runs/`; session bundles go to the selected data directory.
+Animal mode retains the existing calibration, welfare and rig certification
+requirements. See [current audit evidence and limits](docs/QUALITY_AUDIT_2026_10.md).
+
 ## Table of contents
 
 - [Why this repo](#why-this-repo)

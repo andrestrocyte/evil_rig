@@ -17,7 +17,7 @@ import zlib
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import PackageNotFoundError, distribution as installed_distribution, version
 from pathlib import Path
 from typing import Any, Literal
 
@@ -137,7 +137,20 @@ def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
         if driver_spec is not None and driver_spec.origin:
             driver_path = Path(driver_spec.origin).resolve()
             streamdio_driver["module_path"] = str(driver_path)
-            streamdio_driver.update(_git_identity(driver_path.parent))
+            # A wheel inside this repo's .venv is not code from this repo's Git
+            # tree. PEP 610 records the actual pinned driver source revision.
+            try:
+                direct = json.loads(installed_distribution("MM-PybBod2").read_text("direct_url.json") or "{}")
+            except (PackageNotFoundError, ValueError):
+                direct = {}
+            streamdio_driver["source_url"] = direct.get("url")
+            vcs = direct.get("vcs_info", {})
+            if vcs.get("commit_id"):
+                streamdio_driver["git_commit"] = vcs["commit_id"]
+                streamdio_driver["identity_source"] = "installed_direct_url"
+            elif not any(part.lower() in {"site-packages", "dist-packages"} for part in driver_path.parts):
+                streamdio_driver.update(_git_identity(driver_path.parent))
+                streamdio_driver["identity_source"] = "editable_git_checkout"
     except Exception:
         pass
 

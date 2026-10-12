@@ -920,6 +920,15 @@ def test_hardware_self_test_returns_typed_validation_results(tmp_path):
         for result in report["results"]
     )
 
+    # Optical sessions intentionally leave cap-touch power off. Their output
+    # test must not demand a transition from an unused sensor.
+    config.licks.source = "optical"
+    recorder.events = [event for event in recorder.events if not (
+        event.event_type == "output_actual"
+        and event.payload["channel"] == config.licks.power_output_channel
+    )]
+    assert session.validate_results()["passed"]
+
     # The maximum interval is an independent guard: a malformed or legacy
     # stall counter must not let a slow choice loop pass certification.
     recorder.trials[0].choice_loop_max_frame_s = 0.2

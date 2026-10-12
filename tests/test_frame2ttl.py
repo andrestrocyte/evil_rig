@@ -61,6 +61,28 @@ def test_frame2ttl_trial_barcode_round_trips():
     assert decoded["fields"]["modality"] == "risk"
 
 
+def test_frame_clock_does_not_round_60hz_to_16ms_or_catch_up_after_stall(monkeypatch):
+    from hf_dm.display import pygame_display as display
+    current = [100.0]
+    sleeps = []
+    monkeypatch.setattr(display.time, "perf_counter", lambda: current[0])
+    def sleep(seconds):
+        sleeps.append(seconds)
+        current[0] += seconds
+    monkeypatch.setattr(display.time, "sleep", sleep)
+    clock = display.FrameClock()
+    for _ in range(60):
+        current[0] += 0.002  # rendering time
+        clock.tick(60)
+    assert abs(current[0] - 101) < 1e-9
+    current[0] += 0.1
+    clock.tick(60)
+    count = len(sleeps)
+    clock.tick(60)
+    assert len(sleeps) == count + 1
+    assert abs(sleeps[-1] - 1 / 60) < 1e-9
+
+
 def test_frame2ttl_decoder_accepts_inverted_ttl_polarity():
     code = encode_frame2ttl_trial_code(
         trial_index=5,
@@ -78,6 +100,17 @@ def test_frame2ttl_decoder_accepts_inverted_ttl_polarity():
     assert decoded["inverted"]
     assert decoded["word"] == code.word
     assert decoded["pulse_groups"] == [1, 1]
+
+
+def test_frame2ttl_uses_device_clock_despite_host_receipt_jitter():
+    code = encode_frame2ttl_trial_code(
+        trial_index=1, star_side="left", trial_mode="free", forced_shape=None, modality="force",
+    )
+    events = _events_from_states(frame2ttl_barcode_states(code), frame_period_s=1 / 60)
+    for index, event in enumerate(events):
+        event["relative_time_s"] += 0.09 if index % 2 else 0
+    decoded = decode_frame2ttl_barcode_events(events, frame_period_s=1 / 60)
+    assert decoded["decoded"] and decoded["word"] == code.word
 
 
 def test_frame2ttl_count_barcode_stays_short_and_covers_trial_kinds():

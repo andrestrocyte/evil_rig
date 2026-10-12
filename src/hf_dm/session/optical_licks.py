@@ -26,10 +26,19 @@ class BpodLickReader:
         self._exit_events = {f"Port{self.port}_Low", f"Port{self.port}Out"}
         self._thread = None
         self._cursor = 0
+        self._poll_lock = threading.Lock()
         self.edge_count = 0
         self._base_us = int(bpod._time_reference.reset_system_time_ns) // 1000
 
-    def poll(self) -> None:
+    def poll(self, *, timeout_s: float = 1.0) -> None:
+        if not self._poll_lock.acquire(timeout=timeout_s):
+            raise TimeoutError("Optical lick reader is still processing previous events")
+        try:
+            self._poll()
+        finally:
+            self._poll_lock.release()
+
+    def _poll(self) -> None:
         thread = getattr(self.bpod, "_event_thread", None)
         if thread is None:
             return
@@ -41,6 +50,8 @@ class BpodLickReader:
             self._thread = thread
             self._cursor = 0
         end = frame.height
+        if end == self._cursor:
+            return
         pending = (
             frame.slice(self._cursor)
             .filter(pl.col("event").is_in(self._entry_events | self._exit_events))
@@ -64,6 +75,43 @@ class BpodLickReader:
             )
             self.edge_count += 1
         self._cursor = end
+
+
+class BpodLickWorker:
+    """Read/forward licks outside the display loop, with a bounded final drain."""
+
+    def __init__(self, reader: BpodLickReader, poll_interval_s: float = 0.005):
+        self.reader = reader
+        self.poll_interval_s = poll_interval_s
+        self._stop = threading.Event()
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, name="optical-lick-reader", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            while not self._stop.is_set():
+                self.reader.poll()
+                self._stop.wait(self.poll_interval_s)
+        except BaseException as exc:
+            self._error = exc
+
+    def raise_if_error(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("Optical lick acquisition failed") from self._error
+
+    def drain(self) -> None:
+        self.raise_if_error()
+        self.reader.poll()
+        self.raise_if_error()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        if self._thread.is_alive():
+            raise TimeoutError("Optical lick worker did not stop")
 
 
 class BpodLickForwarder:

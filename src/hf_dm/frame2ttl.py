@@ -183,9 +183,8 @@ def decode_frame2ttl_barcode_events(
 ) -> dict[str, Any]:
     """Decode a two-group pulse-count barcode from DI edge events.
 
-    The decoder uses host receipt times when available because the GUI/session needs
-    immediate coherence checks. Raw StreamDIO module timestamps remain in each event
-    for offline alignment.
+    Prefer StreamDIO edge timestamps so USB/host scheduling jitter cannot change
+    pulse widths. Legacy events without device timestamps use host receipt times.
     """
     del expected_bits, zero_high_frames
     frame_period = max(1e-6, float(frame_period_s))
@@ -253,12 +252,17 @@ def _decode_with_polarity(
     for pulse_index, pulse in enumerate(pulses[preamble_index + 1 :], start=preamble_index + 1):
         frames = pulse["duration_s"] / frame_period_s
         if abs(frames - float(one_high_frames)) > tolerance_frames:
-            continue
+            return {
+                "decoded": False, "reason": "invalid_data_pulse_width",
+                "inverted": inverted, "edge_count": len(events), "bits": "",
+                "pulse_frames": [*pulse_frames, frames],
+            }
         current_count += 1
         pulse_frames.append(frames)
         next_pulse = pulses[pulse_index + 1] if pulse_index + 1 < len(pulses) else None
         if next_pulse is None:
             groups.append(current_count)
+            current_count = 0
             break
         gap_frames = (
             (next_pulse["start_time_s"] - pulse["end_time_s"]) / frame_period_s
@@ -287,7 +291,7 @@ def _decode_with_polarity(
     parsed = parse_frame2ttl_word(word)
     first_edge = events[0] if events else None
     return {
-        "decoded": True,
+        "decoded": bool(parsed["checksum_ok"]),
         "inverted": inverted,
         "edge_count": len(events),
         "bits": f"M{modality_count}K{kind_count}",
@@ -328,7 +332,7 @@ def _high_pulses(events: list[dict[str, Any]], *, inverted: bool) -> list[dict[s
 
 
 def _event_time_s(event: dict[str, Any]) -> float:
-    for key in ("relative_time_s", "timestamp_us", "host_perf_counter_s", "monotonic_s"):
+    for key in ("timestamp_us", "relative_time_s", "host_perf_counter_s", "monotonic_s"):
         if key in event and event[key] is not None:
             if key == "timestamp_us":
                 return float(event[key]) / 1_000_000.0

@@ -25,6 +25,7 @@ mm = ["pybpod-soundcard-module", "opencv-python>=4.0"]
 dev = ["pytest==9.1.1", "mypy==2.2.0", "ruff==0.15.20", "types-PyYAML>=6.0"]
 
 [project.scripts]
+evil-rig = "hf_dm.operator_app:main"
 hf-dm = "hf_dm.ops_cli:main"
 hf-dm-run = "hf_dm.cli:main"
 hf-dm-export-session = "hf_dm.data.session_export:main_export"

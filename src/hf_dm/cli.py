@@ -267,6 +267,22 @@ def _record_cli_override(
     )
 
 
+def _write_run_result(session: HFDecisionSession, *, error: BaseException | None = None) -> None:
+    path = os.environ.get("HF_DM_RESULT_PATH")
+    if not path:
+        return
+    from hf_dm.data.recorder import _atomic_write_text
+    recorder = session.recorder
+    session_path = None if recorder is None else recorder.base_path.with_suffix(".json")
+    summary = getattr(recorder, "summary", None)
+    _atomic_write_text(Path(path), json.dumps({
+        "summary": asdict(summary) if summary is not None else None,
+        "session_path": str(session_path) if session_path is not None and session_path.exists() else None,
+        "error": None if error is None else f"{type(error).__name__}: {error}",
+        "cleanup_error": str(session._last_cleanup_error) if session._last_cleanup_error else None,
+    }, indent=2))
+
+
 def _normalize_modality(value: str) -> str:
     modality = str(value or "force").lower()
     if modality not in {"force", "risk", "delay"}:
@@ -861,6 +877,10 @@ def main() -> None:
             config,
             source="hf-dm-run --hardware-self-test",
             values={
+                "phase": config.phase.value,
+                "task.modality": config.task.modality,
+                "task.n_free_trials": config.task.n_free_trials,
+                "task.n_forced_trials": config.task.n_forced_trials,
                 "shortened_timing": True,
                 "n_trials": config.n_trials,
                 "camera.record_video": config.camera.record_video,
@@ -891,7 +911,7 @@ def main() -> None:
             animal_use_confirmed=animal_use_confirmed,
         )
     connected = False
-    while True:
+    for connection_attempt in range(2):
         try:
             session.connect()
             connected = True
@@ -907,6 +927,10 @@ def main() -> None:
                 and config.animal_use.enabled
             )
             if not is_interactive_animal:
+                raise
+            if connection_attempt:
+                # A changed hardware identity must produce a finite, actionable
+                # failure, rather than repeatedly reopening the same dialog.
                 raise
             animal_use_confirmed = _remediate_animal_use_gate(
                 config,
@@ -944,13 +968,15 @@ def main() -> None:
             if isinstance(session, HardwareSelfTestSession):
                 report = session.validate_results()
                 print(f"Hardware self-test validated: {json.dumps(report, sort_keys=True)}")
-    except BaseException:
+    except BaseException as exc:
         # Preserve the initiating failure; close records and interlocks any
         # independent cleanup failure without replacing the original cause.
         session.close(raise_on_error=False)
+        _write_run_result(session, error=exc)
         raise
     print(f"Session finished: {summary.end_reason}")
     print(f"Trials completed: {summary.n_trials_completed}/{summary.n_trials_planned}")
+    _write_run_result(session)
 
 
 if __name__ == "__main__":

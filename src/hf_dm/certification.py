@@ -50,6 +50,12 @@ REQUIRED_HUMAN_APPROVALS = frozenset(
 )
 
 
+def required_certification_checks(config: SessionConfig) -> frozenset[str]:
+    if config.licks.source == "optical":
+        return (REQUIRED_CERTIFICATION_CHECKS - {"cap_touch"}) | {"optical_lick"}
+    return REQUIRED_CERTIFICATION_CHECKS
+
+
 class AnimalUseGateError(RuntimeError):
     """Raised before animal acquisition when any release requirement is unproven."""
 
@@ -295,12 +301,14 @@ def evaluate_animal_use_gate(
         "required_runtime_hardware",
         (not config.animal_use.require_camera or (config.camera.required and config.camera.record_video))
         and (not config.animal_use.require_speaker or config.speaker.required)
-        and (not config.animal_use.require_licks or config.licks.power_required),
+        and (not config.animal_use.require_licks
+             or config.licks.source == "optical" or config.licks.power_required),
         {
             "camera_required": config.camera.required,
             "camera_record_video": config.camera.record_video,
             "speaker_required": config.speaker.required,
             "lick_power_required": config.licks.power_required,
+            "lick_source": config.licks.source,
         },
     )
 
@@ -367,7 +375,7 @@ def evaluate_animal_use_gate(
     }
     missing_or_failed = {
         name: check_status.get(name)
-        for name in sorted(REQUIRED_CERTIFICATION_CHECKS)
+        for name in sorted(required_certification_checks(config))
         if check_status.get(name) != "PASS"
     }
     extra_nonpass = {
