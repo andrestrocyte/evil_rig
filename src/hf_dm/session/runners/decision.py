@@ -130,7 +130,7 @@ class BpodDecisionEpochRunner:
 
                 if phase == "quiescence":
                     self._track_engagement_from_wheel()
-                    wheel_snap = self.wheel.snapshot()
+                    wheel_snap = self.wheel.snapshot(include_percentile=False)
                     edges = int(wheel_snap["cw_pulses"]) + int(wheel_snap["ccw_pulses"])
                     if edges != last_quiescence_edges:
                         self.bpod.send_softcode(sc.QUIESCENCE_MOVEMENT)
@@ -251,7 +251,7 @@ class BpodDecisionEpochRunner:
                     if choice_start_mono_s is None:
                         choice_start_mono_s = float(state["phase_started_mono_s"])
                     self._track_engagement_from_wheel()
-                    wheel_snap = self.wheel.snapshot()
+                    wheel_snap = self.wheel.snapshot(include_percentile=False)
                     net_position_deg = (
                         int(wheel_snap["net_pulses"]) * self.config.wheel.deg_per_pulse
                     )

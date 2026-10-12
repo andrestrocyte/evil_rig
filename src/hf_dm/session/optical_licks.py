@@ -26,6 +26,7 @@ class BpodLickReader:
         self._exit_events = {f"Port{self.port}_Low", f"Port{self.port}Out"}
         self._thread = None
         self._cursor = 0
+        self._observed_event_count: int | None = None
         self._poll_lock = threading.Lock()
         self.edge_count = 0
         self._base_us = int(bpod._time_reference.reset_system_time_ns) // 1000
@@ -42,6 +43,12 @@ class BpodLickReader:
         thread = getattr(self.bpod, "_event_thread", None)
         if thread is None:
             return
+        # bpod-core appends a complete row before incrementing this counter.
+        # Avoid rebuilding a Polars join every 5 ms when no new event exists.
+        # Unknown driver versions retain the public peek_data fallback.
+        event_count = getattr(thread, "_n_events", None)
+        if thread is self._thread and event_count is not None and event_count == self._observed_event_count:
+            return
         frame = self.bpod.peek_data()
         # A new FSM may replace the buffer while the snapshot is being copied.
         if thread is not getattr(self.bpod, "_event_thread", None):
@@ -49,6 +56,7 @@ class BpodLickReader:
         if thread is not self._thread:
             self._thread = thread
             self._cursor = 0
+        self._observed_event_count = event_count
         end = frame.height
         if end == self._cursor:
             return

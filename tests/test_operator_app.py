@@ -46,6 +46,15 @@ def test_saved_diagnostic_failure_is_not_reported_as_pass(tmp_path):
         assert diagnostic_result("screen_barcodes", str(path))["passed"] is passed
 
 
+def test_saved_camera_count_mismatch_is_not_reported_as_pass(tmp_path):
+    import json
+    path = tmp_path / "session.json"
+    path.write_text(json.dumps({"stream_summaries": {"spinnaker_video": {
+        "trigger_alignment": {"status": "FAIL", "recorded_triggers": 30, "saved_frames": 29},
+    }}}))
+    assert diagnostic_result("session", str(path))["passed"] is False
+
+
 def test_hung_bpod_reader_never_enters_unbounded_driver_wait():
     release = threading.Event()
     thread = threading.Thread(target=release.wait, daemon=True)

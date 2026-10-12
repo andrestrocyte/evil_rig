@@ -51,17 +51,6 @@ def _mean_fps(frame_count: int, duration_s: float | None) -> float | None:
     return float(frame_count) / duration_s
 
 
-def _estimated_missing_triggers(
-    frame_count: int,
-    target_hz: int,
-    duration_s: float | None,
-) -> int | None:
-    if duration_s is None or duration_s <= 0.0 or target_hz <= 0:
-        return None
-    expected = int(round(float(target_hz) * duration_s))
-    return max(0, expected - int(frame_count))
-
-
 def _capture_stats(
     *,
     frames_saved: int,
@@ -483,11 +472,9 @@ class _SpinnakerCRecorder:
                 self._frame_count,
                 _duration_s(self._start_wall_s, self._stop_wall_s),
             ),
-            "estimated_missing_triggers": _estimated_missing_triggers(
-                self._frame_count,
-                self._fps,
-                _duration_s(self._start_wall_s, self._stop_wall_s),
-            ),
+            # Recorder lifetime includes waiting before/after triggers. The
+            # session compares frames with the recorded hardware trigger count.
+            "estimated_missing_triggers": None,
             "capture_error": self._error,
             "cleanup_error": "; ".join(cleanup_errors) or None,
         }
@@ -1132,11 +1119,7 @@ class HeadlessSpinnakerRecorder:
                 self._frame_count,
                 _duration_s(self._start_wall_s, self._stop_wall_s),
             ),
-            "estimated_missing_triggers": _estimated_missing_triggers(
-                self._frame_count,
-                self._fps,
-                _duration_s(self._start_wall_s, self._stop_wall_s),
-            ),
+            "estimated_missing_triggers": None,
             "capture_error": self._error,
             "cleanup_error": cleanup_error,
         }

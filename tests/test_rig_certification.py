@@ -312,7 +312,8 @@ def test_certify_rig_emits_gate_consumable_pass_only_with_complete_evidence(
         "hf_dm.rig_certification.build_release_identity",
         lambda _config: {
             "git_commit": "a" * 40,
-            "git_exact_tag": "v0.1.0-animal-ready",
+            "git_exact_tag": None,
+            "streamdio_driver_sha256": "e" * 64,
             "git_dirty": False,
             "requirements_lock_sha256": "b" * 64,
             "package_versions": {"bpod-core": "0.1.0a12"},

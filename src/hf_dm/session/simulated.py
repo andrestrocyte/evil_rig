@@ -87,7 +87,7 @@ class SimulatedWheel:
     ) -> None:
         del event_type, channel, value, timestamp_us, relative_time
 
-    def snapshot(self) -> dict:
+    def snapshot(self, *, include_percentile: bool = True) -> dict:
         if self._planned_choice != "timeout":
             target_sign = 1 if self._planned_choice == "cw" else -1
             target_pulses = max(1, round(self._choice_distance_deg / self.cfg.deg_per_pulse))
@@ -107,7 +107,7 @@ class SimulatedWheel:
             self.force_max = self.force_last if self.force_max is None else max(self.force_max, self.force_last)
 
         force_mean = self.force_sum / self.force_samples if self.force_samples else None
-        force_p95 = _percentile(self.force_values, 95.0) if self.force_values else None
+        force_p95 = _percentile(self.force_values, 95.0) if self.force_values and include_percentile else None
         return {
             "net_pulses": self.net_pulses,
             "cw_pulses": self.cw_pulses,

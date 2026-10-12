@@ -110,7 +110,7 @@ class CenteringTrialRunner:
 
                 if phase == "quiescence":
                     self._track_engagement_from_wheel()
-                    snap = self.wheel.snapshot()
+                    snap = self.wheel.snapshot(include_percentile=False)
                     edges = int(snap["cw_pulses"]) + int(snap["ccw_pulses"])
                     if edges != last_quiescence_edges:
                         self.bpod.send_softcode(sc.QUIESCENCE_MOVEMENT)

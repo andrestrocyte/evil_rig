@@ -55,6 +55,7 @@ def _release_fixture(tmp_path):
             "module_path": "C:/vendor/streamdio.py",
             "git_commit": "c" * 40,
             "git_dirty": False,
+            "source_sha256": "e" * 64,
         },
     }
     release = build_release_identity(config, provenance=provenance)
@@ -212,11 +213,18 @@ def test_operator_confirmation_is_per_run_and_cannot_be_stored_in_certificate(tm
 
 def test_certificate_hash_ignores_per_session_identity_and_storage_paths(tmp_path):
     config, _provenance, _certificate, _now = _release_fixture(tmp_path)
+    config.monitor.record_path = "auto"
     baseline = certified_config_sha256(config)
     changed = deepcopy(config)
     changed.subject_id = "different-mouse"
+    changed.n_trials = 12
+    changed.random_seed = 314
+    changed.task.profile_name = "renamed-identical-profile"
+    changed.task.n_free_trials = 10
+    changed.task.n_forced_trials = 2
     changed.results_dir = str(tmp_path / "other-session")
     changed.camera.save_dir = str(tmp_path / "other-video")
+    changed.monitor.record_path = str(tmp_path / "session/monitor_telemetry.jsonl")
     changed.reward.calibration_path = str(tmp_path / "relocated-calibration.json")
     changed.welfare.subjects_dir = str(tmp_path / "other-subject-records")
     changed.animal_use.certification_path = str(tmp_path / "relocated-certificate.json")
@@ -234,7 +242,7 @@ def test_certificate_hash_still_binds_task_and_safety_values(tmp_path):
     baseline = certified_config_sha256(config)
 
     for mutate in (
-        lambda value: setattr(value, "n_trials", value.n_trials + 1),
+        lambda value: setattr(value.task, "modality", "delay"),
         lambda value: setattr(value.reward, "matched_pump_s", 0.09),
         lambda value: setattr(value.timing, "choice_timeout_s", 21.0),
         lambda value: setattr(value.animal_use, "hardware_failsafe_revision", "watchdog-r3"),
@@ -242,6 +250,36 @@ def test_certificate_hash_still_binds_task_and_safety_values(tmp_path):
         changed = deepcopy(config)
         mutate(changed)
         assert certified_config_sha256(changed) != baseline
+
+
+def test_trial_count_changes_reuse_certificate_but_cannot_exceed_reward_limit(tmp_path):
+    config, provenance, certificate, now = _release_fixture(tmp_path)
+    provenance["git_exact_tag"] = None  # exact commit remains authoritative
+    config.n_trials = 10
+    def gate():
+        return evaluate_animal_use_gate(
+            config, operator_confirmed=True, provenance=provenance,
+            actual_hardware=certificate["hardware"], now_s=now,
+            storage_probe=lambda _path: {"pass": True},
+        )
+    assert gate()["status"] == "PASS"
+    config.n_trials = 1000
+    checks = {item["name"]: item for item in gate()["checks"]}
+    assert checks["exact_release_identity"]["status"] == "PASS"
+    assert checks["subject_welfare"]["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("source_hash", [None, "f" * 64])
+def test_changed_or_missing_driver_source_hash_invalidates_certificate(tmp_path, source_hash):
+    config, provenance, _certificate, now = _release_fixture(tmp_path)
+    provenance["streamdio_driver"]["source_sha256"] = source_hash
+    report = evaluate_animal_use_gate(
+        config, operator_confirmed=True, provenance=provenance, now_s=now,
+        storage_probe=lambda _path: {"pass": True},
+    )
+    check = next(item for item in report["checks"] if item["name"] == "exact_release_identity")
+    assert check["status"] == "FAIL"
+    assert "streamdio_driver_sha256" in check["detail"]
 
 
 def test_gate_probes_results_and_camera_storage(tmp_path):

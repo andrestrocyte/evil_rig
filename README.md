@@ -41,6 +41,11 @@ launch saves its configuration, console log, result and data validation under
 Animal mode retains the existing calibration, welfare and rig certification
 requirements. See [current audit evidence and limits](docs/QUALITY_AUDIT_2026_10.md).
 
+The camera records every received frame at the configured trigger rate. The GUI
+uses a separate 15 fps preview of recent frames; on this rig its measured host
+frame age is about 74 ms median / 89 ms p95. Preview timing is not the acquisition
+timestamp. The saved session compares frame counts with recorded camera triggers.
+
 ## Table of contents
 
 - [Why this repo](#why-this-repo)
@@ -315,9 +320,16 @@ Drop `--simulate-headless` to open the pygame window. Choice modes: `matched`, `
 `timeout`, `cw`, `ccw`, `alternate` (in the DM task, *matched* = star/high-effort, *opposite* =
 circle/low-effort).
 
-**3. On the rig**, preflight first. The shipped animal profiles are intentionally fail-closed: a
-session will not open hardware until the exact tagged release/config/calibration has a current PASS
+**3. On the rig**, use preflight during setup or troubleshooting. The shipped animal profiles are intentionally fail-closed: a
+session will not open hardware until the exact release/config/calibration has a current PASS
 certificate and the operator confirms that this is an animal-use run.
+
+Certification binds the clean Git commit, installed driver source hash, effective
+hardware/task settings and calibration. A Git tag is optional. Subjects, session
+paths, random seeds and trial counts can change without repeating commissioning;
+the calibrated reward ceiling is checked against the selected trial count on
+every run. Changing sensor, modality, timing or reward settings still changes the
+certified configuration. Existing certificates need regeneration after this code update.
 
 ```bash
 python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration 2
@@ -338,7 +350,7 @@ hardware opens. Four profiles ship in `configs/`:
 | Profile | Phase | Trials | Notable settings |
 |---------|-------|--------|------------------|
 | `centering_50.yaml` | `centering` | 50 | `centering_threshold_deg: 8.0` shaping |
-| `dm_50.yaml` | `decision_making` | 50 | full task, `streamdio_memory_mode: full` |
+| `dm_50.yaml` | `decision_making` | 50 | full task, bounded raw-event working history |
 | `dm_100.yaml` | `decision_making` | 100 | standard volume |
 | `dm_200.yaml` | `decision_making` | 200 | `streamdio_chunk_s: 45`, `streamdio_memory_mode: bounded` |
 
@@ -654,9 +666,17 @@ triggers).
 
 ### Long sessions
 
-`dm_200` sets `streamdio_chunk_s: 45` and `streamdio_memory_mode: bounded`: the live task keeps only
-the most recent `streamdio_recent_events` rows in memory, writes completed chunks in a daemon thread,
-and reconstructs the full primary NPZ/CSV/timeline from those chunks at finalize.
+All shipped profiles bound the raw-event working history to about 50,000 recent
+rows. Every raw event is written to the recovery journal (WAL); final NPZ/CSV
+exports retain the full stream. `dm_200` also writes optional 45-second NPZ chunks.
+Bounding memory does not require those extra chunks.
+
+The rig checks available space before connecting and every two seconds during
+acquisition, stopping through normal cleanup when a recording volume falls below
+2 GiB free. Full-resolution uncompressed video still needs substantial space
+(about 2.8 GB/min on the installed camera). This reserve is a guard, not a promise
+that every possible session's exports will fit. Finalization currently reconstructs
+the complete stream in memory; its peak memory use grows with session length.
 
 ### Inspecting a session
 

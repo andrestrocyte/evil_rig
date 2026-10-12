@@ -1288,11 +1288,11 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
         "must be full, bounded, rolling, or chunked",
         export.streamdio_memory_mode,
     )
-    if export.streamdio_memory_mode in {"bounded", "rolling", "chunked"}:
+    if export.streamdio_memory_mode == "chunked":
         require(
             export.streamdio_chunk_s > 0,
             "session_export.streamdio_chunk_s",
-            "must be greater than zero for bounded or chunked memory modes",
+            "must be greater than zero for explicit chunked mode; bounded mode can use the WAL alone",
             export.streamdio_chunk_s,
         )
     require(export.streamdio_recent_events > 0, "session_export.streamdio_recent_events", "must be greater than zero", export.streamdio_recent_events)

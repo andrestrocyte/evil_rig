@@ -5,9 +5,10 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+import shutil
 import threading
 import time
-from typing import Callable, TypeVar
+from typing import Callable, Iterable, TypeVar
 
 T = TypeVar("T")
 
@@ -17,7 +18,7 @@ class OperatorStop(KeyboardInterrupt):
 
 
 class RunControl:
-    def __init__(self) -> None:
+    def __init__(self, *, storage_paths: Iterable[str | Path] = (), reserve_bytes: int = 2 * 1024**3) -> None:
         value = os.environ.get("HF_DM_STOP_REQUEST")
         self.stop_path = Path(value) if value else None
         seconds = float(os.environ.get("HF_DM_RUN_TIMEOUT_S", "0"))
@@ -25,6 +26,9 @@ class RunControl:
             raise ValueError("HF_DM_RUN_TIMEOUT_S must be finite and non-negative")
         self.deadline = time.perf_counter() + seconds if seconds else None
         self._next_poll = 0.0
+        self.reserve_bytes = reserve_bytes
+        self._storage_paths = tuple(dict.fromkeys(Path(path).expanduser().resolve() for path in storage_paths))
+        self._next_storage_check = 0.0
 
     def check(self) -> None:
         now = time.perf_counter()
@@ -34,6 +38,23 @@ class RunControl:
             self._next_poll = now + 0.1
             if self.stop_path is not None and self.stop_path.exists():
                 raise OperatorStop("Operator requested stop")
+        if now >= self._next_storage_check:
+            self._next_storage_check = now + 2.0
+            checked_devices = set()
+            for path in self._storage_paths:
+                existing = path
+                while not existing.exists() and existing.parent != existing:
+                    existing = existing.parent
+                device = existing.stat().st_dev
+                if device in checked_devices:
+                    continue
+                checked_devices.add(device)
+                free = shutil.disk_usage(existing).free
+                if free < self.reserve_bytes:
+                    raise OSError(
+                        f"Low disk space at {path}: {free / 1024**3:.2f} GiB free; "
+                        f"stopping to preserve {self.reserve_bytes / 1024**3:.2f} GiB for data finalization"
+                    )
 
 
 def bounded_close(callback: Callable[[], T], *, timeout_s: float = 3.0) -> T:

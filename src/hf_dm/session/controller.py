@@ -105,7 +105,10 @@ class HFDecisionSession:
         animal_use_confirmed: bool = False,
     ):
         self.config = validate_session_config(config)
-        self._run_control = RunControl()
+        storage_paths = [config.results_dir]
+        if config.camera.record_video:
+            storage_paths.append(config.camera.save_dir)
+        self._run_control = RunControl(storage_paths=storage_paths)
         # A disabled animal-use gate is an explicit bench configuration.  Keep
         # the task runnable as requested, but never label that acquisition as an
         # animal-certified run.
@@ -205,6 +208,7 @@ class HFDecisionSession:
             raise
 
     def _connect_hardware(self) -> None:
+        self._run_control.check()
         self._closed = False
         self._require_live_barcode_capacity()
         self.runtime_provenance = capture_runtime_provenance()
@@ -1415,7 +1419,7 @@ class HFDecisionSession:
                 )
 
     def _publish_wheel_snapshot(self, *, phase: str, trial_index: int | None = None) -> None:
-        snap = self.wheel.snapshot()
+        snap = self.wheel.snapshot(include_percentile=False)
         if snap["force_last"] is not None:
             self._publish_monitor_throttled(
                 "force",
@@ -2093,7 +2097,7 @@ class HFDecisionSession:
         start_optical_edges = (
             self._bpod_lick_reader.edge_count if self._bpod_lick_reader is not None else 0
         )
-        start_streamdio_count = len(self.recorder.streamdio_events)
+        start_streamdio_counts = self.recorder.streamdio_counts_snapshot()
         start_snap = self.wheel.snapshot()
         self.recorder.log_event(
             "preflight_start",
@@ -2111,11 +2115,8 @@ class HFDecisionSession:
             end_snap = self.wheel.snapshot()
             end_camera_count = len(self.dio.get_camera_events())
             end_lick_count = self._lick_event_count()
-            raw_events = self.recorder.streamdio_events[start_streamdio_count:]
-            digital_counts: dict[int, int] = {}
-            for event_type, channel, _value, _timestamp_us, _relative_s, _host_s in raw_events:
-                if event_type == "dio_input":
-                    digital_counts[int(channel)] = digital_counts.get(int(channel), 0) + 1
+            counts = self.recorder.streamdio_counts_snapshot() - start_streamdio_counts
+            digital_counts = {channel: count for (kind, channel), count in counts.items() if kind == "dio_input"}
             self.recorder.log_event(
                 "preflight_end",
                 {
@@ -2493,7 +2494,7 @@ class HFDecisionSession:
             "Abort",
         ]
         expected_ids = [STREAMDIO_STATE_MARKER_IDS[name] for name in sequence]
-        start_streamdio_idx = len(self.recorder.streamdio_events)
+        start_event_idx = len(self.recorder.events)
         self.recorder.log_event(
             "bpod_opcode_diagnostic_start",
             {"hold_s": hold_s, "sequence": sequence, "expected_ids": expected_ids},
@@ -2510,24 +2511,25 @@ class HFDecisionSession:
                 fsm.add_state(
                     name=f"{state_name}_Opcode",
                     timer=hold_s,
-                    transitions={"Tup": next_state},
+                    transitions={"Tup": next_state, f"SoftCode{sc.SESSION_ABORT}": ">exit"},
                     actions=self.speaker_relay.bpod_state_marker_act(state_name),
                 )
             self.recorder.log_fsm_definition("bpod_opcode_diagnostic", fsm)
             self._prepare_bpod_run(0)
             self.bpod.run(fsm, trial_number=0)
             while self.bpod.is_running:
+                self._check_recorder_health()
                 if self.display is not None:
                     self.display.pump_events()
                 time.sleep(0.002)
             self._wait_for_bpod_trial_threads()
             self.recorder.log_bpod_trial(0, self.bpod.get_data(concat=False))
             events = [
-                event
-                for event in self.recorder.streamdio_events[start_streamdio_idx:]
-                if event[0] == "bpod_state"
+                event.payload
+                for event in self.recorder.events[start_event_idx:]
+                if event.event_type == "bpod_state_marker"
             ]
-            seen_ids = [int(event[1]) for event in events]
+            seen_ids = [int(event["state_id"]) for event in events]
             result = {
                 "hold_s": hold_s,
                 "sequence": sequence,
@@ -2535,7 +2537,7 @@ class HFDecisionSession:
                 "seen_ids": seen_ids,
                 "markers_seen": len(seen_ids),
                 "matched": seen_ids == expected_ids,
-                "streamdio_events": events,
+                "state_markers": events,
             }
             self.recorder.log_event("bpod_opcode_diagnostic_end", result)
             self._publish_monitor("bpod_opcode_diagnostic", result)

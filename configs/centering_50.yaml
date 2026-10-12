@@ -153,7 +153,7 @@ session_export:
   export_csv_on_finalize: true
   export_timeline: true
   streamdio_chunk_s: 0
-  streamdio_memory_mode: full
+  streamdio_memory_mode: bounded
   streamdio_wal_fsync_s: 1.0
   streamdio_recent_events: 50000
 

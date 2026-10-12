@@ -89,6 +89,10 @@ def certified_config_payload(config: SessionConfig) -> dict[str, Any]:
     # certificate that otherwise matches the exact task and hardware contract.
     payload["subject_id"] = None
     payload["results_dir"] = None
+    # Session length is checked against calibrated reward limits on every run.
+    # Reordering or choosing fewer trials does not change the hardware contract.
+    payload["n_trials"] = None
+    payload["random_seed"] = None
     reward = payload.get("reward")
     if isinstance(reward, dict):
         # The calibration artifact itself is bound separately by SHA-256.
@@ -96,8 +100,16 @@ def certified_config_payload(config: SessionConfig) -> dict[str, Any]:
     camera = payload.get("camera")
     if isinstance(camera, dict):
         camera["save_dir"] = None
+    monitor = payload.get("monitor")
+    if isinstance(monitor, dict) and monitor.get("record_path"):
+        # 'auto' resolves to a new absolute path after hardware opens. Preserve
+        # whether telemetry recording is enabled, not its per-session filename.
+        monitor["record_path"] = "<session>"
     task = payload.get("task")
     if isinstance(task, dict):
+        task["profile_name"] = None
+        task["n_free_trials"] = None
+        task["n_forced_trials"] = None
         task["selected_mouse_dir"] = None
         task["session_name"] = None
         task["session_dir"] = None
@@ -167,6 +179,7 @@ def build_release_identity(
         "package_versions": runtime.get("package_versions"),
         "python_version": runtime.get("python_version"),
         "streamdio_driver": runtime.get("streamdio_driver"),
+        "streamdio_driver_sha256": (runtime.get("streamdio_driver") or {}).get("source_sha256"),
         "config_sha256": certified_config_sha256(config),
         "source_config_sha256": source_sha256,
         "calibration_sha256": calibration_sha256,
@@ -351,7 +364,7 @@ def evaluate_animal_use_gate(
         certified_release = {}
     release_keys = (
         "git_commit",
-        "git_exact_tag",
+        "streamdio_driver_sha256",
         "requirements_lock_sha256",
         "package_versions",
         "config_sha256",

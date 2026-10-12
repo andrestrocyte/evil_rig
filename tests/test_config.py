@@ -140,7 +140,7 @@ def test_semantic_config_validation_reports_all_dangerous_values():
     config = SessionConfig(n_trials=0)
     config.camera.frequency_hz = 30
     config.camera.exposure_us = 40_000
-    config.session_export.streamdio_memory_mode = "bounded"
+    config.session_export.streamdio_memory_mode = "chunked"
     config.session_export.streamdio_chunk_s = 0
     config.task.modality = "mystery"
 

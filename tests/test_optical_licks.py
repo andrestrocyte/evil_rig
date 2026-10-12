@@ -87,6 +87,30 @@ def test_lick_reader_drain_has_a_lock_timeout():
             reader.poll(timeout_s=0.001)
 
 
+def test_idle_lick_poll_skips_dataframe_work_but_reads_new_and_final_events():
+    rows = []
+    thread = SimpleNamespace(_n_events=0)
+    bpod = SimpleNamespace(_time_reference=SimpleNamespace(reset_system_time_ns=0), _event_thread=thread)
+    def snapshot():
+        return pl.DataFrame(rows, schema={'time': pl.Datetime('us'), 'trial': pl.Int64, 'event': pl.String})
+    bpod.peek_data = Mock(side_effect=snapshot)
+    seen = []
+    reader = BpodLickReader(bpod, 1, seen.append)
+    reader.poll()
+    for _ in range(50):
+        reader.poll()
+    assert bpod.peek_data.call_count == 1
+    for index, event in enumerate(['Port1_High', 'Port1_Low']):
+        rows.append({'time': datetime(2026, 1, 1) + timedelta(microseconds=index), 'trial': 1, 'event': event})
+        thread._n_events += 1
+        reader.poll()
+    assert [event['value'] for event in seen] == [1, 0]
+    # A replacement FSM must be read even when its raw event count is unchanged.
+    bpod._event_thread = SimpleNamespace(_n_events=2)
+    reader.poll()
+    assert len(seen) == 4
+
+
 def test_optical_selection_ignores_streamdio_touch_and_counts_only_beam_entries():
     config = SessionConfig()
     config.licks.source = "optical"

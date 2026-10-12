@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -56,7 +57,8 @@ class WheelAccumulator:
             self.force_last: float | None = None
             self.force_min: float | None = None
             self.force_max: float | None = None
-            self.force_values: list[float] = []
+            # Exact counts, bounded by the ADC's distinct output codes, not time.
+            self._force_histogram: Counter[float] = Counter()
             self.last_pulse_monotonic = time.perf_counter()
 
     def handle_event(
@@ -85,7 +87,7 @@ class WheelAccumulator:
                 self.force_samples += 1
                 self.force_sum += numeric_value
                 self.force_last = numeric_value
-                self.force_values.append(numeric_value)
+                self._force_histogram[numeric_value] += 1
                 self.force_min = (
                     numeric_value if self.force_min is None else min(self.force_min, numeric_value)
                 )
@@ -93,29 +95,46 @@ class WheelAccumulator:
                     numeric_value if self.force_max is None else max(self.force_max, numeric_value)
                 )
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, include_percentile: bool = True) -> dict[str, Any]:
         with self.lock:
             force_mean = None
-            force_p95 = None
             if self.force_samples:
                 force_mean = self.force_sum / float(self.force_samples)
-                force_p95 = _percentile(self.force_values, 95.0)
-            return {
+            histogram = self._force_histogram.copy() if include_percentile else None
+            result: dict[str, Any] = {
                 "net_pulses": self.net_pulses,
                 "cw_pulses": self.cw_pulses,
                 "ccw_pulses": self.ccw_pulses,
                 "force_samples": self.force_samples,
                 "force_last": self.force_last,
                 "force_mean": force_mean,
-                "force_p95": force_p95,
+                "force_p95": None,
                 "force_min": self.force_min,
                 "force_max": self.force_max,
                 "quiescent_for_s": time.perf_counter() - self.last_pulse_monotonic,
             }
+        # Sorting statistics must not hold the 1 kHz acquisition lock.
+        if histogram:
+            result["force_p95"] = _histogram_percentile(histogram, result["force_samples"], 95.0)
+        return result
 
     def signed_position_deg(self) -> float:
-        snap = self.snapshot()
-        return snap["net_pulses"] * self.cfg.deg_per_pulse
+        with self.lock:
+            return self.net_pulses * self.cfg.deg_per_pulse
+
+
+def _histogram_percentile(counts: Counter[float], total: int, percentile: float) -> float:
+    rank = (total - 1) * max(0.0, min(100.0, percentile)) / 100.0
+    lower, upper = math.floor(rank), math.ceil(rank)
+    cumulative, low_value = 0, 0.0
+    for value, count in sorted(counts.items()):
+        previous = cumulative
+        cumulative += count
+        if previous <= lower < cumulative:
+            low_value = value
+        if cumulative > upper:
+            return low_value + (rank - lower) * (value - low_value)
+    raise ValueError("Force histogram count does not match sample count")
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:

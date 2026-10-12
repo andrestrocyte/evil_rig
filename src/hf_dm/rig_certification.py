@@ -612,7 +612,7 @@ def _missing_release_identity(release: dict[str, Any]) -> list[str]:
         key
         for key in (
             "git_commit",
-            "git_exact_tag",
+            "streamdio_driver_sha256",
             "requirements_lock_sha256",
             "package_versions",
             "config_sha256",

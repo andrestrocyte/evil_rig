@@ -151,6 +151,18 @@ def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
             elif not any(part.lower() in {"site-packages", "dist-packages"} for part in driver_path.parts):
                 streamdio_driver.update(_git_identity(driver_path.parent))
                 streamdio_driver["identity_source"] = "editable_git_checkout"
+            # Bind the installed source bytes too: PEP 610 alone does not detect
+            # local edits to an installed wheel. Ignore paths and bytecode caches.
+            driver_files = (
+                sorted(driver_path.parent.rglob("*.py"))
+                if driver_path.name == "__init__.py" else [driver_path]
+            )
+            digest = hashlib.sha256()
+            for source in driver_files:
+                digest.update(source.relative_to(driver_path.parent).as_posix().encode("utf-8") + b"\0")
+                digest.update(hashlib.sha256(source.read_bytes()).digest())
+            if driver_files:
+                streamdio_driver["source_sha256"] = digest.hexdigest()
     except Exception:
         pass
 
@@ -368,6 +380,8 @@ class SessionRecorder:
         self._streamdio_recent_max_events = 0
         self._streamdio_total_count = 0
         self._streamdio_counts: Counter[str] = Counter()
+        self._streamdio_channel_counts: Counter[tuple[str, int]] = Counter()
+        self._streamdio_index_lock = threading.Lock()
         self._max_event_count = 0
         self._max_trial_count = 0
         self._max_streamdio_event_count = 0
@@ -642,15 +656,22 @@ class SessionRecorder:
             self._set_streamdio_wal_background_error(exc)
             self.raise_if_background_error()
             raise AssertionError("unreachable")
-        self._streamdio_total_count += 1
-        self._streamdio_counts[row[0]] += 1
-        self.streamdio_events.append(row)
-        self._prune_streamdio_events_if_needed()
+        with self._streamdio_index_lock:
+            self._streamdio_total_count += 1
+            self._streamdio_counts[row[0]] += 1
+            self._streamdio_channel_counts[(row[0], row[1])] += 1
+            self.streamdio_events.append(row)
+            self._prune_streamdio_events_if_needed()
         self._max_streamdio_event_count = max(
             self._max_streamdio_event_count,
             len(self.streamdio_events),
         )
         self._buffer_streamdio_chunk(row)
+
+    def streamdio_counts_snapshot(self) -> Counter[tuple[str, int]]:
+        """Exact interval counts even when the in-memory stream is rolling."""
+        with self._streamdio_index_lock:
+            return self._streamdio_channel_counts.copy()
 
     def finalize(self, summary: SessionSummary) -> Path:
         if self._finalized:
@@ -659,6 +680,21 @@ class SessionRecorder:
         finalize_start = time.perf_counter()
         self.summary = summary
         self._append_session_water_log(summary)
+        camera = self.stream_summaries.get("spinnaker_video", {})
+        if "frames_saved" in camera:
+            # All producers have stopped before finalization. Use the complete
+            # counter, never the rolling cache or the recorder's wall duration.
+            triggers = self._streamdio_counts.get("camera", 0)
+            frames = int(camera["frames_saved"])
+            alignment = {
+                "status": "PASS" if frames == triggers and frames > 0 else "FAIL",
+                "recorded_triggers": triggers,
+                "saved_frames": frames,
+                "frame_count_minus_triggers": frames - triggers,
+                "count_source": "streamdio_camera_events",
+            }
+            self.register_stream("spinnaker_video", {**camera, "trigger_alignment": alignment})
+            self.log_event("camera_trigger_alignment", alignment)
         self.log_event("session_end", {"end_reason": summary.end_reason})
         self._journal_append("session_summary", asdict(summary), durable=True)
         self.close_journal()
@@ -921,13 +957,12 @@ class SessionRecorder:
             0,
             int(self.export_options.get("streamdio_recent_events", 50000) or 0),
         )
-        if self._streamdio_chunk_s <= 0.0:
-            self._streamdio_memory_bounded = False
-            self._streamdio_memory_mode = "full"
-            return
         self._streamdio_memory_bounded = requested_mode in {"bounded", "rolling", "chunked"}
         if self._streamdio_memory_bounded and self._streamdio_recent_max_events <= 0:
             self._streamdio_recent_max_events = 50000
+        # Every raw event is durably journaled regardless of optional NPZ chunks.
+        if self._streamdio_chunk_s <= 0.0:
+            return
         try:
             from hf_dm.data.session_export import session_bundle_dir
 
@@ -1668,6 +1703,7 @@ def recover_session_journal(
     recorder.streamdio_events = recovered_streamdio
     recorder._streamdio_total_count = len(recovered_streamdio)
     recorder._streamdio_counts = Counter(row[0] for row in recovered_streamdio)
+    recorder._streamdio_channel_counts = Counter((row[0], row[1]) for row in recovered_streamdio)
     recorder._max_streamdio_event_count = len(recovered_streamdio)
     recorder._streamdio_chunk_s = float(recorder.export_options.get("streamdio_chunk_s", 0.0) or 0.0)
     recorder._streamdio_memory_mode = str(

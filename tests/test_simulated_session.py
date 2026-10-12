@@ -635,10 +635,13 @@ def test_simulated_frame2ttl_barcode_diagnostic_decodes_all_cases(tmp_path):
     assert diagnostic_end.payload["all_match"]
 
 
-def test_simulated_bpod_opcode_diagnostic_reports_marker_sequence(tmp_path):
+@pytest.mark.parametrize("memory_mode", ["full", "bounded"])
+def test_simulated_bpod_opcode_diagnostic_reports_marker_sequence(tmp_path, memory_mode):
     os.environ["SDL_VIDEODRIVER"] = "dummy"
     config = SessionConfig(n_trials=1, results_dir=str(tmp_path))
     config.camera.save_dir = str(tmp_path / "videos")
+    config.session_export.streamdio_memory_mode = memory_mode
+    config.session_export.streamdio_recent_events = 1
     shorten_for_simulation(config)
     session = SimulatedHFDecisionSession(
         config,

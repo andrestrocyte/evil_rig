@@ -113,13 +113,16 @@ def diagnostic_result(name: str, session_path: str) -> dict[str, Any] | None:
         "screen_sync": ("frame2ttl_diagnostic_end", "detected"),
         "screen_barcodes": ("frame2ttl_barcode_diagnostic_end", "all_match"),
     }
-    if name not in expected:
-        return None
-    event_type, flag = expected[name]
     document = json.loads(Path(session_path).read_text(encoding="utf-8"))
+    alignment = document.get("stream_summaries", {}).get("spinnaker_video", {}).get("trigger_alignment")
+    camera_ok = alignment is None or alignment.get("status") == "PASS"
+    if name not in expected:
+        return None if alignment is None else {"passed": camera_ok, "camera_trigger_alignment": alignment}
+    event_type, flag = expected[name]
     payload = next((event["payload"] for event in reversed(document.get("events", []))
                     if event.get("event_type") == event_type), {})
-    return {"passed": payload.get(flag) is True, "event_type": event_type, "result": payload}
+    return {"passed": payload.get(flag) is True and camera_ok, "event_type": event_type,
+            "result": payload, "camera_trigger_alignment": alignment}
 
 
 class AcquisitionJob:

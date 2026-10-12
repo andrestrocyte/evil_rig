@@ -34,6 +34,10 @@ def test_audio_stop_failure_is_visible_to_cleanup_interlock():
 def test_wheel_driver_provenance_does_not_inherit_venv_parent_git(tmp_path, monkeypatch):
     from hf_dm.data import recorder
     module = tmp_path / ".venv/Lib/site-packages/pybpod_streamDIO_module/__init__.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("# driver package\n")
+    implementation = module.parent / "driver.py"
+    implementation.write_text("REVISION = 1\n")
     monkeypatch.setattr(recorder.importlib.util, "find_spec", lambda name: SimpleNamespace(origin=str(module)))
     monkeypatch.setattr(recorder, "installed_distribution", lambda name: SimpleNamespace(
         read_text=lambda file: json.dumps({"url": "https://example.org/driver.git", "vcs_info": {"commit_id": "driver-revision"}}),
@@ -44,6 +48,9 @@ def test_wheel_driver_provenance_does_not_inherit_venv_parent_git(tmp_path, monk
     assert result["streamdio_driver"]["git_commit"] == "driver-revision"
     assert result["streamdio_driver"]["git_root"] is None
     git.assert_called_once_with(tmp_path)
+    first_hash = result["streamdio_driver"]["source_sha256"]
+    implementation.write_text("REVISION = 2\n")
+    assert recorder.capture_runtime_provenance(tmp_path)["streamdio_driver"]["source_sha256"] != first_hash
 
 
 def test_self_test_resets_selected_trial_counts_and_modality():

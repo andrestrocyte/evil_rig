@@ -94,6 +94,7 @@ class StreamDIOClient:
             deque[tuple[int, int, int, float, float]],
         ] = defaultdict(lambda: deque(maxlen=64))
         self._last_buffer_stats: dict[str, int] = {}
+        self._camera_events: list[tuple[int, float]] = []
 
     def open(
         self,
@@ -257,6 +258,15 @@ class StreamDIOClient:
         if self._dio is None:
             raise RuntimeError("StreamDIO not connected")
         self._dio.clear_event_history()
+        self._camera_events = []
+        # The durable recorder owns the complete high-rate stream. The vendor's
+        # extra debug histories must not grow for the entire session as well.
+        event_lock = getattr(self._dio, "_event_lock", None)
+        if event_lock is not None:
+            with event_lock:
+                for name in ("_event_history", "_all_events_history"):
+                    if hasattr(self._dio, name):
+                        setattr(self._dio, name, deque(maxlen=50000))
         self._callback = callback
 
         # The bringup driver's start_streaming() queries the current timestamp on
@@ -285,6 +295,8 @@ class StreamDIOClient:
     ) -> None:
         host_mono_s = time.perf_counter()
         host_wall_s = time.time()
+        if event_type == "camera":
+            self._camera_events.append((int(timestamp_us), float(relative_time)))
         if (
             event_type == "diagnostic"
             and channel is not None
@@ -626,11 +638,8 @@ class StreamDIOClient:
         return dict(self._last_buffer_stats)
 
     def get_camera_events(self) -> list[tuple[int, float]]:
-        """Return (timestamp_us, relative_s) for camera TTL events in history."""
-        if self._dio is None:
-            return []
-        events = self._dio.get_event_history(event_types=["camera"])
-        return [(int(e[3]), float(e[-1])) for e in events]
+        """Return camera TTLs without scanning/copying the 1 kHz analog history."""
+        return list(self._camera_events)
 
     def close(self) -> None:
         if self._dio is None:
