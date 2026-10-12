@@ -1560,6 +1560,66 @@ def _preserve_damaged_wal(path: Path) -> Path:
     return backup
 
 
+def _checkpoint_recovery_completion(marker: Path, journal: Path, result: dict[str, Any]) -> None:
+    from hf_dm.data.session_export import sha256_file
+
+    state = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else {
+        "schema_version": 1, "status": "incomplete", "journal": journal.name,
+    }
+    manifest = Path(result["manifest"])
+    state["recovery_completion"] = {
+        "schema_version": 1,
+        "manifest": manifest.resolve().relative_to(journal.parent.resolve()).as_posix(),
+        "manifest_sha256": sha256_file(manifest),
+        "result": result,
+    }
+    # This durable record precedes either unlink. A retry must verify the saved
+    # bundle rather than reconstruct it from a WAL that was already removed.
+    _atomic_write_text(marker, json.dumps(state, indent=2))
+
+
+def _cleanup_recovered_session(marker: Path, journal: Path) -> None:
+    base_name = journal.name[:-len(_JOURNAL_SUFFIX)]
+    journal.with_name(f"{base_name}.streamdio.wal").unlink(missing_ok=True)
+    marker.unlink(missing_ok=True)
+    fsync_directory_best_effort(journal.parent)
+
+
+def _resume_recovery_completion(marker: Path, journal: Path) -> dict[str, Any] | None:
+    if not marker.exists():
+        return None
+    state = json.loads(marker.read_text(encoding="utf-8"))
+    completion = state.get("recovery_completion")
+    if completion is None:
+        return None
+    if (not isinstance(completion, dict) or completion.get("schema_version") != 1
+            or not isinstance(completion.get("result"), dict)):
+        raise RuntimeError("Invalid recovery completion checkpoint; inputs retained")
+    from hf_dm.data.session_export import sha256_file, validate_session
+
+    manifest_name = str(completion.get("manifest", "")).replace("\\", "/")
+    manifest = (journal.parent / manifest_name).resolve()
+    if not manifest.is_relative_to(journal.parent.resolve()) or not manifest.is_file():
+        raise RuntimeError("Recovery completion manifest is missing or outside its session")
+    if sha256_file(manifest) != completion.get("manifest_sha256"):
+        raise RuntimeError("Recovery completion manifest checksum mismatch; inputs retained")
+    validation = validate_session(manifest)
+    if not validation.get("valid"):
+        raise RuntimeError(f"Completed recovery no longer validates; inputs retained: {validation.get('errors')}")
+    result = dict(completion["result"])
+    base_name = journal.name[:-len(_JOURNAL_SUFFIX)]
+    result.update({"journal": str(journal), "artifact": str(journal.with_name(f"{base_name}.npz")),
+                   "bundle_dir": str(manifest.parent), "manifest": str(manifest),
+                   "validation": validation, "resumed_completed_recovery": True})
+    # Rebase returned evidence paths for sessions copied to a different directory.
+    result["journal_recovery_backups"] = [str(journal.parent / Path(str(path).replace("\\", "/")).name)
+                                          for path in result.get("journal_recovery_backups", [])]
+    if backup := result.get("streamdio_wal_recovery_backup"):
+        result["streamdio_wal_recovery_backup"] = str(journal.parent / Path(str(backup).replace("\\", "/")).name)
+    _cleanup_recovered_session(marker, journal)
+    return result
+
+
 def recover_session_journal(
     path: Path | str,
     *,
@@ -1572,6 +1632,38 @@ def recover_session_journal(
         journal_path.parent / "manifest.json",
         journal_path.parent / f"{base_name}_bundle" / "manifest.json",
     )
+    if completed := _resume_recovery_completion(incomplete_marker, journal_path):
+        return completed
+    # Older recoveries have no checkpoint. If their WAL has already been deleted,
+    # a fully valid existing bundle is the durable source: never overwrite it.
+    if incomplete_marker.exists() and not journal_path.with_name(f"{base_name}.streamdio.wal").exists():
+        from hf_dm.data.session_export import validate_session
+        for manifest_path in manifest_candidates:
+            if not manifest_path.exists():
+                continue
+            validation = validate_session(manifest_path)
+            if not validation.get("valid"):
+                # There is no WAL left to establish that reconstruction is
+                # complete. Preserve the existing artifacts for inspection.
+                raise RuntimeError("Existing recovery bundle does not validate and its WAL is missing; inputs retained")
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            primary = journal_path.with_name(f"{base_name}.npz")
+            primary_indexed = any((manifest_path.parent / item["path"]).resolve() == primary.resolve()
+                                  for item in manifest_data.get("artifacts", []))
+            if not primary_indexed:
+                continue
+            counts = manifest_data["counts"]
+            completed = {
+                "journal": str(journal_path), "artifact": str(primary), "bundle_dir": str(manifest_path.parent),
+                "manifest": str(manifest_path), "validation": validation,
+                "repaired_trailing_record": False, "replaced_prior_summary": False,
+                "recovered_trials": counts["trials"], "recovered_bpod_trials": counts["bpod_trials"],
+                "recovered_streamdio_events": counts["streamdio_events"],
+                "streamdio_recovery_source": "verified_existing_bundle", "resumed_completed_recovery": True,
+            }
+            _checkpoint_recovery_completion(incomplete_marker, journal_path, completed)
+            _cleanup_recovered_session(incomplete_marker, journal_path)
+            return completed
     if not incomplete_marker.exists() and any(item.exists() for item in manifest_candidates):
         raise RuntimeError(
             f"Session is already finalized; refusing recovery without an incomplete marker: "
@@ -1724,13 +1816,7 @@ def recover_session_journal(
         artifact = recorder.finalize(summary)
         bundle_dir = session_bundle_dir(recorder.base_path, layout=layout)
         validation = validate_session(bundle_dir)
-        if validation.get("valid"):
-            # Recovery keeps its durable inputs until the regenerated bundle has
-            # passed validation. Failed validation leaves an explicit retry path.
-            recorder._streamdio_wal_path.unlink(missing_ok=True)
-            recorder._incomplete_marker_path.unlink(missing_ok=True)
-            fsync_directory_best_effort(recorder.base_path.parent)
-        return {
+        result = {
             "journal": str(journal_path),
             "artifact": str(artifact),
             "bundle_dir": str(bundle_dir),
@@ -1751,5 +1837,9 @@ def recover_session_journal(
             "streamdio_wal_trailing_bytes": wal_trailing_bytes,
             "streamdio_wal_recovery_backup": None if wal_backup is None else str(wal_backup),
         }
+        if validation.get("valid"):
+            _checkpoint_recovery_completion(incomplete_marker, journal_path, result)
+            _cleanup_recovered_session(incomplete_marker, journal_path)
+        return result
     finally:
         recorder.close_journal()

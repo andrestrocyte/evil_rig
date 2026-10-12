@@ -7,9 +7,9 @@ session selection, on-demand diagnostics, cooperative Stop and saved results.
 This audit does not establish that every hardware component is calibrated or
 that the system is bug-free.
 
-Local verification: full suite 476 passed. Ruff and type checks for config,
+Local verification: full suite 494 passed. Ruff and type checks for config,
 recorder, session export, raw I/O, journal I/O and array I/O passed. CI checks
-Windows and Linux; the preceding commit passed all 456 tests on both platforms.
+Windows and Linux; the preceding commit passed all 476 tests on both platforms.
 
 ## Repairs
 
@@ -97,6 +97,12 @@ Windows and Linux; the preceding commit passed all 456 tests on both platforms.
   sidecar text and reuse its event dictionaries for cold exports. Validate full
   semantic-array contents and counts in blocks, including JSON decoding and ZIP
   checksums; reject truncated/trailing data and object/pickle arrays.
+- Checkpoint a validated recovery before deleting its WAL or incomplete marker.
+  If either deletion fails, retry verifies the completed bundle and finishes only
+  cleanup, preserving the NPZ and journal bytes. Refuse changed or missing completed
+  artifacts. Accept copied checkpoints with local evidence, and preserve valid
+  older bundles whose WAL was already removed; refuse invalid older bundles with
+  no WAL instead of rebuilding from incomplete sources.
 
 ## Evidence on this PC
 
@@ -133,10 +139,12 @@ Windows and Linux; the preceding commit passed all 456 tests on both platforms.
 | Semantic-event recovery | All 50,000 events and payload values retained exactly; both full recovered bundles validate; total recovery/validation 6.67 / 6.48 s, peak RSS 351.7 / 348.7 MiB | Final semantic-event export dominates peak memory; no large overall memory reduction claimed |
 | Semantic-array and JSON streaming | Same 50,000-event workload now peaks at 141.7 MiB versus 348.7 MiB; full recovery/validation 8.16 versus 6.48 s; every sample value matches the original hash | Synthetic workload; stronger validation and two-pass string sizing add work. Semantic models, timeline analysis and JSON validation still grow with session size |
 | Live recording with semantic streaming | 465 camera triggers = 465 images; 17,302 raw records and 191 semantic events retained; all 25 artifacts validate; no incomplete/save errors, clean cleanup | Fifteen-second observation; one ordinary acquisition wait timeout, with no missing triggered frame |
+| Interrupted recovery cleanup | Before: marker deletion failure followed by retry changed one recovered raw row to zero and still validated. After: retry retains the row and validates existing artifacts without rewriting | Synthetic temporary recording; regression tests cover both deletions, both layouts, checkpoint write failure, altered artifacts, relative paths, copied evidence and older bundles |
 
 Local evidence (recordings are intentionally excluded from Git):
 
 - `data/runtime/audit/camera_latency_summary.json`
+- `data/runtime/audit/recovery_marker_failure_before.json` and `recovery_marker_failure_after.json` (interrupted cleanup retry)
 - `data/runtime/audit/production_timing/result.json`
 - `data/runtime/operator/runs/20261012_212437_904677/result.json` (camera)
 - `data/runtime/operator/runs/20261012_212901_829814/result.json` (complete rig check)

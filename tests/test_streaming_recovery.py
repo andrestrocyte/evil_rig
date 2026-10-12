@@ -1,6 +1,7 @@
 """Crash recovery must remain bounded, ordered and retryable after write failure."""
 
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -14,10 +15,10 @@ from hf_dm.data.recorder import SessionRecorder, _reconcile_streamdio_recovery_r
 from hf_dm.data.session_export import session_bundle_dir
 
 
-def crashed_recording(path, count=20, *, chunk_s=0):
+def crashed_recording(path, count=20, *, chunk_s=0, layout="flat"):
     config = SessionConfig(subject_id="recover_test", n_trials=0, results_dir=str(path))
     config.camera.required = False
-    config.session_export.layout = "flat"
+    config.session_export.layout = layout
     config.session_export.streamdio_memory_mode = "bounded"
     config.session_export.streamdio_recent_events = 1
     r = SessionRecorder(path, config.subject_id, config.phase.value)
@@ -196,6 +197,150 @@ def test_failed_wal_cleanup_cannot_clear_incomplete_marker(tmp_path, monkeypatch
         recover_session_journal(r.incomplete_marker_path)
     assert r.incomplete_marker_path.exists()
     assert r.streamdio_wal_path.exists()
+
+
+def interrupt_recovery_cleanup(r, monkeypatch, *, target="marker"):
+    """Fail after validation, on either side of deleting the redundant WAL."""
+    blocked = r.incomplete_marker_path if target == "marker" else r.streamdio_wal_path
+    unlink = Path.unlink
+
+    def fail(path, *args, **kwargs):
+        if path == blocked:
+            raise PermissionError("injected cleanup failure")
+        return unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", fail)
+        with pytest.raises(PermissionError, match="injected cleanup failure"):
+            recover_session_journal(r.incomplete_marker_path)
+    assert r.incomplete_marker_path.exists()
+
+
+@pytest.mark.parametrize("target", ["marker", "wal"])
+@pytest.mark.parametrize("layout", ["flat", "mm_hierarchy"])
+def test_cleanup_retry_preserves_verified_npz_and_journal(tmp_path, monkeypatch, target, layout):
+    r = crashed_recording(tmp_path, count=23, layout=layout)
+    expected = list(WalRows(r.streamdio_wal_path))
+    interrupt_recovery_cleanup(r, monkeypatch, target=target)
+    assert r.streamdio_wal_path.exists() == (target == "wal")
+    artifact = r.base_path.with_suffix(".npz")
+    before = artifact.read_bytes(), r.journal_path.read_bytes()
+    # Resuming must validate the finished files; it must not replay the journal.
+    monkeypatch.setattr(recorder_module, "prepare_journal", lambda *a, **k: pytest.fail("unexpected replay"))
+    result = recover_session_journal(r.incomplete_marker_path)
+    assert result["resumed_completed_recovery"]
+    assert result["validation"]["valid"]
+    assert result["recovered_streamdio_events"] == len(expected)
+    assert list(NpzRows(artifact)) == expected
+    assert (artifact.read_bytes(), r.journal_path.read_bytes()) == before
+    assert not r.incomplete_marker_path.exists()
+    assert not r.streamdio_wal_path.exists()
+
+
+def test_completion_checkpoint_write_failure_keeps_wal_for_retry(tmp_path, monkeypatch):
+    r = crashed_recording(tmp_path)
+    before = r.streamdio_wal_path.read_bytes()
+    replace = recorder_module.os.replace
+
+    def fail(source, destination):
+        if Path(destination) == r.incomplete_marker_path:
+            payload = json.loads(Path(source).read_text(encoding="utf-8"))
+            if "recovery_completion" in payload:
+                raise OSError("injected checkpoint replacement failure")
+        return replace(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(recorder_module.os, "replace", fail)
+        with pytest.raises(OSError, match="checkpoint replacement failure"):
+            recover_session_journal(r.incomplete_marker_path)
+    assert "recovery_completion" not in json.loads(r.incomplete_marker_path.read_text())
+    assert r.streamdio_wal_path.read_bytes() == before
+    result = recover_session_journal(r.incomplete_marker_path)
+    assert result["validation"]["valid"]
+    assert result["recovered_streamdio_events"] == 20
+
+
+@pytest.mark.parametrize("damage", ["manifest", "artifact", "journal", "missing_manifest", "outside", "schema", "result"])
+def test_completed_recovery_damage_refuses_retry_without_mutating_sources(tmp_path, monkeypatch, damage):
+    r = crashed_recording(tmp_path)
+    interrupt_recovery_cleanup(r, monkeypatch, target="wal")
+    marker = json.loads(r.incomplete_marker_path.read_text())
+    manifest = r.journal_path.parent / marker["recovery_completion"]["manifest"]
+    if damage == "manifest":
+        with manifest.open("a") as handle:
+            handle.write(" ")
+    elif damage == "missing_manifest":
+        manifest.unlink()
+    elif damage in {"artifact", "journal"}:
+        path = r.base_path.with_suffix(".npz") if damage == "artifact" else r.journal_path
+        with path.open("ab") as handle:
+            handle.write(b"damage")
+    else:
+        key, value = {"outside": ("manifest", "../manifest.json"),
+                      "schema": ("schema_version", 99), "result": ("result", None)}[damage]
+        marker["recovery_completion"][key] = value
+        r.incomplete_marker_path.write_text(json.dumps(marker))
+    paths = (r.incomplete_marker_path, r.streamdio_wal_path, r.journal_path, r.base_path.with_suffix(".npz"))
+    before = [path.read_bytes() for path in paths]
+    with pytest.raises(RuntimeError, match="checkpoint|manifest|no longer validates"):
+        recover_session_journal(r.incomplete_marker_path)
+    assert [path.read_bytes() for path in paths] == before
+
+
+def test_completed_recovery_can_resume_from_a_copy_with_local_evidence(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    r = crashed_recording(source)
+    with r.journal_path.open("ab") as handle:
+        handle.write(b'{"unfinished":')
+    with r.streamdio_wal_path.open("ab") as handle:
+        handle.write(b"partial")
+    interrupt_recovery_cleanup(r, monkeypatch)
+    copied = tmp_path / "copy"
+    shutil.copytree(source, copied)
+    original_marker = r.incomplete_marker_path.read_bytes()
+    # Both the CLI's relative input and copied recovery evidence must work.
+    monkeypatch.chdir(tmp_path)
+    result = recover_session_journal(Path("copy") / r.incomplete_marker_path.name)
+    assert result["validation"]["valid"]
+    assert result["recovered_streamdio_events"] == 20
+    assert result["resumed_completed_recovery"]
+    assert Path(result["streamdio_wal_recovery_backup"]).resolve().parent == copied
+    assert all(Path(path).resolve().parent == copied for path in result["journal_recovery_backups"])
+    assert r.incomplete_marker_path.read_bytes() == original_marker
+    assert not (copied / r.incomplete_marker_path.name).exists()
+
+
+@pytest.mark.parametrize("layout", ["flat", "mm_hierarchy"])
+@pytest.mark.parametrize("damage", [False, True])
+def test_legacy_cleanup_retry_never_replaces_finished_raw_data(tmp_path, monkeypatch, layout, damage):
+    r = crashed_recording(tmp_path, count=7, layout=layout)
+    interrupt_recovery_cleanup(r, monkeypatch)
+    state = json.loads(r.incomplete_marker_path.read_text())
+    del state["recovery_completion"]  # Recoveries before the durable checkpoint.
+    r.incomplete_marker_path.write_text(json.dumps(state))
+    if damage:
+        with r.base_path.with_suffix(".npz").open("ab") as handle:
+            handle.write(b"damage")
+    before = r.base_path.with_suffix(".npz").read_bytes(), r.journal_path.read_bytes()
+    if damage:
+        with pytest.raises(RuntimeError, match="WAL is missing"):
+            recover_session_journal(r.incomplete_marker_path)
+        assert r.incomplete_marker_path.exists()
+    else:
+        result = recover_session_journal(r.incomplete_marker_path)
+        assert result["validation"]["valid"]
+        assert result["recovered_streamdio_events"] == 7
+        assert result["streamdio_recovery_source"] == "verified_existing_bundle"
+        assert not r.incomplete_marker_path.exists()
+    assert (r.base_path.with_suffix(".npz").read_bytes(), r.journal_path.read_bytes()) == before
+
+
+def test_recovery_completion_checkpoint_accepts_relative_cli_path(tmp_path, monkeypatch):
+    r = crashed_recording(tmp_path / "session")
+    monkeypatch.chdir(tmp_path)
+    result = recover_session_journal(Path("session") / r.incomplete_marker_path.name)
+    assert result["validation"]["valid"]
+    assert result["recovered_streamdio_events"] == 20
 
 
 def test_chunk_order_is_numeric_after_999(tmp_path, monkeypatch):

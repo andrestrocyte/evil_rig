@@ -832,6 +832,14 @@ of the recovered records; it cannot recreate records that never reached storage.
 Recovery creates a manifest even if the original session disabled it, so this
 validation also works for sessions with optional exports turned off.
 
+Before deleting recovery inputs, recovery atomically checkpoints the validated
+manifest's checksum in the incomplete marker. If cleanup is interrupted, a retry
+verifies the saved bundle and finishes cleanup without rebuilding or replacing
+its data. Changed or missing completed artifacts stop the retry and retain the
+remaining evidence. A valid older bundle whose WAL was already deleted is also
+kept; an invalid older bundle with no WAL requires inspection instead of a blind
+rebuild. Checkpoints and backup references also work after copying a session.
+
 **Session QC.** `hf-dm session-qc` writes `session.qc.json` with PASS/WARN/FAIL for response rate,
 matched rate, response time, choice-loop stalls, and worst frame duration. Calibrated sessions also
 require a successful subject-water log event. The permanent StreamDIO heartbeat adds missed-pulse,
