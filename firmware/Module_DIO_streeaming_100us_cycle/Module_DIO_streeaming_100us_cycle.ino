@@ -28,7 +28,7 @@
 //   Pin 32: Camera frame trigger (configurable frequency and exposure)
 //   Pin 31: UCLA miniscope trigger (toggle high/low)
 //   Pin 30: Fiber photometry (toggle high/low)
-//   Pin 27: speaker white-noise output or manual TTL gate
+//   Pin 26: speaker white-noise output or manual TTL gate
 //   Pin 14 / channel 13: optional analog force input on the direct USB streaming path
 
 #include "ArCOM.h"  // Import Sanworks serial communication wrapper
@@ -132,7 +132,7 @@ const byte CAP_TOUCH_POWER_OUTPUT_CHANNEL = 13; // Output channel 13 maps to Tee
 const byte CAMERA_PIN = 32;
 const byte MINISCOPE_PIN = 31;
 const byte PHOTOMETRY_PIN = 30;
-const byte SPEAKER_PIN = 27;
+const byte SPEAKER_PIN = 26;
 const int LED_pin = 13;
 
 // Timing and control variables
@@ -566,7 +566,7 @@ byte getUSBCommandBytes(byte cmd) {
     case 'N': return 6; // configure analog input
     case 't': return 6; // configure cap-touch ADC digitizer thresholds
     case 'K': return 5; // speaker white-noise enable + sample interval
-    case 'Y': return 1; // speaker gate high / low on pin 27
+    case 'Y': return 1; // speaker gate high / low on pin 26
     case 'A': return 2; // all outputs
     case 'O': return 2; // single output
     case 'C': return 1; // camera enable
@@ -1080,7 +1080,7 @@ void executeCommand(byte opCode, byte* params, byte paramCount) {
       }
       break;
 
-    case 'Y': // Manual speaker gate on pin 27
+    case 'Y': // Manual speaker gate on pin 26
       if (paramCount >= 1) {
         speakerNoiseEnabled = false;
         speakerGateState = params[0] ? 1 : 0;
@@ -1845,11 +1845,6 @@ void cycleTimerISR() {
   static uint64_t lastCycleTime = 0;// Static means, that the variable is initialized to 0 only once when the program starts
   uint64_t  cycleStartTime = getCurrentTimestamp();
 
-    // Turn off LED state at the start of each cycle this will lead to lower brightness representing higher computational load
-  if (LED_state) {
-      setStatusLed(0);
-  }
-
   uint32_t stream_available_for_write = PC2.availableForWrite();
 
   if (debugMode) {
@@ -1943,9 +1938,6 @@ void cycleTimerISR() {
       }
     }
 
-    if (!LED_state) {
-      setStatusLed(1);
-    }
   }
 
 
@@ -1959,4 +1951,13 @@ void cycleTimerISR() {
 }
 
 void loop() {
+  // Visible liveness indicator, kept outside the 100 us acquisition interrupt.
+  // Unsigned subtraction keeps the interval correct across millis() rollover.
+  static uint32_t lastStatusBlinkMs = 0;
+  const uint32_t nowMs = millis();
+  if (uint32_t(nowMs - lastStatusBlinkMs) >= 500) {
+    lastStatusBlinkMs = nowMs;
+    LED_state = !LED_state;
+    setStatusLed(LED_state);
+  }
 }

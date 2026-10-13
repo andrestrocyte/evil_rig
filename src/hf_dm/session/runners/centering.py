@@ -29,7 +29,8 @@ class CenteringTrialRunner:
         start_position_deg = self.rng.choice(
             [-self.config.display.choice_distance_deg, self.config.display.choice_distance_deg]
         )
-        movement_direction: Direction = "cw" if start_position_deg < 0.0 else "ccw"
+        start_side = "left" if start_position_deg < 0.0 else "right"
+        movement_direction: Direction = self._wheel_direction_for_side(start_side)
         opposite_direction: Direction = "ccw" if movement_direction == "cw" else "cw"
         runtime = TrialRuntime(
             trial_index=trial_index,
@@ -37,8 +38,8 @@ class CenteringTrialRunner:
             choice_target_direction=movement_direction,
             star_direction=movement_direction,
             circle_direction=opposite_direction,
-            star_side="left" if movement_direction == "cw" else "right",
-            circle_side="right" if movement_direction == "cw" else "left",
+            star_side=start_side,
+            circle_side=self._opposite_side(start_side),
             high_reward_s=float(self.config.reward.matched_pump_s),
             low_reward_s=0.0,
             high_delay_s=float(self.config.timing.choice_blank_s),
@@ -109,7 +110,7 @@ class CenteringTrialRunner:
 
                 if phase == "quiescence":
                     self._track_engagement_from_wheel()
-                    snap = self.wheel.snapshot()
+                    snap = self.wheel.snapshot(include_percentile=False)
                     edges = int(snap["cw_pulses"]) + int(snap["ccw_pulses"])
                     if edges != last_quiescence_edges:
                         self.bpod.send_softcode(sc.QUIESCENCE_MOVEMENT)
@@ -123,7 +124,9 @@ class CenteringTrialRunner:
                         -self.config.display.choice_distance_deg,
                         min(
                             self.config.display.choice_distance_deg,
-                            start_position_deg + self.wheel.signed_position_deg(),
+                            start_position_deg + self.config.display.wheel_to_screen_deg(
+                                self.wheel.signed_position_deg()
+                            ),
                         ),
                     )
                     flip_mono_s = self.display.draw_centering(

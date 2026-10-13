@@ -111,6 +111,7 @@ def test_recover_session_repairs_truncated_tail_and_finalizes(tmp_path):
             host_perf_counter_s=100.0 + index * 0.1,
         )
     recorder.add_trial(_trial())
+    recorder._close_streamdio_wal(durable=True)
     recorder.close_journal()
     with recorder.journal_path.open("a", encoding="utf-8") as handle:
         handle.write('{"schema_version":1')
@@ -261,7 +262,8 @@ def test_recover_session_refuses_completed_session_without_manifest(tmp_path):
         raise AssertionError("completed manifest-free session was accepted for crash recovery")
 
 
-def test_hard_process_exit_preserves_recoverable_completed_trial(tmp_path):
+@pytest.mark.parametrize("memory_mode", ["full", "bounded"])
+def test_hard_process_exit_preserves_recoverable_completed_trial(tmp_path, memory_mode):
     script = r'''
 import os
 import sys
@@ -272,6 +274,8 @@ from hf_dm.data.recorder import SessionRecorder, TrialRecord
 root = Path(sys.argv[1])
 config = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(root))
 config.session_export.layout = "flat"
+config.session_export.streamdio_memory_mode = sys.argv[2]
+config.session_export.streamdio_recent_events = 1
 recorder = SessionRecorder(root, "S1", "decision_making", base_name="crashed")
 recorder.set_export_options(config_to_dict(config)["session_export"])
 recorder.set_metadata({"config": config_to_dict(config)})
@@ -288,7 +292,7 @@ recorder.add_trial(TrialRecord(
 os._exit(23)
 '''
     process = subprocess.run(
-        [sys.executable, "-c", script, str(tmp_path)],
+        [sys.executable, "-c", script, str(tmp_path), memory_mode],
         check=False,
     )
 

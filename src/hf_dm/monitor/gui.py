@@ -472,8 +472,10 @@ class OperatorMonitorState:
             self.lick_edge_count += 1
             self.last_lick_value = _optional_int(payload.get("value"))
             self.last_lick_edge_mono_s = now
-            self.last_lick_source = "digital"
-            self._update_lick_input_state(payload, now=now, source="digital")
+            self.last_lick_source = (
+                "optical" if payload.get("source") in {"bpod_optical", "streamdio_optical"} else "digital"
+            )
+            self._update_lick_input_state(payload, now=now, source=self.last_lick_source)
         elif event_type == "cap_touch_sample":
             self.last_lick_value = _optional_int(payload.get("value"))
             self.last_touch_sample_mono_s = now
@@ -515,7 +517,11 @@ class OperatorMonitorState:
         elif event_type == "camera_frame":
             self.latest_camera_frame = payload
             self.camera_frame_count += 1
-            self.last_camera_frame_mono_s = now
+            self.last_camera_frame_mono_s = (
+                _optional_float(payload.get("acquired_mono_s"))
+                or _optional_float(payload.get("monotonic_s"))
+                or now
+            )
         elif event_type == "task_frame":
             self.latest_task_frame = payload
             self.task_frame_count += 1
@@ -603,7 +609,7 @@ class OperatorMonitorState:
         state["source"] = source
         state["last_mono_s"] = now
         state["relative_time_s"] = payload.get("relative_time_s")
-        if source == "digital":
+        if source in {"digital", "optical"}:
             state["last_edge_mono_s"] = now
         else:
             state["last_sample_mono_s"] = now
@@ -618,7 +624,7 @@ class OperatorMonitorState:
         ):
             if payload.get(key) is not None:
                 state[key] = payload.get(key)
-        if source == "digital":
+        if source in {"digital", "optical"}:
             state["active"] = bool(payload.get("value"))
         elif payload.get("active") is not None:
             state["active"] = bool(payload.get("active"))
@@ -1060,6 +1066,7 @@ class _MonitorWindow:
         self.height = max(720, int(event.height))
 
     def _tick(self) -> None:
+        started = time.perf_counter()
         try:
             shutdown = self._drain_queue()
             self._render()
@@ -1073,7 +1080,8 @@ class _MonitorWindow:
         if shutdown:
             self.root.quit()
             return
-        delay_ms = max(20, int(round(1000.0 / max(1, int(self.config.fps)))))
+        period_s = 1.0 / max(1, int(self.config.fps))
+        delay_ms = max(1, int(round(1000 * (period_s - (time.perf_counter() - started)))))
         self.root.after(delay_ms, self._tick)
 
     def _drain_queue(self) -> bool:
@@ -1271,7 +1279,7 @@ class _MonitorWindow:
             ("Circle side", self.state.current_circle_side or "-"),
             ("Licks", str(self.state.lick_count)),
             (
-                "Touch input",
+                "Optical input" if self.state.session_info.get("lick_source") == "optical" else "Touch input",
                 f"edges {self.state.lick_edge_count}  last {self.state.last_lick_value} ({self.state.last_lick_source})"
                 if self.state.last_lick_value is not None
                 else f"edges {self.state.lick_edge_count}",
@@ -1524,6 +1532,9 @@ class _MonitorWindow:
             + (" ON" if self.state.cap_touch_power_active else " off")
         )
         power_fill = "#daf3e5" if self.state.cap_touch_power_active else "#f4f6f7"
+        if self.state.session_info.get("lick_source") == "optical":
+            clock = self.state.session_info.get("lick_clock", "bpod")
+            power_text = f"Optical / {clock}"
         self.canvas.create_rectangle(x, y, x + w, y + h, fill="#fbfcfd", outline="#e1e6ea")
         self.canvas.create_rectangle(x + 8, y + 8, x + min(w - 8, 170), y + 30, fill=power_fill, outline="#d7dde2")
         self.canvas.create_text(
@@ -1569,6 +1580,8 @@ class _MonitorWindow:
             if chip_w < 100:
                 break
             text = f"in ch{channel}" + (f"/pin{pin}" if pin is not None else "")
+            if item.get("source") == "bpod_optical":
+                text = f"Bpod Port{channel}"
             text += f"  {source}:{value}"
             if state.get("baseline") is not None:
                 text += f" b{state.get('baseline')}"

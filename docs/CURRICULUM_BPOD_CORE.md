@@ -71,7 +71,7 @@ Exercise: Log 10 seconds of events; verify `deg_per_pulse` against a hand turn a
 | File | Learn |
 |------|-------|
 | `hf_dm/streamdio/outputs.py` | Active pump, effort, cap-touch power, and speaker control |
-| `hf_dm/fsm/relay.py` | Bringup-compatible Bpod Serial-module messages, including pin-27 gate |
+| `hf_dm/fsm/relay.py` | Bringup-compatible Bpod Serial-module messages, including pin-26 gate |
 | `hf_dm/fsm/builders.py` | Active Bpod decision-trial FSM |
 | `hf_dm/fsm/runtime.py` | Thread-safe bridge between Bpod states and the host loop |
 
@@ -100,7 +100,7 @@ through the production loop while activating real outputs. Verify zero choice-lo
 |------|-------|
 | `hf_dm/display/pygame_display.py` | Equal-pixel lateral star/circle options moving to center |
 | `hf_dm/audio/white_noise.py` | Continuous soundcard white noise from the speaker bringup |
-| Bpod Serial-module action | Hardware gate on Teensy pin 27 |
+| Bpod Serial-module action | Hardware gate on Teensy pin 26 |
 | `hf_dm/camera/spinnaker.py` | Headless PySpin/C API recorder with external-trigger configuration |
 
 ## Key design decision

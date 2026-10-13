@@ -418,6 +418,9 @@ def connect_bpod_core(port: str | None = None):
 
     bpod = Bpod(port=resolved)
     try:
+        if not any(module.is_connected for module in bpod.modules.values()):
+            logger.info("No Bpod modules detected at startup; refreshing module discovery once")
+            bpod.update_modules()
         bpod.hf_dm_event_allocation = configure_bpod_event_allocation(bpod)
     except BaseException:
         bpod.close()

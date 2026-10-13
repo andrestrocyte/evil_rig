@@ -62,6 +62,55 @@ def _summary() -> SessionSummary:
     )
 
 
+@pytest.mark.parametrize("saved,expected", [(3, "PASS"), (2, "FAIL"), (4, "FAIL")])
+def test_camera_alignment_uses_full_trigger_count_after_cache_wrap(tmp_path, saved, expected):
+    recorder = SessionRecorder(tmp_path, "S1", "decision_making")
+    recorder.set_export_options({
+        "streamdio_memory_mode": "bounded", "streamdio_recent_events": 1,
+        "manifest": False, "config_snapshot": False,
+        "export_csv_on_finalize": False, "export_timeline": False,
+    })
+    for timestamp in range(3):
+        recorder.log_streamdio_event("camera", 0, 0, timestamp, timestamp / 1e6)
+    recorder.register_stream("spinnaker_video", {"frames_saved": saved})
+    path = recorder.finalize(_summary())
+    document = json.loads(path.with_suffix(".json").read_text())
+    alignment = document["stream_summaries"]["spinnaker_video"]["trigger_alignment"]
+    assert alignment["status"] == expected
+    assert alignment["recorded_triggers"] == 3
+    assert alignment["frame_count_minus_triggers"] == saved - 3
+
+
+@pytest.mark.parametrize("mode,backend,saved,expected", [
+    ("simulation", "spinnaker_sim", 0, "NOT_APPLICABLE"),
+    ("bench", "spinnaker_sim", 0, "FAIL"),
+    ("animal", "spinnaker_sim", 0, "FAIL"),
+    (None, "spinnaker_sim", 0, "FAIL"),
+    ("simulation", "spinnaker", 0, "FAIL"),
+    ("simulation", "spinnaker_sim", 2, "FAIL"),
+])
+def test_camera_alignment_exempts_only_preview_only_simulation(tmp_path, mode, backend, saved, expected):
+    from hf_dm.operator_app import diagnostic_result
+    recorder = SessionRecorder(tmp_path, "S1", "decision_making")
+    recorder.set_export_options({"manifest": False, "config_snapshot": False,
+                                 "export_csv_on_finalize": False, "export_timeline": False})
+    recorder.set_metadata({"run_mode": mode})
+    recorder.register_stream("spinnaker_video", {"backend": backend, "frames_saved": saved})
+    for timestamp in range(3):
+        recorder.log_streamdio_event("camera", 0, 0, timestamp, timestamp / 1e6)
+    path = recorder.finalize(_summary()).with_suffix(".json")
+    document = json.loads(path.read_text())
+    camera = document["stream_summaries"]["spinnaker_video"]
+    assert camera["frames_saved"] == saved
+    alignment = camera["trigger_alignment"]
+    assert alignment["status"] == expected
+    assert alignment["recorded_triggers"] == 3
+    if expected == "NOT_APPLICABLE":
+        assert alignment["frame_count_minus_triggers"] is None
+        assert "without recording" in alignment["reason"]
+    assert diagnostic_result("session", str(path))["passed"] is (expected == "NOT_APPLICABLE")
+
+
 def test_primary_npz_write_failure_is_reported_and_keeps_recovery_marker(
     tmp_path,
     monkeypatch,
@@ -1232,9 +1281,10 @@ def test_optional_streamdio_chunk_writer_adds_manifest_artifacts(tmp_path):
     )
 
 
-def test_streamdio_bounded_memory_reconstructs_full_npz_from_chunks(tmp_path):
+@pytest.mark.parametrize("chunk_s", [0.0, 0.001])
+def test_streamdio_bounded_memory_reconstructs_full_npz_from_chunks(tmp_path, chunk_s):
     cfg = SessionConfig(subject_id="S1", n_trials=1, results_dir=str(tmp_path))
-    cfg.session_export.streamdio_chunk_s = 0.001
+    cfg.session_export.streamdio_chunk_s = chunk_s
     cfg.session_export.streamdio_memory_mode = "bounded"
     cfg.session_export.streamdio_recent_events = 2
     recorder = SessionRecorder(tmp_path, cfg.subject_id, cfg.phase.value)
@@ -1247,6 +1297,7 @@ def test_streamdio_bounded_memory_reconstructs_full_npz_from_chunks(tmp_path):
     recorder.finalize(_summary())
 
     assert len(recorder.streamdio_events) <= 2
+    assert recorder.streamdio_counts_snapshot()[("analog_input", 13)] == 6
     with np.load(recorder.base_path.with_suffix(".npz"), allow_pickle=True) as data:
         assert len(data["streamdio_events"]) == 6
     bundle = recorder.base_path.with_name(f"{recorder.base_path.name}_bundle")

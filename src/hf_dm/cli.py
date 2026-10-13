@@ -57,6 +57,8 @@ class SessionSetup:
     n_forced_trials: int
     session_name: str
     session_dir: str
+    lick_source: str = "capacitive"
+    optical_clock: str = "bpod"
 
 
 def _default_session_name(modality: str, profile_name: str) -> str:
@@ -80,7 +82,13 @@ def _setup_from_values(
     n_free_trials: int | None = None,
     n_forced_trials: int | None = None,
     session_name: str | None = None,
+    lick_source: str = "capacitive",
+    optical_clock: str = "bpod",
 ) -> SessionSetup:
+    if lick_source not in {"capacitive", "optical"}:
+        raise ValueError("lick source must be capacitive or optical")
+    if optical_clock not in {"bpod", "streamdio"}:
+        raise ValueError("optical lick clock must be bpod or streamdio")
     modality = _normalize_modality(modality)
     profile_name = profile_name if profile_name in PROFILE_COUNTS else "custom"
     profile_free, profile_forced = PROFILE_COUNTS[profile_name]
@@ -98,10 +106,12 @@ def _setup_from_values(
         n_forced_trials=forced,
         session_name=name,
         session_dir=str(selected_mouse_dir / name),
+        lick_source=lick_source,
+        optical_clock=optical_clock,
     )
 
 
-def _run_session_setup_dialog() -> SessionSetup:
+def _run_session_setup_dialog(*, lick_source: str = "capacitive", optical_clock: str = "bpod") -> SessionSetup:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
@@ -119,10 +129,12 @@ def _run_session_setup_dialog() -> SessionSetup:
     result: dict[str, SessionSetup] = {}
     root.deiconify()
     root.title("HF DM Session Setup")
-    root.geometry("420x310")
+    root.geometry("460x410")
     root.resizable(False, False)
 
     modality_var = tk.StringVar(value="force")
+    lick_source_var = tk.StringVar(value=lick_source)
+    optical_clock_var = tk.StringVar(value=optical_clock)
     profile_var = tk.StringVar(value="50 free")
     free_var = tk.StringVar(value="50")
     forced_var = tk.StringVar(value="0")
@@ -148,6 +160,8 @@ def _run_session_setup_dialog() -> SessionSetup:
                 n_free_trials=int(free_var.get()),
                 n_forced_trials=int(forced_var.get()),
                 session_name=session_name_var.get().strip() or None,
+                lick_source=lick_source_var.get(),
+                optical_clock=optical_clock_var.get(),
             )
         except Exception as exc:
             messagebox.showerror("Invalid session setup", str(exc), parent=root)
@@ -183,7 +197,16 @@ def _run_session_setup_dialog() -> SessionSetup:
     ttk.Entry(root, textvariable=session_name_var).grid(row=5, column=1, sticky="ew", **pad)
 
     buttons = ttk.Frame(root)
-    buttons.grid(row=6, column=0, columnspan=2, sticky="e", padx=12, pady=18)
+    ttk.Label(root, text="Lick sensor").grid(row=6, column=0, sticky="w", **pad)
+    ttk.Combobox(
+        root, textvariable=lick_source_var, values=("capacitive", "optical"),
+        state="readonly",
+    ).grid(row=6, column=1, sticky="ew", **pad)
+    ttk.Label(root, text="Optical timestamp clock").grid(row=7, column=0, sticky="w", **pad)
+    ttk.Combobox(
+        root, textvariable=optical_clock_var, values=("bpod", "streamdio"), state="readonly",
+    ).grid(row=7, column=1, sticky="ew", **pad)
+    buttons.grid(row=8, column=0, columnspan=2, sticky="e", padx=12, pady=18)
     ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right", padx=(8, 0))
     ttk.Button(buttons, text="Start", command=accept).pack(side="right")
 
@@ -199,6 +222,8 @@ def _run_session_setup_dialog() -> SessionSetup:
 
 
 def _apply_session_setup(config: SessionConfig, setup: SessionSetup) -> None:
+    config.licks.source = setup.lick_source
+    config.licks.optical_clock = setup.optical_clock
     session_dir = Path(setup.session_dir)
     session_dir.mkdir(parents=True, exist_ok=True)
     (session_dir / "videos").mkdir(parents=True, exist_ok=True)
@@ -240,6 +265,22 @@ def _record_cli_override(
             "created_wall_time_s": datetime.now().timestamp(),
         }
     )
+
+
+def _write_run_result(session: HFDecisionSession, *, error: BaseException | None = None) -> None:
+    path = os.environ.get("HF_DM_RESULT_PATH")
+    if not path:
+        return
+    from hf_dm.data.recorder import _atomic_write_text
+    recorder = session.recorder
+    session_path = None if recorder is None else recorder.base_path.with_suffix(".json")
+    summary = getattr(recorder, "summary", None)
+    _atomic_write_text(Path(path), json.dumps({
+        "summary": asdict(summary) if summary is not None else None,
+        "session_path": str(session_path) if session_path is not None and session_path.exists() else None,
+        "error": None if error is None else f"{type(error).__name__}: {error}",
+        "cleanup_error": str(session._last_cleanup_error) if session._last_cleanup_error else None,
+    }, indent=2))
 
 
 def _normalize_modality(value: str) -> str:
@@ -351,6 +392,18 @@ def main() -> None:
         "--simulate",
         action="store_true",
         help="Run a hardware-free simulation that exercises the live display/task loop.",
+    )
+    parser.add_argument(
+        "--lick-source", choices=("capacitive", "optical"),
+        help="Lick sensor for this session: StreamDIO capacitive touch or Bpod optical port.",
+    )
+    parser.add_argument(
+        "--lick-clock", choices=("bpod", "streamdio"),
+        help="Optical timestamps: original Bpod edges or StreamDIO receipt of forwarded port events.",
+    )
+    parser.add_argument(
+        "--lick-port", type=int,
+        help="Bpod behavior port for the optical lickometer (default: configured port, normally 1).",
     )
     parser.add_argument(
         "--preflight",
@@ -604,6 +657,17 @@ def main() -> None:
     )
 
     config = SessionConfig.from_yaml(args.config)
+    if args.lick_source is not None:
+        config.licks.source = args.lick_source
+    if args.lick_port is not None:
+        config.licks.bpod_port = args.lick_port
+    if args.lick_clock is not None:
+        config.licks.optical_clock = args.lick_clock
+    if args.lick_source is not None or args.lick_port is not None or args.lick_clock is not None:
+        _record_cli_override(config, source="hf-dm-run lick sensor arguments", values={
+            "licks.source": config.licks.source, "licks.bpod_port": config.licks.bpod_port,
+            "licks.optical_clock": config.licks.optical_clock,
+        })
     config.session_export.source_config_path = str(args.config)
     if args.monitor and args.no_monitor:
         parser.error("--monitor cannot be combined with --no-monitor")
@@ -659,7 +723,7 @@ def main() -> None:
         and not any(frame2ttl_modes)
     )
     if should_show_setup:
-        setup = _run_session_setup_dialog()
+        setup = _run_session_setup_dialog(lick_source=config.licks.source, optical_clock=config.licks.optical_clock)
         _apply_session_setup(config, setup)
         _record_cli_override(
             config,
@@ -675,6 +739,8 @@ def main() -> None:
                 n_free_trials=args.free_trials,
                 n_forced_trials=args.forced_trials,
                 session_name=args.session_name,
+                lick_source=config.licks.source,
+                optical_clock=config.licks.optical_clock,
             )
             _apply_session_setup(config, setup)
             _record_cli_override(
@@ -811,6 +877,10 @@ def main() -> None:
             config,
             source="hf-dm-run --hardware-self-test",
             values={
+                "phase": config.phase.value,
+                "task.modality": config.task.modality,
+                "task.n_free_trials": config.task.n_free_trials,
+                "task.n_forced_trials": config.task.n_forced_trials,
                 "shortened_timing": True,
                 "n_trials": config.n_trials,
                 "camera.record_video": config.camera.record_video,
@@ -841,7 +911,7 @@ def main() -> None:
             animal_use_confirmed=animal_use_confirmed,
         )
     connected = False
-    while True:
+    for connection_attempt in range(2):
         try:
             session.connect()
             connected = True
@@ -857,6 +927,10 @@ def main() -> None:
                 and config.animal_use.enabled
             )
             if not is_interactive_animal:
+                raise
+            if connection_attempt:
+                # A changed hardware identity must produce a finite, actionable
+                # failure, rather than repeatedly reopening the same dialog.
                 raise
             animal_use_confirmed = _remediate_animal_use_gate(
                 config,
@@ -894,13 +968,15 @@ def main() -> None:
             if isinstance(session, HardwareSelfTestSession):
                 report = session.validate_results()
                 print(f"Hardware self-test validated: {json.dumps(report, sort_keys=True)}")
-    except BaseException:
+    except BaseException as exc:
         # Preserve the initiating failure; close records and interlocks any
         # independent cleanup failure without replacing the original cause.
         session.close(raise_on_error=False)
+        _write_run_result(session, error=exc)
         raise
     print(f"Session finished: {summary.end_reason}")
     print(f"Trials completed: {summary.n_trials_completed}/{summary.n_trials_planned}")
+    _write_run_result(session)
 
 
 if __name__ == "__main__":

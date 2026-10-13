@@ -1,31 +1,36 @@
-# AGENTS.md
+# Working on evil_rig
 
-## Cursor Cloud specific instructions
+This is the Python `hf_dm` Bpod/StreamDIO rig application. See README for operation
+and `docs/QUALITY_AUDIT_2026_10.md` for measured hardware coverage and open work.
 
-This is a single Python package (`hf_dm`, the head-fixed decision-making Bpod task). It is a
-CLI-launched rig application with no web server, database, or network ports. Everything runs in one
-process and talks to hardware over USB/serial. See `README.md` for the full command reference.
+## Environment
 
-### Environment
-- Python 3.12 with a project virtualenv at `.venv` (the startup update script creates it and runs
-  `pip install -e ".[dev]"`). Activate it with `source .venv/bin/activate` before running anything.
-- The runtime dep `bpod-core` and dev deps (`pytest`, `mypy`) come from PyPI. The live-hardware
-  drivers `pybpod_streamDIO_module` (from `MM_PyBpod2`), the Spinnaker SDK / `PySpin`, and the sound
-  module are **not installed** and are **not needed** for tests or simulation — they are imported
-  lazily only when connecting to real rig hardware.
+- Python 3.12, dependencies pinned in `requirements.lock`.
+- Windows installation: `scripts/install_rig.ps1`; this rig has its own `.venv`.
+- Hardware drivers and Spinnaker SDK are optional for tests/simulation.
+  Do not assume hardware is present in cloud CI, or absent on a physical rig.
+- Data, machine settings and local audit artifacts under `data/` are ignored.
+- Preserve the separate `bpod-hf-dm` checkout when using it as a reference.
 
-### Running without hardware (the dev/run path here)
-- There is no real rig in this environment, so use simulation mode:
-  `python -m hf_dm.cli --config configs/dm_50.yaml --simulate --simulate-headless --simulate-trials 3 --simulate-choice-mode alternate`
-- Run headless GUI/pygame code with `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy` exported. It is not
-  strictly required (the session still completes without it) but it suppresses noisy ALSA/SDL audio
-  errors since the VM has no audio/display device.
-- Live/preflight/diagnostic subcommands (`--preflight`, `--hardware-self-test`,
-  `--cap-touch-diagnostic`, `--frame2ttl-*`, `--bpod-opcode-diagnostic`) require physical hardware and
-  will not work in this environment.
-- Sessions write outputs under `data/sessions/` (gitignored).
+## Verification
 
-### Test / type-check
-- Tests: `pytest` (testpaths = `tests`); the suite is hardware-free and passes headless.
-- `mypy src` runs (dev extra) but currently reports pre-existing type errors; it is not wired up as a
-  required/configured lint gate, so treat its output as informational. There is no other linter.
+Use the checkout's virtualenv Python:
+
+```text
+python -m ruff check src tests
+python -m mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_export.py src/hf_dm/data/raw_stream.py src/hf_dm/data/session_journal.py src/hf_dm/data/array_stream.py
+python -m pytest
+```
+
+For headless runs, set `SDL_VIDEODRIVER=dummy` and `SDL_AUDIODRIVER=dummy`.
+CI runs these checks on Windows and Linux. Simulation needs no hardware:
+
+```text
+python -m hf_dm.cli --config configs/dm_50.yaml --simulate --simulate-headless --simulate-trials 3 --simulate-choice-mode alternate
+```
+
+Live checks can operate pump, force and audio outputs; use the user's authorized
+bench scope. Preserve raw data and original timestamp semantics. Do not equate a
+successful process exit or valid export with successful sensor detection. Keep
+failures visible, waits finite, and hardware calibration distinct from software
+event verification.

@@ -37,7 +37,7 @@ Full contingencies:
 - Star choice: high effort and `0.08 s` pump by default
 - Circle choice: low effort and `0.04 s` pump by default
 - Bpod requires 3 s quiescence and owns the 20 s choice timeout
-- Timeout: Bpod pin-27 gate passes continuous soundcard white noise for `2 s` by default
+- Timeout: Bpod controls the StreamDIO pin-26 gate to pass continuous soundcard white noise for `2 s` by default
 
 Success criteria:
 

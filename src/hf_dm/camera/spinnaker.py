@@ -14,14 +14,53 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from .settings import apply_roi
+
 logger = logging.getLogger(__name__)
 
 
 PreviewCallback = Callable[[dict[str, Any]], None]
 
 
-def _preview_due(last_preview_mono_s: float, min_interval_s: float) -> bool:
-    return time.perf_counter() - last_preview_mono_s >= max(0.0, float(min_interval_s))
+def _cleanup_step(errors: list[str], name: str, action: Callable[[], Any]) -> bool:
+    try:
+        action()
+        return True
+    except Exception as exc:
+        errors.append(f"{name}: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _remember_cleanup_errors(history: list[str], errors: list[str]) -> None:
+    history.extend(error for error in errors if error not in history)
+
+
+def _join_capture_thread(thread: threading.Thread | None, timeout_ms: int) -> None:
+    # Thread.start() can fail after assignment. Joining an unstarted thread raises
+    # another exception and used to prevent release of the camera and timestamp file.
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=max(5.0, timeout_ms / 1000.0 + 2.0))
+        if thread.is_alive():
+            raise TimeoutError("capture thread did not stop before SDK teardown")
+
+
+class _PreviewCadence:
+    """Keep preview cadence despite small acquisition jitter; never catch up stale frames."""
+
+    def __init__(self, interval_s: float):
+        self.interval_s = max(0.0, float(interval_s))
+        self.next_s: float | None = None
+
+    def due(self, now: float) -> bool:
+        if self.interval_s == 0:
+            return True
+        if self.next_s is None:
+            self.next_s = now + self.interval_s
+            return True
+        if now < self.next_s:
+            return False
+        self.next_s += (math.floor((now - self.next_s) / self.interval_s) + 1) * self.interval_s
+        return True
 
 
 def _duration_s(start_wall_s: float | None, stop_wall_s: float | None) -> float | None:
@@ -36,17 +75,6 @@ def _mean_fps(frame_count: int, duration_s: float | None) -> float | None:
     return float(frame_count) / duration_s
 
 
-def _estimated_missing_triggers(
-    frame_count: int,
-    target_hz: int,
-    duration_s: float | None,
-) -> int | None:
-    if duration_s is None or duration_s <= 0.0 or target_hz <= 0:
-        return None
-    expected = int(round(float(target_hz) * duration_s))
-    return max(0, expected - int(frame_count))
-
-
 def _capture_stats(
     *,
     frames_saved: int,
@@ -54,7 +82,9 @@ def _capture_stats(
     acquisition_timeouts: int,
     save_errors: int = 0,
 ) -> dict[str, int]:
-    skipped = max(0, int(incomplete_frames)) + max(0, int(acquisition_timeouts))
+    # A timed-out wait can occur before triggers start or after they stop; it
+    # does not identify a missing frame. Keep it separate from observed losses.
+    skipped = max(0, int(incomplete_frames)) + max(0, int(save_errors))
     return {
         "frames_saved": max(0, int(frames_saved)),
         "incomplete_frames": max(0, int(incomplete_frames)),
@@ -182,6 +212,19 @@ def _next_pgm_token(raw: bytes, pos: int) -> tuple[bytes, int]:
     return raw[start:pos], pos
 
 
+def _save_mono_pgm(path: Path, width: int, height: int, stride: int, raw: bytes) -> None:
+    """Save every Mono8 pixel, excluding row padding, without an SDK encoder."""
+    if min(width, height) <= 0 or stride < width or len(raw) != stride * height:
+        raise ValueError("Invalid Mono8 dimensions or buffer size")
+    with path.open("wb") as handle:
+        handle.write(f"P5\n{width} {height}\n255\n".encode("ascii"))
+        if stride == width:
+            handle.write(raw)
+        else:
+            for row in range(height):
+                handle.write(raw[row * stride : row * stride + width])
+
+
 class _PreviewDispatcher:
     """Drop-stale dispatcher so preview publishing cannot stall acquisition."""
 
@@ -253,11 +296,22 @@ class _FrameTimestampWriter:
         self.path = session_dir / "frame_timestamps.csv"
         self._handle = self.path.open("w", newline="", encoding="utf-8")
         self._writer = csv.writer(self._handle)
-        self._writer.writerow(
-            ["frame_index", "camera_timestamp_ns", "wall_time_s", "monotonic_s", "filename"]
-        )
+        try:
+            self._writer.writerow(
+                ["frame_index", "camera_timestamp_ns", "wall_time_s", "monotonic_s", "filename",
+                 "received_wall_time_s", "received_monotonic_s"]
+            )
+        except BaseException as exc:
+            errors: list[str] = []
+            _cleanup_step(errors, "timestamp_header_cleanup", self._handle.close)
+            if errors:
+                exc.add_note("; ".join(errors))
+            raise
 
-    def write(self, frame_index: int, camera_timestamp_ns: int | None, filename: str) -> None:
+    def write(
+        self, frame_index: int, camera_timestamp_ns: int | None, filename: str,
+        *, received_wall_s: float | None = None, received_mono_s: float | None = None,
+    ) -> None:
         self._writer.writerow(
             [
                 int(frame_index),
@@ -265,6 +319,8 @@ class _FrameTimestampWriter:
                 time.time(),
                 time.perf_counter(),
                 filename,
+                "" if received_wall_s is None else received_wall_s,
+                "" if received_mono_s is None else received_mono_s,
             ]
         )
         if frame_index % 30 == 0:
@@ -272,8 +328,10 @@ class _FrameTimestampWriter:
 
     def close(self) -> None:
         if not self._handle.closed:
-            self._handle.flush()
-            self._handle.close()
+            try:
+                self._handle.flush()
+            finally:
+                self._handle.close()
 
 
 class _SpinnakerCRecorder:
@@ -299,7 +357,7 @@ class _SpinnakerCRecorder:
         preview_callback: PreviewCallback | None = None,
         preview_max_width: int = 520,
         preview_max_height: int = 390,
-        preview_min_interval_s: float = 0.125,
+        preview_min_interval_s: float = 1 / 15,
     ) -> None:
         self.session_dir = session_dir
         self._serial_number = serial_number
@@ -312,11 +370,14 @@ class _SpinnakerCRecorder:
         self._roi_offset_y = None if roi_offset_y is None else int(roi_offset_y)
         self._gain_db = gain_db
         self._gamma = gamma
+        self._actual_roi: dict[str, int] | None = None
+        self._settings_readback: dict[str, Any] = {}
         self._acquisition_timeout_ms = int(acquisition_timeout_ms)
         self._preview_callback = preview_callback
         self._preview_max_width = int(preview_max_width)
         self._preview_max_height = int(preview_max_height)
         self._preview_min_interval_s = float(preview_min_interval_s)
+        self._preview_cadence = _PreviewCadence(preview_min_interval_s)
         self._last_preview_mono_s = 0.0
         self._preview_count = 0
         self._preview_dispatcher = _PreviewDispatcher(
@@ -348,6 +409,10 @@ class _SpinnakerCRecorder:
         self._dll_path: str | None = None
         self._camera_initialized = False
         self._acquisition_started = False
+        self._camera_list_cleared = False
+        self._start_attempted = False
+        self._cleanup_errors: list[str] = []
+        self._unreleased_images: list[ctypes.c_void_p] = []
         self._timestamps: _FrameTimestampWriter | None = None
 
     @property
@@ -378,6 +443,9 @@ class _SpinnakerCRecorder:
         }
 
     def start(self) -> Path:
+        if self._start_attempted:
+            raise RuntimeError("Camera recorder is single-use; create a new recorder for another recording")
+        self._start_attempted = True
         try:
             self._load_api()
             self._check("spinSystemGetInstance", ctypes.byref(self._system))
@@ -415,29 +483,43 @@ class _SpinnakerCRecorder:
             self._thread.start()
             logger.info("Spinnaker C API recording started: %s", self.session_dir)
             return self.session_dir
-        except Exception:
+        except BaseException as exc:
+            self._error = f"{type(exc).__name__}: {exc}"
             self._running = False
-            self._preview_dispatcher.stop()
-            if self._timestamps is not None:
-                self._timestamps.close()
-            cleanup_errors = self._cleanup()
+            cleanup_errors: list[str] = []
+            stopped = _cleanup_step(cleanup_errors, "capture_thread_stop", lambda: _join_capture_thread(
+                self._thread, self._acquisition_timeout_ms))
+            _cleanup_step(cleanup_errors, "preview_stop", self._preview_dispatcher.stop)
+            if stopped:
+                cleanup_errors.extend(self._cleanup())
+                if self._timestamps is not None:
+                    _cleanup_step(cleanup_errors, "timestamp_close", self._timestamps.close)
+            _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
             if cleanup_errors:
                 logger.error("Spinnaker C startup cleanup errors: %s", "; ".join(cleanup_errors))
+                exc.add_note("Camera startup cleanup: " + "; ".join(cleanup_errors))
             raise
 
     def stop(self) -> dict[str, Any]:
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=max(5.0, self._acquisition_timeout_ms / 1000.0 + 2.0))
-            if self._thread.is_alive():
-                self._error = "capture thread did not stop before SDK teardown"
-                self._preview_dispatcher.stop()
-                raise TimeoutError(self._error)
-        self._preview_dispatcher.stop()
+        try:
+            _join_capture_thread(self._thread, self._acquisition_timeout_ms)
+        except TimeoutError as exc:
+            self._error = self._error or str(exc)
+            cleanup_errors = [f"capture_thread_stop: {exc}"]
+            _cleanup_step(cleanup_errors, "preview_stop", self._preview_dispatcher.stop)
+            _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
+            if len(cleanup_errors) > 1:
+                exc.add_note("; ".join(cleanup_errors[1:]))
+            raise
+        cleanup_errors: list[str] = []
+        _cleanup_step(cleanup_errors, "preview_stop", self._preview_dispatcher.stop)
         self._stop_wall_s = time.time()
-        cleanup_errors = self._cleanup()
+        cleanup_errors.extend(self._cleanup())
         if self._timestamps is not None:
-            self._timestamps.close()
+            if not _cleanup_step(cleanup_errors, "timestamp_close", self._timestamps.close):
+                self._error = self._error or cleanup_errors[-1]
+        _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
 
         summary = {
             "backend": "spinnaker_c",
@@ -454,7 +536,10 @@ class _SpinnakerCRecorder:
             "target_trigger_hz": int(self._fps),
             "exposure_us": int(self._exposure_us),
             "pixel_format": self._pixel_format,
-            "roi": self._roi_summary(),
+            "roi": self._actual_roi,
+            "requested_roi": self._roi_summary(),
+            "settings_readback": dict(self._settings_readback),
+            "exposure_control": "StreamDIO trigger pulse width; ExposureTime is the timed-mode setting",
             "preview_frames": int(self._preview_count),
             "preview_frames_delivered": int(self._preview_dispatcher.delivered_count),
             "frame_timestamps_csv": str(self.session_dir / "frame_timestamps.csv"),
@@ -465,13 +550,12 @@ class _SpinnakerCRecorder:
                 self._frame_count,
                 _duration_s(self._start_wall_s, self._stop_wall_s),
             ),
-            "estimated_missing_triggers": _estimated_missing_triggers(
-                self._frame_count,
-                self._fps,
-                _duration_s(self._start_wall_s, self._stop_wall_s),
-            ),
+            # Recorder lifetime includes waiting before/after triggers. The
+            # session compares frames with the recorded hardware trigger count.
+            "estimated_missing_triggers": None,
             "capture_error": self._error,
             "cleanup_error": "; ".join(cleanup_errors) or None,
+            "cleanup_error_history": list(self._cleanup_errors),
         }
         (self.session_dir / "recording_summary.json").write_text(
             json.dumps(summary, indent=2),
@@ -542,9 +626,14 @@ class _SpinnakerCRecorder:
         )
         self._bind("spinEnumerationEntryGetIntValue", [void_p, ctypes.POINTER(ctypes.c_int64)])
         self._bind("spinEnumerationSetIntValue", [void_p, ctypes.c_int64])
+        self._bind("spinEnumerationGetCurrentEntry", [void_p, ctypes.POINTER(void_p)])
+        self._bind("spinEnumerationEntryGetSymbolic", [void_p, ctypes.c_char_p, size_p])
         self._bind("spinFloatSetValue", [void_p, ctypes.c_double])
-        self._bind_optional("spinIntegerSetValue", [void_p, ctypes.c_int64])
+        self._bind("spinFloatGetValue", [void_p, ctypes.POINTER(ctypes.c_double)])
+        self._bind("spinIntegerSetValue", [void_p, ctypes.c_int64])
+        self._bind("spinIntegerGetValue", [void_p, ctypes.POINTER(ctypes.c_int64)])
         self._bind("spinBooleanSetValue", [void_p, ctypes.c_ubyte])
+        self._bind("spinBooleanGetValue", [void_p, ctypes.POINTER(ctypes.c_ubyte)])
         self._bind(
             "spinStringGetValue",
             [void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t)],
@@ -576,22 +665,22 @@ class _SpinnakerCRecorder:
         if count.value == 0:
             raise RuntimeError("No Spinnaker cameras found")
         if self._serial_number is None:
-            camera = ctypes.c_void_p()
-            self._check("spinCameraListGet", self._camera_list, 0, ctypes.byref(camera))
-            return camera
+            self._check("spinCameraListGet", self._camera_list, 0, ctypes.byref(self._camera))
+            return self._camera
 
         for index in range(count.value):
-            camera = ctypes.c_void_p()
+            self._camera = ctypes.c_void_p()
             self._check(
                 "spinCameraListGet",
                 self._camera_list,
                 index,
-                ctypes.byref(camera),
+                ctypes.byref(self._camera),
             )
-            serial = self._camera_string(camera, "DeviceSerialNumber")
+            serial = self._camera_string(self._camera, "DeviceSerialNumber")
             if serial == self._serial_number:
-                return camera
-            self._fn["spinCameraRelease"](camera)
+                return self._camera
+            self._check("spinCameraRelease", self._camera)
+            self._camera = ctypes.c_void_p()
         raise RuntimeError(f"Spinnaker camera serial not found: {self._serial_number}")
 
     def _camera_string(self, camera: ctypes.c_void_p, node_name: str) -> str | None:
@@ -616,25 +705,59 @@ class _SpinnakerCRecorder:
         self._check("spinCameraGetNodeMap", self._camera, ctypes.byref(node_map))
         # Match the verified bringup: StreamDIO drives Line0 FrameStart TTLs and
         # the TTL pulse width controls camera exposure.
+        # TriggerMode is unavailable while this camera is in TriggerWidth mode.
+        self._set_enum(node_map, "ExposureMode", "Timed", required=True)
+        self._set_enum(node_map, "TriggerSelector", "FrameStart", required=True)
         self._set_enum(node_map, "TriggerMode", "Off", required=True)
         self._set_enum(node_map, "AcquisitionMode", "Continuous", required=True)
         self._set_bool(node_map, "AcquisitionFrameRateEnable", False, required=True)
         self._set_enum(node_map, "ExposureAuto", "Off", required=True)
         self._set_float(node_map, "ExposureTime", self._exposure_us)
-        self._set_enum(node_map, "ExposureMode", "TriggerWidth", required=True)
         self._apply_roi(node_map)
         self._set_enum(node_map, "PixelFormat", self._pixel_format, required=True)
         if self._gain_db is not None:
-            self._set_enum(node_map, "GainAuto", "Off")
+            self._set_enum(node_map, "GainAuto", "Off", required=True)
             self._set_float(node_map, "Gain", self._gain_db)
         if self._gamma is not None:
-            self._set_bool(node_map, "GammaEnable", True)
+            self._set_bool(node_map, "GammaEnable", True, required=True)
             self._set_float(node_map, "Gamma", self._gamma)
+        self._record_optional_settings(node_map)
         self._set_enum(node_map, "TriggerSelector", "FrameStart", required=True)
         self._set_enum(node_map, "TriggerSource", "Line0", required=True)
         self._set_enum(node_map, "TriggerActivation", "RisingEdge", required=True)
         self._set_float(node_map, "TriggerDelay", 9.0)
         self._set_enum(node_map, "TriggerMode", "On", required=True)
+        self._set_enum(node_map, "ExposureMode", "TriggerWidth", required=True)
+
+    def _record_optional_settings(self, node_map: ctypes.c_void_p) -> None:
+        for name, kind in (("Gain", "Float"), ("Gamma", "Float"), ("GammaEnable", "Boolean")):
+            try:
+                self._settings_readback[name] = self._read_value(node_map, name, kind)
+            except RuntimeError:
+                self._settings_readback[name] = None
+        try:
+            self._settings_readback["GainAuto"] = self._read_enum(node_map, "GainAuto")
+        except RuntimeError:
+            self._settings_readback["GainAuto"] = None
+
+    def _read_value(self, node_map: ctypes.c_void_p, name: str, kind: str) -> Any:
+        node = self._get_node(node_map, name)
+        if node is None:
+            raise RuntimeError(f"Spinnaker {name}: node unavailable")
+        value = {"Integer": ctypes.c_int64, "Float": ctypes.c_double, "Boolean": ctypes.c_ubyte}[kind]()
+        self._check(f"spin{kind}GetValue", node, ctypes.byref(value))
+        return bool(value.value) if kind == "Boolean" else value.value
+
+    def _read_enum(self, node_map: ctypes.c_void_p, name: str) -> str:
+        node = self._get_node(node_map, name)
+        if node is None:
+            raise RuntimeError(f"Spinnaker {name}: node unavailable")
+        entry = ctypes.c_void_p()
+        self._check("spinEnumerationGetCurrentEntry", node, ctypes.byref(entry))
+        size = ctypes.c_size_t(256)
+        buffer = ctypes.create_string_buffer(size.value)
+        self._check("spinEnumerationEntryGetSymbolic", entry, buffer, ctypes.byref(size))
+        return buffer.value.decode("ascii")
 
     def _get_node(self, node_map: ctypes.c_void_p, name: str) -> ctypes.c_void_p | None:
         node = ctypes.c_void_p()
@@ -673,34 +796,39 @@ class _SpinnakerCRecorder:
         if result != 0:
             failed(f"set failed with Spinnaker error {result}")
             logger.debug("Could not set Spinnaker enum %s=%s (%d)", name, entry_name, result)
+            return
+        try:
+            actual = self._read_enum(node_map, name)
+            if actual != entry_name:
+                raise RuntimeError(f"readback mismatch: got {actual}")
+        except RuntimeError as exc:
+            failed(str(exc))
+            return
+        self._settings_readback[name] = actual
 
     def _set_float(self, node_map: ctypes.c_void_p, name: str, value: float) -> None:
         node = self._get_node(node_map, name)
         if node is None:
-            return
-        result = self._fn["spinFloatSetValue"](node, float(value))
-        if result != 0:
-            logger.debug("Could not set Spinnaker float %s=%s (%d)", name, value, result)
+            raise RuntimeError(f"Required Spinnaker float {name}={value}: node unavailable")
+        self._check("spinFloatSetValue", node, float(value))
+        # Camera floats can be quantized. Retain the actual accepted value.
+        self._settings_readback[name] = self._read_value(node_map, name, "Float")
 
     def _set_int(self, node_map: ctypes.c_void_p, name: str, value: int) -> None:
-        if "spinIntegerSetValue" not in self._fn:
-            return
         node = self._get_node(node_map, name)
         if node is None:
-            return
-        result = self._fn["spinIntegerSetValue"](node, int(value))
-        if result != 0:
-            logger.debug("Could not set Spinnaker integer %s=%s (%d)", name, value, result)
+            raise RuntimeError(f"Required Spinnaker integer {name}={value}: node unavailable")
+        self._check("spinIntegerSetValue", node, int(value))
+        actual = self._read_value(node_map, name, "Integer")
+        if actual != value:
+            raise RuntimeError(f"Spinnaker {name} readback mismatch: requested {value}, got {actual}")
 
     def _apply_roi(self, node_map: ctypes.c_void_p) -> None:
-        for node_name, value in (
-            ("OffsetX", self._roi_offset_x),
-            ("OffsetY", self._roi_offset_y),
-            ("Width", self._roi_width),
-            ("Height", self._roi_height),
-        ):
-            if value is not None:
-                self._set_int(node_map, node_name, max(0, int(value)))
+        self._actual_roi = apply_roi(
+            self._roi_summary(),
+            lambda name: self._read_value(node_map, name, "Integer"),
+            lambda name, value: self._set_int(node_map, name, value),
+        )
 
     def _set_bool(
         self,
@@ -723,6 +851,16 @@ class _SpinnakerCRecorder:
                     f"set failed with Spinnaker error {result}"
                 )
             logger.debug("Could not set Spinnaker bool %s=%s (%d)", name, value, result)
+            return
+        try:
+            actual = self._read_value(node_map, name, "Boolean")
+            if actual != value:
+                raise RuntimeError(f"readback mismatch: got {actual}")
+        except RuntimeError as exc:
+            if required:
+                raise RuntimeError(f"Required Spinnaker bool {name}={value}: {exc}") from exc
+            return
+        self._settings_readback[name] = actual
 
     def _capture_loop(self) -> None:
         assert self._timestamps is not None
@@ -742,6 +880,8 @@ class _SpinnakerCRecorder:
                 self._error = f"spinCameraGetNextImageEx failed with Spinnaker error {result}"
                 logger.error("Spinnaker C capture loop error: %s", self._error)
                 break
+            acquired_mono_s = time.perf_counter()
+            acquired_wall_s = time.time()
             try:
                 incomplete = ctypes.c_ubyte()
                 if self._fn["spinImageIsIncomplete"](image, ctypes.byref(incomplete)) != 0:
@@ -753,31 +893,63 @@ class _SpinnakerCRecorder:
                 frame_index = self._frame_count
                 filename = f"frame_{frame_index:09d}.pgm"
                 frame_path = self.session_dir / filename
-                result = int(self._fn["spinImageSaveFromExt"](image, os.fsencode(frame_path)))
-                if result != 0:
-                    self._save_errors += 1
-                    self._error = f"spinImageSaveFromExt failed with Spinnaker error {result}"
-                    logger.error("Spinnaker C capture loop error: %s", self._error)
-                    break
                 camera_timestamp = ctypes.c_uint64()
                 timestamp_result = self._fn["spinImageGetTimeStamp"](
                     image,
                     ctypes.byref(camera_timestamp),
                 )
                 camera_timestamp_ns = camera_timestamp.value if timestamp_result == 0 else None
+                try:
+                    mono_frame = self._read_mono_image(image)
+                    if mono_frame is not None:
+                        self._maybe_emit_saved_preview(
+                            frame_path, frame_index=frame_index,
+                            camera_timestamp_ns=camera_timestamp_ns,
+                            mono_frame=mono_frame, acquired_mono_s=acquired_mono_s,
+                        )
+                        _save_mono_pgm(frame_path, *mono_frame)
+                    else:
+                        self._check("spinImageSaveFromExt", image, os.fsencode(frame_path))
+                        self._maybe_emit_saved_preview(
+                            frame_path, frame_index=frame_index,
+                            camera_timestamp_ns=camera_timestamp_ns,
+                            acquired_mono_s=acquired_mono_s,
+                        )
+                except Exception:
+                    self._save_errors += 1
+                    raise
                 self._timestamps.write(
-                    frame_index,
-                    camera_timestamp_ns,
-                    filename,
-                )
-                self._maybe_emit_saved_preview(
-                    frame_path,
-                    frame_index=frame_index,
-                    camera_timestamp_ns=camera_timestamp_ns,
+                    frame_index, camera_timestamp_ns, filename,
+                    received_wall_s=acquired_wall_s, received_mono_s=acquired_mono_s,
                 )
                 self._frame_count += 1
+            except Exception as exc:
+                self._error = f"{type(exc).__name__}: {exc}"
+                logger.error("Spinnaker C capture loop error: %s", self._error)
+                break
             finally:
-                self._fn["spinImageRelease"](image)
+                try:
+                    self._check("spinImageRelease", image)
+                except Exception as exc:
+                    error = f"Image release failed: {type(exc).__name__}: {exc}"
+                    self._error = self._error or error
+                    self._unreleased_images.append(image)
+                    _remember_cleanup_errors(self._cleanup_errors, [error])
+                    self._running = False
+                    logger.error("Spinnaker image release failed: %s", error)
+
+    def _read_mono_image(self, image: ctypes.c_void_p) -> tuple[int, int, int, bytes] | None:
+        """Copy Mono8 pixels before release; avoid the SDK's slow image encoder."""
+        functions = ("spinImageGetWidth", "spinImageGetHeight", "spinImageGetStride", "spinImageGetData")
+        if self._pixel_format != "Mono8" or not all(name in self._fn for name in functions):
+            return None
+        width, height, stride = ctypes.c_size_t(), ctypes.c_size_t(), ctypes.c_size_t()
+        pointer = ctypes.c_void_p()
+        for name, target in zip(functions, (width, height, stride, pointer)):
+            self._check(name, image, ctypes.byref(target))
+        if not pointer.value or width.value <= 0 or height.value <= 0 or stride.value < width.value:
+            raise RuntimeError("Invalid Spinnaker Mono8 image buffer")
+        return width.value, height.value, stride.value, ctypes.string_at(pointer, stride.value * height.value)
 
     def _maybe_emit_saved_preview(
         self,
@@ -785,17 +957,25 @@ class _SpinnakerCRecorder:
         *,
         frame_index: int,
         camera_timestamp_ns: int | None,
+        mono_frame: tuple[int, int, int, bytes] | None = None,
+        acquired_mono_s: float | None = None,
     ) -> None:
         if not self._preview_dispatcher.enabled:
             return
-        if not _preview_due(self._last_preview_mono_s, self._preview_min_interval_s):
+        if not self._preview_cadence.due(time.perf_counter()):
             return
         try:
-            preview = _downsample_pgm_file_preview(
-                frame_path,
-                max_width=self._preview_max_width,
-                max_height=self._preview_max_height,
-            )
+            if mono_frame is not None:
+                width, height, stride, raw = mono_frame
+                preview = _downsample_mono_bytes(
+                    raw, width=width, height=height, stride=stride,
+                    max_width=self._preview_max_width, max_height=self._preview_max_height,
+                )
+            else:
+                preview = _downsample_pgm_file_preview(
+                    frame_path, max_width=self._preview_max_width,
+                    max_height=self._preview_max_height,
+                )
             if preview is None:
                 return
             out_width, out_height, data = preview
@@ -810,6 +990,7 @@ class _SpinnakerCRecorder:
                     "format": "L",
                     "data": data,
                     "monotonic_s": self._last_preview_mono_s,
+                    "acquired_mono_s": acquired_mono_s,
                     "backend": "spinnaker_c",
                 }
             ):
@@ -819,31 +1000,38 @@ class _SpinnakerCRecorder:
 
     def _cleanup(self) -> list[str]:
         errors: list[str] = []
-        steps = [
-            ("spinCameraEndAcquisition", self._acquisition_started, self._camera),
-            ("spinCameraDeInit", self._camera_initialized, self._camera),
-            ("spinCameraRelease", bool(self._camera.value), self._camera),
-            ("spinCameraListClear", bool(self._camera_list.value), self._camera_list),
-            ("spinCameraListDestroy", bool(self._camera_list.value), self._camera_list),
-            ("spinSystemReleaseInstance", bool(self._system.value), self._system),
-        ]
-        for name, enabled, handle in steps:
-            if not enabled:
-                continue
-            try:
-                result = int(self._fn[name](handle))
-                if result != 0:
-                    errors.append(f"{name}: {result}")
-            except Exception as exc:
-                errors.append(f"{name}: {type(exc).__name__}: {exc}")
-        self._acquisition_started = False
-        self._camera_initialized = False
-        self._camera = ctypes.c_void_p()
-        self._camera_list = ctypes.c_void_p()
-        self._system = ctypes.c_void_p()
-        if self._dll_dir_handle is not None:
-            self._dll_dir_handle.close()
-            self._dll_dir_handle = None
+
+        def release(name: str, handle: ctypes.c_void_p) -> bool:
+            return _cleanup_step(errors, name, lambda: self._check(name, handle))
+
+        for image in list(self._unreleased_images):
+            if release("spinImageRelease", image):
+                self._unreleased_images.remove(image)
+        if self._unreleased_images:
+            _remember_cleanup_errors(self._cleanup_errors, errors)
+            return errors
+        # Retain failed handles for a subsequent stop attempt. Parent resources
+        # cannot be released while their camera/list is still in use.
+        if self._acquisition_started and release("spinCameraEndAcquisition", self._camera):
+            self._acquisition_started = False
+        if not self._acquisition_started:
+            if self._camera_initialized and release("spinCameraDeInit", self._camera):
+                self._camera_initialized = False
+            if not self._camera_initialized and self._camera.value:
+                if release("spinCameraRelease", self._camera):
+                    self._camera = ctypes.c_void_p()
+        if not self._camera.value and self._camera_list.value:
+            if not self._camera_list_cleared:
+                self._camera_list_cleared = release("spinCameraListClear", self._camera_list)
+            if self._camera_list_cleared and release("spinCameraListDestroy", self._camera_list):
+                self._camera_list = ctypes.c_void_p()
+        if not self._camera.value and not self._camera_list.value and self._system.value:
+            if release("spinSystemReleaseInstance", self._system):
+                self._system = ctypes.c_void_p()
+        if not self._system.value and self._dll_dir_handle is not None:
+            if _cleanup_step(errors, "dll_directory_close", self._dll_dir_handle.close):
+                self._dll_dir_handle = None
+        _remember_cleanup_errors(self._cleanup_errors, errors)
         return errors
 
 
@@ -870,7 +1058,7 @@ class HeadlessSpinnakerRecorder:
         preview_callback: PreviewCallback | None = None,
         preview_max_width: int = 520,
         preview_max_height: int = 390,
-        preview_min_interval_s: float = 0.125,
+        preview_min_interval_s: float = 1 / 15,
     ) -> None:
         # Native camera SDK calls run on a capture thread.  Use an absolute path
         # so a process-wide working-directory change cannot redirect frame data.
@@ -892,6 +1080,7 @@ class HeadlessSpinnakerRecorder:
         self._preview_max_width = int(preview_max_width)
         self._preview_max_height = int(preview_max_height)
         self._preview_min_interval_s = float(preview_min_interval_s)
+        self._preview_cadence = _PreviewCadence(preview_min_interval_s)
         self._last_preview_mono_s = 0.0
         self._preview_count = 0
         self._preview_dispatcher = _PreviewDispatcher(
@@ -899,6 +1088,8 @@ class HeadlessSpinnakerRecorder:
             thread_name="spinnaker-preview",
         )
         self.backend = "spinnaker_pyspin"
+        self._actual_roi: dict[str, int] | None = None
+        self._settings_readback: dict[str, Any] = {}
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -913,6 +1104,12 @@ class HeadlessSpinnakerRecorder:
         self._pyspin: Any = None
         self._system: Any = None
         self._camera: Any = None
+        self._camera_list: Any = None
+        self._camera_initialized = False
+        self._acquisition_started = False
+        self._start_attempted = False
+        self._cleanup_errors: list[str] = []
+        self._unreleased_images: list[Any] = []
         self._device_info: dict[str, str | None] = {
             "serial_number": None,
             "model_name": None,
@@ -956,6 +1153,17 @@ class HeadlessSpinnakerRecorder:
             return dict(self._c_backend._device_info)
         return dict(self._device_info)
 
+    @property
+    def camera_settings(self) -> dict[str, Any]:
+        """Settings read back before acquisition, also available in crash journals."""
+        source = self._c_backend if self._c_backend is not None else self
+        return {
+            "roi": None if source._actual_roi is None else dict(source._actual_roi),
+            "requested_roi": source._roi_summary(),
+            "settings_readback": dict(source._settings_readback),
+            "exposure_control": "StreamDIO trigger pulse width; ExposureTime is the timed-mode setting",
+        }
+
     def _roi_summary(self) -> dict[str, int | None]:
         return {
             "width": self._roi_width,
@@ -966,6 +1174,9 @@ class HeadlessSpinnakerRecorder:
 
     def start(self) -> Path:
         """Start camera acquisition and background frame saving."""
+        if self._start_attempted:
+            raise RuntimeError("Camera recorder is single-use; create a new recorder for another recording")
+        self._start_attempted = True
         self.session_dir.mkdir(parents=True, exist_ok=True)
         try:
             self._pyspin = self._load_pyspin()
@@ -994,12 +1205,11 @@ class HeadlessSpinnakerRecorder:
 
         try:
             self._system = self._pyspin.System.GetInstance()
-            cam_list = self._system.GetCameras()
-            if cam_list.GetSize() == 0:
-                cam_list.Clear()
+            self._camera_list = self._system.GetCameras()
+            if self._camera_list.GetSize() == 0:
                 raise RuntimeError("No Spinnaker cameras found")
 
-            self._camera = self._select_camera(cam_list)
+            self._camera = self._select_camera(self._camera_list)
             device_version = self._pyspin_device_value("DeviceVersion")
             firmware_version = self._pyspin_device_value("DeviceFirmwareVersion")
             self._device_info = {
@@ -1009,10 +1219,13 @@ class HeadlessSpinnakerRecorder:
                 "device_version": device_version,
                 "firmware_version": firmware_version or device_version,
             }
-            cam_list.Clear()
+            self._camera_list.Clear()
+            self._camera_list = None
             self._camera.Init()
+            self._camera_initialized = True
             self._configure_camera()
             self._camera.BeginAcquisition()
+            self._acquisition_started = True
             self._timestamps = _FrameTimestampWriter(self.session_dir)
             self._preview_dispatcher.start()
             self._running = True
@@ -1025,8 +1238,23 @@ class HeadlessSpinnakerRecorder:
             self._thread.start()
             logger.info("Headless Spinnaker recording started: %s", self.session_dir)
             return self.session_dir
-        except Exception:
-            self._cleanup_pyspin()
+        except BaseException as exc:
+            self._error = f"{type(exc).__name__}: {exc}"
+            self._running = False
+            cleanup_errors: list[str] = []
+            stopped = _cleanup_step(cleanup_errors, "capture_thread_stop", lambda: _join_capture_thread(
+                self._thread, self._acquisition_timeout_ms))
+            _cleanup_step(cleanup_errors, "preview_stop", self._preview_dispatcher.stop)
+            if stopped:
+                cleanup_error = self._cleanup_pyspin()
+                if cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                if self._timestamps is not None:
+                    _cleanup_step(cleanup_errors, "timestamp_close", self._timestamps.close)
+            _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
+            if cleanup_errors:
+                logger.error("PySpin startup cleanup errors: %s", "; ".join(cleanup_errors))
+                exc.add_note("Camera startup cleanup: " + "; ".join(cleanup_errors))
             raise
 
     def stop(self) -> dict[str, Any]:
@@ -1035,17 +1263,26 @@ class HeadlessSpinnakerRecorder:
             return self._c_backend.stop()
 
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=max(5.0, self._acquisition_timeout_ms / 1000.0 + 2.0))
-            if self._thread.is_alive():
-                self._error = "capture thread did not stop before SDK teardown"
-                self._preview_dispatcher.stop()
-                raise TimeoutError(self._error)
-        self._preview_dispatcher.stop()
+        try:
+            _join_capture_thread(self._thread, self._acquisition_timeout_ms)
+        except TimeoutError as exc:
+            self._error = self._error or str(exc)
+            cleanup_errors = [f"capture_thread_stop: {exc}"]
+            _cleanup_step(cleanup_errors, "preview_stop", self._preview_dispatcher.stop)
+            _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
+            if len(cleanup_errors) > 1:
+                exc.add_note("; ".join(cleanup_errors[1:]))
+            raise
+        cleanup_errors: list[str] = []
+        _cleanup_step(cleanup_errors, "preview_stop", self._preview_dispatcher.stop)
         self._stop_wall_s = time.time()
         cleanup_error = self._cleanup_pyspin()
+        if cleanup_error:
+            cleanup_errors.append(cleanup_error)
         if self._timestamps is not None:
-            self._timestamps.close()
+            if not _cleanup_step(cleanup_errors, "timestamp_close", self._timestamps.close):
+                self._error = self._error or cleanup_errors[-1]
+        _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
 
         summary = {
             "backend": self.backend,
@@ -1061,7 +1298,10 @@ class HeadlessSpinnakerRecorder:
             "target_trigger_hz": int(self._fps),
             "exposure_us": int(self._exposure_us),
             "pixel_format": self._pixel_format,
-            "roi": self._roi_summary(),
+            "roi": self._actual_roi,
+            "requested_roi": self._roi_summary(),
+            "settings_readback": dict(self._settings_readback),
+            "exposure_control": "StreamDIO trigger pulse width; ExposureTime is the timed-mode setting",
             "preview_frames": int(self._preview_count),
             "preview_frames_delivered": int(self._preview_dispatcher.delivered_count),
             "frame_timestamps_csv": str(self.session_dir / "frame_timestamps.csv"),
@@ -1072,13 +1312,10 @@ class HeadlessSpinnakerRecorder:
                 self._frame_count,
                 _duration_s(self._start_wall_s, self._stop_wall_s),
             ),
-            "estimated_missing_triggers": _estimated_missing_triggers(
-                self._frame_count,
-                self._fps,
-                _duration_s(self._start_wall_s, self._stop_wall_s),
-            ),
+            "estimated_missing_triggers": None,
             "capture_error": self._error,
-            "cleanup_error": cleanup_error,
+            "cleanup_error": "; ".join(cleanup_errors) or None,
+            "cleanup_error_history": list(self._cleanup_errors),
         }
         (self.session_dir / "recording_summary.json").write_text(
             json.dumps(summary, indent=2),
@@ -1093,25 +1330,31 @@ class HeadlessSpinnakerRecorder:
 
     def _cleanup_pyspin(self) -> str | None:
         cleanup_errors: list[str] = []
-        try:
-            if self._camera is not None:
-                self._camera.EndAcquisition()
-        except Exception as exc:  # pragma: no cover - device-specific
-            cleanup_errors.append(f"EndAcquisition: {type(exc).__name__}: {exc}")
-        try:
-            if self._camera is not None:
-                self._camera.DeInit()
-        except Exception as exc:  # pragma: no cover - device-specific
-            cleanup_errors.append(f"DeInit: {type(exc).__name__}: {exc}")
-        finally:
-            self._camera = None
-        try:
-            if self._system is not None:
-                self._system.ReleaseInstance()
-        except Exception as exc:  # pragma: no cover - device-specific
-            cleanup_errors.append(f"ReleaseInstance: {type(exc).__name__}: {exc}")
-        finally:
-            self._system = None
+        for image in list(self._unreleased_images):
+            if _cleanup_step(cleanup_errors, "Image.Release", image.Release):
+                self._unreleased_images.remove(image)
+        if self._unreleased_images:
+            _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
+            return "; ".join(cleanup_errors)
+        if self._camera is not None:
+            if self._acquisition_started and _cleanup_step(
+                cleanup_errors, "EndAcquisition", self._camera.EndAcquisition,
+            ):
+                self._acquisition_started = False
+            if not self._acquisition_started:
+                if self._camera_initialized and _cleanup_step(
+                    cleanup_errors, "DeInit", self._camera.DeInit,
+                ):
+                    self._camera_initialized = False
+                if not self._camera_initialized:
+                    self._camera = None
+        if self._camera is None and self._camera_list is not None:
+            if _cleanup_step(cleanup_errors, "CameraList.Clear", self._camera_list.Clear):
+                self._camera_list = None
+        if self._camera is None and self._camera_list is None and self._system is not None:
+            if _cleanup_step(cleanup_errors, "ReleaseInstance", self._system.ReleaseInstance):
+                self._system = None
+        _remember_cleanup_errors(self._cleanup_errors, cleanup_errors)
         return "; ".join(cleanup_errors) or None
 
     def _load_pyspin(self) -> Any:
@@ -1129,8 +1372,13 @@ class HeadlessSpinnakerRecorder:
             return cam_list.GetByIndex(0)
         for idx in range(cam_list.GetSize()):
             cam = cam_list.GetByIndex(idx)
-            if str(cam.TLDevice.DeviceSerialNumber.GetValue()) == self._serial_number:
-                return cam
+            try:
+                if str(cam.TLDevice.DeviceSerialNumber.GetValue()) == self._serial_number:
+                    return cam
+            finally:
+                # A retained exception traceback must not keep an unmatched
+                # camera reference alive when the parent SDK is released.
+                del cam
         raise RuntimeError(f"Spinnaker camera serial not found: {self._serial_number}")
 
     def _pyspin_device_value(self, name: str) -> str | None:
@@ -1141,48 +1389,53 @@ class HeadlessSpinnakerRecorder:
             return None
 
     def _configure_camera(self) -> None:
-        PySpin = self._pyspin
         nodemap = self._camera.GetNodeMap()
-
+        self._set_pyspin_enum(nodemap, "ExposureMode", "Timed", required=True)
+        self._set_pyspin_enum(nodemap, "TriggerSelector", "FrameStart", required=True)
         self._set_pyspin_enum(nodemap, "TriggerMode", "Off", required=True)
-        self._camera.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)
-
-        if not PySpin.IsWritable(self._camera.AcquisitionFrameRateEnable):
-            raise RuntimeError("Required PySpin AcquisitionFrameRateEnable is not writable")
-        self._camera.AcquisitionFrameRateEnable.SetValue(False)
-
-        if not PySpin.IsWritable(self._camera.ExposureAuto):
-            raise RuntimeError("Required PySpin ExposureAuto is not writable")
-        self._camera.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
-        if PySpin.IsWritable(self._camera.ExposureTime):
-            self._camera.ExposureTime.SetValue(float(self._exposure_us))
-        self._set_pyspin_enum(nodemap, "ExposureMode", "TriggerWidth", required=True)
+        self._set_pyspin_enum(nodemap, "AcquisitionMode", "Continuous", required=True)
+        self._set_pyspin_value(nodemap, "AcquisitionFrameRateEnable", False, "Boolean")
+        self._set_pyspin_enum(nodemap, "ExposureAuto", "Off", required=True)
+        self._set_pyspin_value(nodemap, "ExposureTime", self._exposure_us, "Float")
         self._apply_pyspin_roi(nodemap)
-
-        if self._gain_db is not None and PySpin.IsWritable(self._camera.GainAuto):
-            self._camera.GainAuto.SetValue(PySpin.GainAuto_Off)
-        if self._gain_db is not None and PySpin.IsWritable(self._camera.Gain):
-            self._camera.Gain.SetValue(float(self._gain_db))
-
-        if self._gamma is not None and PySpin.IsWritable(self._camera.GammaEnable):
-            self._camera.GammaEnable.SetValue(True)
-        if self._gamma is not None and PySpin.IsWritable(self._camera.Gamma):
-            self._camera.Gamma.SetValue(float(self._gamma))
-
-        pixel_node = PySpin.CEnumerationPtr(nodemap.GetNode("PixelFormat"))
-        if not PySpin.IsAvailable(pixel_node) or not PySpin.IsWritable(pixel_node):
-            raise RuntimeError("Required PySpin PixelFormat node is unavailable or unwritable")
-        pixel_entry = pixel_node.GetEntryByName(self._pixel_format)
-        if not PySpin.IsAvailable(pixel_entry) or not PySpin.IsReadable(pixel_entry):
-            raise RuntimeError(f"Required PySpin PixelFormat {self._pixel_format!r} is unavailable")
-        pixel_node.SetIntValue(pixel_entry.GetValue())
+        self._set_pyspin_enum(nodemap, "PixelFormat", self._pixel_format, required=True)
+        if self._gain_db is not None:
+            self._set_pyspin_enum(nodemap, "GainAuto", "Off", required=True)
+            self._set_pyspin_value(nodemap, "Gain", self._gain_db, "Float")
+        if self._gamma is not None:
+            self._set_pyspin_value(nodemap, "GammaEnable", True, "Boolean")
+            self._set_pyspin_value(nodemap, "Gamma", self._gamma, "Float")
+        for name, kind in (("Gain", "Float"), ("Gamma", "Float"),
+                           ("GammaEnable", "Boolean"), ("GainAuto", "Enumeration")):
+            try:
+                self._settings_readback[name] = self._read_pyspin_value(nodemap, name, kind)
+            except Exception:
+                self._settings_readback[name] = None
         self._set_pyspin_enum(nodemap, "TriggerSelector", "FrameStart", required=True)
         self._set_pyspin_enum(nodemap, "TriggerSource", "Line0", required=True)
         self._set_pyspin_enum(nodemap, "TriggerActivation", "RisingEdge", required=True)
-        trigger_delay = PySpin.CFloatPtr(nodemap.GetNode("TriggerDelay"))
-        if PySpin.IsAvailable(trigger_delay) and PySpin.IsWritable(trigger_delay):
-            trigger_delay.SetValue(9.0)
+        self._set_pyspin_value(nodemap, "TriggerDelay", 9.0, "Float")
         self._set_pyspin_enum(nodemap, "TriggerMode", "On", required=True)
+        self._set_pyspin_enum(nodemap, "ExposureMode", "TriggerWidth", required=True)
+
+    def _read_pyspin_value(self, nodemap: Any, name: str, kind: str) -> Any:
+        node = getattr(self._pyspin, f"C{kind}Ptr")(nodemap.GetNode(name))
+        if not self._pyspin.IsAvailable(node) or not self._pyspin.IsReadable(node):
+            raise RuntimeError(f"PySpin {name}: node unavailable or unreadable")
+        if kind == "Enumeration":
+            return str(node.GetCurrentEntry().GetSymbolic())
+        return node.GetValue()
+
+    def _set_pyspin_value(self, nodemap: Any, name: str, value: Any, kind: str) -> None:
+        node = getattr(self._pyspin, f"C{kind}Ptr")(nodemap.GetNode(name))
+        if not self._pyspin.IsAvailable(node) or not self._pyspin.IsWritable(node):
+            raise RuntimeError(f"Required PySpin {name}={value}: node unavailable or unwritable")
+        convert = {"Integer": int, "Float": float, "Boolean": bool}[kind]
+        node.SetValue(convert(value))
+        actual = self._read_pyspin_value(nodemap, name, kind)
+        if kind != "Float" and actual != value:
+            raise RuntimeError(f"PySpin {name} readback mismatch: requested {value}, got {actual}")
+        self._settings_readback[name] = actual
 
     def _set_pyspin_enum(
         self,
@@ -1201,6 +1454,10 @@ class HeadlessSpinnakerRecorder:
             if not PySpin.IsAvailable(entry) or not PySpin.IsReadable(entry):
                 raise RuntimeError("entry unavailable or unreadable")
             node.SetIntValue(entry.GetValue())
+            actual = self._read_pyspin_value(nodemap, node_name, "Enumeration")
+            if actual != entry_name:
+                raise RuntimeError(f"readback mismatch: got {actual}")
+            self._settings_readback[node_name] = actual
         except Exception as exc:
             if required:
                 raise RuntimeError(
@@ -1209,20 +1466,14 @@ class HeadlessSpinnakerRecorder:
             return
 
     def _set_pyspin_int(self, nodemap: Any, node_name: str, value: int) -> None:
-        PySpin = self._pyspin
-        node = PySpin.CIntegerPtr(nodemap.GetNode(node_name))
-        if PySpin.IsAvailable(node) and PySpin.IsWritable(node):
-            node.SetValue(max(0, int(value)))
+        self._set_pyspin_value(nodemap, node_name, value, "Integer")
 
     def _apply_pyspin_roi(self, nodemap: Any) -> None:
-        for node_name, value in (
-            ("OffsetX", self._roi_offset_x),
-            ("OffsetY", self._roi_offset_y),
-            ("Width", self._roi_width),
-            ("Height", self._roi_height),
-        ):
-            if value is not None:
-                self._set_pyspin_int(nodemap, node_name, value)
+        self._actual_roi = apply_roi(
+            self._roi_summary(),
+            lambda name: self._read_pyspin_value(nodemap, name, "Integer"),
+            lambda name, value: self._set_pyspin_int(nodemap, name, value),
+        )
 
     def _capture_loop(self) -> None:
         assert self._camera is not None
@@ -1231,31 +1482,47 @@ class HeadlessSpinnakerRecorder:
             image = None
             try:
                 image = self._camera.GetNextImage(int(self._acquisition_timeout_ms))
+                acquired_mono_s = time.perf_counter()
+                acquired_wall_s = time.time()
                 if image.IsIncomplete():
                     self._incomplete_frames += 1
                     continue
                 frame_index = self._frame_count
-                filename = f"frame_{frame_index:09d}.png"
+                # Mono8 uses the same direct, lossless writer as the C backend.
+                filename = f"frame_{frame_index:09d}.{'pgm' if self._pixel_format == 'Mono8' else 'png'}"
                 frame_path = self.session_dir / filename
-                try:
-                    image.Save(str(frame_path))
-                except Exception:
-                    self._save_errors += 1
-                    raise
                 camera_timestamp = None
                 try:
                     camera_timestamp = int(image.GetTimeStamp())
                 except Exception:
                     pass
-                self._timestamps.write(frame_index, camera_timestamp, filename)
-                self._maybe_emit_preview(
-                    image,
-                    frame_index=frame_index,
-                    camera_timestamp_ns=camera_timestamp,
+                try:
+                    array = None
+                    if self._pixel_format == "Mono8":
+                        array = image.GetNDArray()
+                        if len(array.shape) != 2 or str(array.dtype) != "uint8":
+                            raise ValueError("Invalid PySpin Mono8 array")
+                        array = array.copy()
+                    self._maybe_emit_preview(
+                        image, frame_index=frame_index, camera_timestamp_ns=camera_timestamp,
+                        array=array, acquired_mono_s=acquired_mono_s,
+                    )
+                    if array is None:
+                        image.Save(str(frame_path))
+                    else:
+                        height, width = array.shape
+                        _save_mono_pgm(frame_path, width, height, width, array.tobytes())
+                except Exception:
+                    self._save_errors += 1
+                    raise
+                self._timestamps.write(
+                    frame_index, camera_timestamp, filename,
+                    received_wall_s=acquired_wall_s, received_mono_s=acquired_mono_s,
                 )
                 self._frame_count += 1
             except Exception as exc:  # pragma: no cover - device-specific
-                if "timeout" in str(exc).lower() and self._running:
+                # A disk/encoder timeout is a save failure, not an empty camera wait.
+                if image is None and "timeout" in str(exc).lower():
                     self._acquisition_timeouts += 1
                     continue
                 self._error = f"{type(exc).__name__}: {exc}"
@@ -1263,7 +1530,15 @@ class HeadlessSpinnakerRecorder:
                 break
             finally:
                 if image is not None:
-                    image.Release()
+                    try:
+                        image.Release()
+                    except Exception as exc:
+                        error = f"Image release failed: {type(exc).__name__}: {exc}"
+                        self._error = self._error or error
+                        self._unreleased_images.append(image)
+                        _remember_cleanup_errors(self._cleanup_errors, [error])
+                        self._running = False
+                        logger.error("PySpin image release failed: %s", error)
 
     def _maybe_emit_preview(
         self,
@@ -1271,13 +1546,16 @@ class HeadlessSpinnakerRecorder:
         *,
         frame_index: int,
         camera_timestamp_ns: int | None,
+        array: Any = None,
+        acquired_mono_s: float | None = None,
     ) -> None:
         if not self._preview_dispatcher.enabled:
             return
-        if not _preview_due(self._last_preview_mono_s, self._preview_min_interval_s):
+        if not self._preview_cadence.due(time.perf_counter()):
             return
         try:
-            array = image.GetNDArray()
+            if array is None:
+                array = image.GetNDArray()
             preview = _downsample_array_preview(
                 array,
                 max_width=self._preview_max_width,
@@ -1297,6 +1575,7 @@ class HeadlessSpinnakerRecorder:
                     "format": "L" if channels == 1 else "RGB",
                     "data": data,
                     "monotonic_s": self._last_preview_mono_s,
+                    "acquired_mono_s": acquired_mono_s,
                     "backend": "spinnaker_pyspin",
                 }
             ):

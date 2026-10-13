@@ -1,4 +1,4 @@
-"""Continuous PC white noise for the pin-27 hardware gate."""
+"""Continuous PC white noise for the pin-26 hardware gate."""
 
 from __future__ import annotations
 
@@ -27,18 +27,16 @@ class WhiteNoisePlayer:
             )
             if control is None:
                 raise RuntimeError("SoundControl.create_from_protocol returned None")
-            if not control.start_continuous_playback_from_protocol():
-                control.stop_and_cleanup()
-                raise RuntimeError("continuous white-noise playback did not start")
             self._control = control
+            if not control.start_continuous_playback_from_protocol():
+                raise RuntimeError("continuous white-noise playback did not start")
             self._status = dict(control.get_status())
             if not self._status.get("continuous_playback_active", False):
                 raise RuntimeError(f"unexpected SoundControl status: {self._status}")
             return True
         except Exception as exc:
             logger.exception("White noise PC playback unavailable: %s", exc)
-            self._control = None
-            self._status = {}
+            self.stop()
             return False
 
     @property
@@ -52,9 +50,6 @@ class WhiteNoisePlayer:
 
     def stop(self) -> None:
         if self._control is not None:
-            try:
-                self._control.stop_and_cleanup()
-            except Exception:
-                pass
+            self._control.stop_and_cleanup()
             self._control = None
         self._status = {}

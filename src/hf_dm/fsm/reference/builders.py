@@ -142,7 +142,7 @@ def build_decision_trial_fsm(
         timer=timeout_noise_s,
         transitions={"Tup": "SpeakerGateOff"},
         actions=relay.act(relay.ids.speaker_gate_on),
-        comment="Gate continuous white noise on pin 27 during timeout only",
+        comment="Gate continuous white noise on pin 26 during timeout only",
     )
     fsm.add_state(
         name="SpeakerGateOff",
@@ -190,7 +190,7 @@ def build_choice_epoch_fsm(
         timer=timeout_noise_s,
         transitions={"Tup": "SpeakerGateOff"},
         actions=relay.act(relay.ids.speaker_gate_on),
-        comment="Gate white noise on pin 27 (speaker bringup)",
+        comment="Gate white noise on pin 26 (speaker bringup)",
     )
     fsm.add_state(
         name="SpeakerGateOff",

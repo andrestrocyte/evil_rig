@@ -60,15 +60,11 @@ class StreamDIOClient:
         # ArCOM logger can emit byte-level DEBUG messages. Both streams can stall
         # the task/display loop even though experiment data are already retained
         # by StreamDIO and this session recorder.
-        driver_logger = logging.getLogger(
-            "pybpod_streamDIO_module.stream_dio_protocol"
-        )
-        driver_logger.setLevel(logging.WARNING)
-        if not any(
-            isinstance(item, _TimingHeartbeatLogFilter)
-            for item in driver_logger.filters
-        ):
-            driver_logger.addFilter(_TimingHeartbeatLogFilter())
+        for name in ("stream_dio_protocol", "stream_dio_base"):
+            driver_logger = logging.getLogger(f"pybpod_streamDIO_module.{name}")
+            driver_logger.setLevel(logging.WARNING)
+            if not any(isinstance(item, _TimingHeartbeatLogFilter) for item in driver_logger.filters):
+                driver_logger.addFilter(_TimingHeartbeatLogFilter())
         logging.getLogger("pybpodapi.com.arcom").setLevel(logging.WARNING)
         try:
             from pybpod_streamDIO_module.stream_dio_protocol import StreamDIOProtocol
@@ -98,6 +94,7 @@ class StreamDIOClient:
             deque[tuple[int, int, int, float, float]],
         ] = defaultdict(lambda: deque(maxlen=64))
         self._last_buffer_stats: dict[str, int] = {}
+        self._camera_events: list[tuple[int, float]] = []
 
     def open(
         self,
@@ -116,6 +113,10 @@ class StreamDIOClient:
         self._dio = self._protocol_cls(config_port=cfg, stream_port=stream, connect=False)
         try:
             self._dio.open()
+            # The driver supplies a historical pin-27 default. Read the actual
+            # firmware value before recording hardware identity or certification.
+            speaker_status = self._dio.get_speaker_status()
+            self._dio.module_info["speaker_pin"] = int(speaker_status["pin"])
             # Firmware initialization drives all module outputs low.
             n_outputs = int(self._dio.module_info["n_output_channels"])
             with self._output_condition:
@@ -124,7 +125,7 @@ class StreamDIOClient:
                 self._output_events = {}
                 self._output_event_history = defaultdict(lambda: deque(maxlen=64))
         except Exception as exc:
-            self._dio = None
+            # Retain the handle so session cleanup can close a partial connection.
             raise RuntimeError(
                 f"Failed to open StreamDIO config={cfg}, stream={stream}. "
                 "If Windows reports 'Access is denied', close old hf-dm-run/python "
@@ -257,6 +258,15 @@ class StreamDIOClient:
         if self._dio is None:
             raise RuntimeError("StreamDIO not connected")
         self._dio.clear_event_history()
+        self._camera_events = []
+        # The durable recorder owns the complete high-rate stream. The vendor's
+        # extra debug histories must not grow for the entire session as well.
+        event_lock = getattr(self._dio, "_event_lock", None)
+        if event_lock is not None:
+            with event_lock:
+                for name in ("_event_history", "_all_events_history"):
+                    if hasattr(self._dio, name):
+                        setattr(self._dio, name, deque(maxlen=50000))
         self._callback = callback
 
         # The bringup driver's start_streaming() queries the current timestamp on
@@ -285,6 +295,8 @@ class StreamDIOClient:
     ) -> None:
         host_mono_s = time.perf_counter()
         host_wall_s = time.time()
+        if event_type == "camera":
+            self._camera_events.append((int(timestamp_us), float(relative_time)))
         if (
             event_type == "diagnostic"
             and channel is not None
@@ -554,6 +566,9 @@ class StreamDIOClient:
                     }
                 except Exception as exc:
                     status[f"{name}_error"] = f"{type(exc).__name__}: {exc}"
+        speaker_pin = status.get("speaker_status", {}).get("pin")
+        if speaker_pin is not None:
+            status["module_info"]["speaker_pin"] = speaker_pin
         return status
 
     def configure_cap_touch_digitizer(
@@ -623,11 +638,8 @@ class StreamDIOClient:
         return dict(self._last_buffer_stats)
 
     def get_camera_events(self) -> list[tuple[int, float]]:
-        """Return (timestamp_us, relative_s) for camera TTL events in history."""
-        if self._dio is None:
-            return []
-        events = self._dio.get_event_history(event_types=["camera"])
-        return [(int(e[3]), float(e[-1])) for e in events]
+        """Return camera TTLs without scanning/copying the 1 kHz analog history."""
+        return list(self._camera_events)
 
     def close(self) -> None:
         if self._dio is None:

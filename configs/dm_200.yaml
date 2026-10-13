@@ -28,6 +28,9 @@ reward:
   opposite_pump_s: 0.04
 
 licks:
+  source: capacitive
+  bpod_port: 1
+  optical_clock: streamdio
   channels: [14]
   high_only: true
   power_output_channel: 13
@@ -51,6 +54,7 @@ display:
   choice_distance_deg: 35.0
   choice_center_threshold_deg: 1.0
   rotated_choice_axis: true
+  invert_wheel_movement: true
   display_index: 1
   auto_size_to_display: true
   window_x:
@@ -99,7 +103,7 @@ monitor:
   force_sample_hz: 80.0
   wheel_sample_hz: 60.0
   screen_fps: 12.0
-  camera_fps: 10.0
+  camera_fps: 15.0
   camera_preview_width: 520
   camera_preview_height: 390
   task_preview_width: 220

@@ -5,6 +5,7 @@ from itertools import groupby
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from hf_dm.config import SessionConfig, TrainingPhase
 from hf_dm.data.session_export import session_bundle_dir
@@ -499,7 +500,8 @@ def test_simulated_session_annotates_reward_volume_without_changing_pump_time(tm
         assert np.isnan(volumes[2])
 
 
-def test_simulated_centering_requires_wheel_motion_and_rewards_at_center(tmp_path):
+@pytest.mark.parametrize("invert_movement", [False, True])
+def test_simulated_centering_requires_wheel_motion_and_rewards_at_center(tmp_path, invert_movement):
     os.environ["SDL_VIDEODRIVER"] = "dummy"
     config = SessionConfig(
         phase=TrainingPhase.CENTERING,
@@ -507,6 +509,7 @@ def test_simulated_centering_requires_wheel_motion_and_rewards_at_center(tmp_pat
         random_seed=1,
         results_dir=str(tmp_path),
     )
+    config.display.invert_wheel_movement = invert_movement
     config.camera.save_dir = str(tmp_path / "videos")
     shorten_for_simulation(config)
     session = SimulatedHFDecisionSession(config, SimulationOptions(choice_mode="matched"))
@@ -632,10 +635,13 @@ def test_simulated_frame2ttl_barcode_diagnostic_decodes_all_cases(tmp_path):
     assert diagnostic_end.payload["all_match"]
 
 
-def test_simulated_bpod_opcode_diagnostic_reports_marker_sequence(tmp_path):
+@pytest.mark.parametrize("memory_mode", ["full", "bounded"])
+def test_simulated_bpod_opcode_diagnostic_reports_marker_sequence(tmp_path, memory_mode):
     os.environ["SDL_VIDEODRIVER"] = "dummy"
     config = SessionConfig(n_trials=1, results_dir=str(tmp_path))
     config.camera.save_dir = str(tmp_path / "videos")
+    config.session_export.streamdio_memory_mode = memory_mode
+    config.session_export.streamdio_recent_events = 1
     shorten_for_simulation(config)
     session = SimulatedHFDecisionSession(
         config,

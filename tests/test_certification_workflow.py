@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from hf_dm.certification import AnimalUseGateError, certified_config_sha256
-from hf_dm.certification_gui import CertificationDialogResult
+from hf_dm.certification_gui import CertificationDialogResult, readiness_rows
 from hf_dm.certification_workflow import (
     append_gui_audit,
     apply_operator_state,
@@ -24,6 +24,63 @@ from hf_dm.cli import (
     main as cli_main,
 )
 from hf_dm.config import SessionConfig
+
+
+def test_setup_close_requests_stop_without_destroying_active_process(tmp_path):
+    from types import SimpleNamespace
+    from hf_dm.certification_gui import _request_certification_stop
+    path = tmp_path / "check.stop"
+    running = {"process": SimpleNamespace(poll=lambda: None), "stop_path": path}
+    assert _request_certification_stop(running)
+    assert path.exists() and running["close_requested"]
+    assert _request_certification_stop(running)  # Repeated close remains idempotent.
+
+
+def test_finished_or_idle_setup_needs_no_stop_request():
+    from types import SimpleNamespace
+    from hf_dm.certification_gui import _request_certification_stop
+    assert not _request_certification_stop({})
+    assert not _request_certification_stop({"process": SimpleNamespace(poll=lambda: 0)})
+
+
+def test_cancelled_certification_does_not_start_another_diagnostic(tmp_path, monkeypatch):
+    import subprocess
+    from hf_dm.rig_certification import _run_cli_diagnostic
+    path = tmp_path / "check.stop"
+    path.touch()
+    monkeypatch.setenv("HF_DM_STOP_REQUEST", str(path))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("hardware diagnostic started after Cancel"))
+    result = _run_cli_diagnostic(name="outputs", config_path=tmp_path / "task.yaml",
+                                 config=SessionConfig(), arguments=["--hardware-self-test"])
+    assert result["status"] == "FAIL" and "not started" in result["error"]
+
+
+def test_missing_certificate_groups_only_dependent_failures_and_preserves_report():
+    import copy
+    names = ["certification_readable", "certification_schema", "certification_status", "certification_current",
+             "exact_release_identity", "certified_checks_all_pass", "human_approvals", "certified_hardware_identity_complete",
+             "reward_calibration", "subject_welfare", "local_durable_storage"]
+    report = {"status": "FAIL", "checks": [{"name": name, "status": "FAIL", "detail": name} for name in names]}
+    original = copy.deepcopy(report)
+    rows = readiness_rows(report)
+    assert len(rows) == 4
+    assert any("Water calibration" in detail for _, detail in rows)
+    assert any("Subject setup" in detail for _, detail in rows)
+    assert any("Data directory" in detail for _, detail in rows)
+    assert report == original
+
+
+def test_readable_certificate_keeps_distinct_failure_actions_and_unknown_checks():
+    report = {"status": "FAIL", "checks": [
+        {"name": "certification_readable", "status": "PASS"},
+        {"name": "certification_current", "status": "FAIL"},
+        {"name": "human_approvals", "status": "FAIL"},
+        {"name": "future_check", "status": "FAIL"},
+    ]}
+    rows = readiness_rows(report)
+    assert len(rows) == 3
+    assert any("future check" in detail for _, detail in rows)
+    assert readiness_rows({"status": "PASS", "checks": [{"name": "future_check", "status": "PASS"}]}) == []
 
 
 def _config(tmp_path: Path) -> SessionConfig:

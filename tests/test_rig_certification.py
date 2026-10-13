@@ -9,6 +9,25 @@ from hf_dm.certification import REQUIRED_CERTIFICATION_CHECKS
 from hf_dm.rig_certification import run_rig_certification
 
 
+def test_optical_certification_requires_both_edges_on_selected_clock():
+    from hf_dm.config import SessionConfig
+    from hf_dm.certification import required_certification_checks
+    from hf_dm.rig_certification import _machine_checks
+    config = SessionConfig()
+    config.licks.source = "optical"
+    config.licks.optical_clock = "streamdio"
+    assert "cap_touch" not in required_certification_checks(config)
+    assert "optical_lick" in required_certification_checks(config)
+    for clock, values, passed in [("bpod_session", [0, 1], False), ("streamdio", [1], False),
+                                  ("streamdio", [1, 0], True)]:
+        events = [{"event_type": "lick_edge", "payload": {
+            "source": "bpod_optical", "clock": clock, "value": value,
+        }} for value in values]
+        checks = _machine_checks({"preflight": {"status": "PASS", "session": {"events": events}}}, {}, config)
+        lick = next(check for check in checks if check["name"] == "optical_lick")
+        assert (lick["status"] == "PASS") is passed
+
+
 CONFIRMATIONS = {
     "no_animal_present": True,
     "collection_vessel_installed": True,
@@ -258,8 +277,9 @@ def test_certify_rig_refuses_missing_pre_actuation_confirmations(tmp_path):
         )
 
 
+@pytest.mark.parametrize("missing_identity", [None, "runtime_code_identity_scheme", "runtime_code_sha256", "python_version"])
 def test_certify_rig_emits_gate_consumable_pass_only_with_complete_evidence(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, missing_identity
 ):
     config = _write_config(tmp_path)
     evidence_path = tmp_path / "physical.json"
@@ -291,9 +311,13 @@ def test_certify_rig_emits_gate_consumable_pass_only_with_complete_evidence(
     )
     monkeypatch.setattr(
         "hf_dm.rig_certification.build_release_identity",
-        lambda _config: {
+        lambda _config: {key: value for key, value in {
             "git_commit": "a" * 40,
-            "git_exact_tag": "v0.1.0-animal-ready",
+            "git_exact_tag": None,
+            "runtime_code_identity_scheme": "hf_dm_package_tree_v1",
+            "runtime_code_sha256": "f" * 64,
+            "python_version": "3.12.test",
+            "streamdio_driver_sha256": "e" * 64,
             "git_dirty": False,
             "requirements_lock_sha256": "b" * 64,
             "package_versions": {"bpod-core": "0.1.0a12"},
@@ -301,7 +325,7 @@ def test_certify_rig_emits_gate_consumable_pass_only_with_complete_evidence(
             "calibration_sha256": "d" * 64,
             "hardware_failsafe_revision": "watchdog-r2",
             "streamdio_driver": {"module_path": "C:/vendor/streamdio.py"},
-        },
+        }.items() if key != missing_identity},
     )
 
     report = run_rig_certification(
@@ -311,11 +335,16 @@ def test_certify_rig_emits_gate_consumable_pass_only_with_complete_evidence(
         command_runner=_fake_runner,
     )
 
-    assert report["status"] == "PASS"
+    expected = "FAIL" if missing_identity else "PASS"
+    assert report["status"] == expected
+    if missing_identity:
+        check = next(item for item in report["checks"] if item["name"] == "release_identity_complete")
+        assert check["status"] == "FAIL"
+        assert missing_identity in check["detail"]["missing"]
     assert report["hardware"]["camera"]["serial_number"] == "20137635"
     assert report["hardware"]["bpod"]["firmware"] == [23, 10]
     saved = json.loads((tmp_path / "rig.json").read_text(encoding="utf-8"))
-    assert saved["status"] == "PASS"
+    assert saved["status"] == expected
     assert {item["name"] for item in saved["checks"]} >= REQUIRED_CERTIFICATION_CHECKS
 
 

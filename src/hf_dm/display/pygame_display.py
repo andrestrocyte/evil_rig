@@ -17,6 +17,25 @@ from hf_dm.fsm.runtime import Shape, Side
 Direction = Literal["cw", "ccw"]
 
 
+class FrameClock:
+    """Pace using a high-resolution sleep, without integer-ms drift or busy waits."""
+
+    def __init__(self) -> None:
+        self.previous = time.perf_counter()
+
+    def tick(self, fps: float) -> float:
+        now = time.perf_counter()
+        if fps > 0:
+            remaining = self.previous + 1.0 / fps - now
+            if remaining > 0:
+                time.sleep(remaining)
+                now = time.perf_counter()
+        elapsed = now - self.previous
+        # Do not shorten a subsequent frame to catch up after a stall.
+        self.previous = now
+        return elapsed * 1000
+
+
 @dataclass
 class DisplayBounds:
     x: int
@@ -134,7 +153,7 @@ class TaskDisplay:
         self.screen = pygame.display.set_mode((self.width, self.height), flags)
         pygame.display.set_caption("HF Decision-Making Task")
         pygame.mouse.set_visible(False)
-        self.clock = pygame.time.Clock()
+        self.clock = FrameClock()
         self.font = pygame.font.Font(None, 28)
         self.small_font = pygame.font.Font(None, 22)
         self._decision_shapes, self.shape_bright_pixel_counts = self._make_decision_shapes()
@@ -255,7 +274,7 @@ class TaskDisplay:
         self._pump_quit()
         self.screen.fill(self.config.background_rgb)
         self._draw_targets()
-        center = self._shape_center(signed_position_deg)
+        center = self._shape_center(self.config.wheel_to_screen_deg(signed_position_deg))
 
         if outcome == "matched":
             color = self.config.matched_rgb
@@ -470,6 +489,8 @@ class TaskDisplay:
             self.screen.blit(surf, (14, 14 + idx * 24))
 
     def _triangle(self, center: tuple[int, int], direction: Direction) -> list[tuple[int, int]]:
+        if self.config.invert_wheel_movement:
+            direction = "ccw" if direction == "cw" else "cw"
         cx, cy = center
         radius = self.shape_radius_px
         short = int(radius * 0.82)

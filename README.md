@@ -19,6 +19,48 @@ post-session quality control.
 
 ---
 
+## Windows rig launcher
+
+For daily Windows operation, open **evil_rig** on the desktop or double-click
+`Start-Rig.cmd`. Choose the subject, trial counts and lick sensor, then **Start
+session**. **Check rig** runs a finite bench check (about 50 seconds here);
+**Watch inputs (20 s)** displays physical sensor responses. **Stop** saves the
+interrupted session and verifies cleanup. These diagnostics are on-demand;
+ordinary sessions retain lightweight acquisition health checks.
+
+Use **Rig setup** for the calibration and certification window. It uses the
+selected task profile, lick sensor and data directory, and keeps its own log.
+Session controls stay disabled until setup closes. The setup screen groups
+consequences of a missing certificate into one actionable item; **Show full
+diagnostic report** retains every underlying check. Opening or closing setup does
+not certify the rig or start a task. Cancel during certification requests a
+cooperative stop, waits for the active check to finish cleanup, and prevents later
+diagnostics from starting. Calibrate and commission the rig when needed; ordinary
+sessions reuse valid evidence rather than repeating the full setup.
+
+Stop allows 30 seconds for hardware shutdown. After verified cleanup, large
+exports get a separate five-minute limit; saved-data validation also runs with a
+five-minute timeout in its own process. A timed-out writer leaves recovery data
+intact and reports failure.
+
+To install a new checkout with Python 3.12 and the camera SDK already installed:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_rig.ps1
+```
+
+This creates a local `.venv`, installs locked runtime dependencies and the pinned
+StreamDIO driver, and adds a desktop shortcut. Add `-Dev` for test tools. Each
+launch saves its configuration, console log, result and data validation under
+`data/runtime/operator/runs/`; session bundles go to the selected data directory.
+Animal mode retains the existing calibration, welfare and rig certification
+requirements. See [current audit evidence and limits](docs/QUALITY_AUDIT_2026_10.md).
+
+The camera records every received frame at the configured trigger rate. The GUI
+uses a separate 15 fps preview of recent frames; on this rig its measured host
+frame age is about 74 ms median / 89 ms p95. Preview timing is not the acquisition
+timestamp. The saved session compares frame counts with recorded camera triggers.
+
 ## Table of contents
 
 - [Why this repo](#why-this-repo)
@@ -94,12 +136,12 @@ flowchart TB
         REC["SessionRecorder<br/>NPZ / JSON / journal"]
         CAM["Headless Spinnaker<br/>video recorder"]
         MON["Operator monitor<br/>(separate process)"]
-        SND["PC white noise +<br/>pin-27 gate (timeout)"]
+        SND["PC white noise +<br/>pin-26 gate (timeout)"]
     end
 
     subgraph BPOD["Bpod State Machine"]
         FSM["Trial FSM<br/>quiescence / choice / reward / timeout"]
-        GATE["Serial action<br/>pin-27 speaker gate"]
+        GATE["Serial action<br/>pin-26 speaker gate"]
     end
 
     subgraph SDIO["StreamDIO module"]
@@ -155,7 +197,7 @@ stateDiagram-v2
     RewardLow --> PostRewardLow: Tup (pump on)
     PostRewardHigh --> [*]: Tup (post_reward_s)
     PostRewardLow --> [*]: Tup (post_reward_s)
-    TimeoutNoise --> PostTimeout: Tup (white noise on pin 27)
+    TimeoutNoise --> PostTimeout: Tup (white noise on pin 26)
     PostTimeout --> [*]: Tup (noise off)
 ```
 
@@ -167,7 +209,7 @@ stateDiagram-v2
    timeout.
 3. **Choice:** when a shape is centered, Python sends one high/low SoftCode. Bpod enters the blank
    state, turns force off, waits `choice_blank_s`, runs the pump state, then holds `post_reward_s`.
-4. **Timeout:** Bpod enters the timeout state, gates audible white noise on pin 27 for
+4. **Timeout:** Bpod enters the timeout state, gates audible white noise on pin 26 for
    `timeout_noise_s`, then holds `post_timeout_s`.
 5. After the FSM completes, the host holds a black screen for `inter_trial_min_s` (default 3 s,
    logged as `iti_start`/`iti_end`), then a fresh FSM starts the next trial.
@@ -184,6 +226,11 @@ events asynchronously and does not re-actuate during normal trials.
 
 ## Hardware contract
 
+The rig configs set `display.invert_wheel_movement: true` to reverse wheel-driven
+screen movement. This setting preserves CW force on pin 21 and CCW force on pin 19,
+and preserves the encoder's CW/CCW pulse labels. Choice and reward mapping follow
+the shape moved to the center. Set it to `false` for the original screen direction.
+
 All channels/pins match the `MM_PyBpod2` bringup notebooks. **Ports default to `AUTO`** with the
 same discovery logic as the screen task.
 
@@ -198,12 +245,16 @@ same discovery logic as the screen task.
 | Cap-touch power | output ch13 | pin 15 | `cap_touch_bringup_pin15_power_pin14_touch.ipynb` |
 | Lick (cap-touch) | input ch14 | pin 25 | `cap_touch_bringup_pin15_power_pin14_touch.ipynb` |
 | Camera TTL | StreamDIO 30 Hz, 10 ms | pin 32 | `camera_bringup_pin32_ttl.ipynb` |
-| Speaker gate | Bpod Serial1 action | pin 27 | `speaker_bringup_pin27_whitenoise.ipynb` |
+| Speaker gate | Bpod Serial1 action | pin 26 | `speaker_bringup_pin27_whitenoise.ipynb` (original pin 27, remapped in this firmware) |
 | Frame2TTL v3 | DI05 (input ch5) | pin 6 | `frame2ttl_v3_bringup_di05_pin6.ipynb` |
 
 **Notes**
 
-- Cap-touch power is held high for the whole session; lick edges on input ch14 are stored both as
+- The BMC applies resistance while the wheel is turned by hand. Check it by gently
+  turning the wheel during a labelled force interval; a stationary, unloaded ADC
+  reading of zero does not establish whether resistance is enabled. Keep physical
+  force calibration separate from digital output verification.
+- When capacitive touch is selected, its power is held high for the whole session; lick edges on input ch14 are stored both as
   raw module-timestamped events and as explicit `lick` session events.
 - The firmware streams **one** analog input at a time, so force stays on AI13 and the vendored
   StreamDIO firmware (`firmware/`) digitizes cap-touch pin 25 locally into channel-14 high/low
@@ -255,6 +306,29 @@ Install the **Teledyne/FLIR Spinnaker SDK** and set `camera.backend: spinnaker`.
 bringup trigger contract (`FrameStart`, `Line0`, rising edge, `TriggerWidth` exposure). With
 `camera.required: true`, the task refuses to run if recording cannot start.
 
+Both backends save Mono8 pixels directly as full-resolution, lossless PGM and
+publish previews before writing the image. The preview keeps the latest frame;
+the recording preserves all acquired frames. Required enum/bool settings and ROI
+are checked by readback. ROI changes restore the original crop on failure;
+unspecified ROI values retain the camera's current crop. Recording metadata and
+the startup journal distinguish requested ROI from actual settings, including
+gain and gamma state. Float readbacks preserve camera quantization. Exposure is
+controlled by the StreamDIO trigger width; `ExposureTime` readback describes the
+temporary Timed-mode setting, not a separate measurement of exposure duration.
+
+`frame_timestamps.csv` retains its existing camera timestamp and post-save host
+columns. New `received_wall_time_s` and `received_monotonic_s` columns record host
+receipt immediately after image acquisition, before preview/copy/save work.
+Neither host timestamp is the physical exposure time; use camera and StreamDIO
+timestamps for scientific timing. Non-Mono8 formats retain SDK saving.
+
+Startup failures release the resources already opened and preserve the original
+error. Shutdown releases images before cameras and SDK resources; a failed release
+retains its handle for a retry and prevents a successful cleanup report. Recording
+summaries separate the current `cleanup_error` from `cleanup_error_history`, which
+survives successful retries. Create a new recorder for each recording; restarting
+the same instance is rejected before it can overwrite frames or timestamp files.
+
 Teledyne distributes `PySpin` separately from PyPI. Install only the `spinnaker_python` wheel whose
 SDK version, operating system, architecture, and CPython tag exactly match the rig (for the installed
 Spinnaker 4.0.0.116 SDK, the vendor Windows wheel is a CPython 3.10 build). Do **not** install the
@@ -288,9 +362,18 @@ Drop `--simulate-headless` to open the pygame window. Choice modes: `matched`, `
 `timeout`, `cw`, `ccw`, `alternate` (in the DM task, *matched* = star/high-effort, *opposite* =
 circle/low-effort).
 
-**3. On the rig**, preflight first. The shipped animal profiles are intentionally fail-closed: a
-session will not open hardware until the exact tagged release/config/calibration has a current PASS
+**3. On the rig**, use preflight during setup or troubleshooting. The shipped animal profiles are intentionally fail-closed: a
+session will not open hardware until the exact release/config/calibration has a current PASS
 certificate and the operator confirms that this is an animal-use run.
+
+Certification binds installed task/driver source hashes, dependencies and Python,
+effective hardware/task settings and calibration. A clean checkout is required;
+its commit is recorded and a Git tag is optional. Documentation/test-only commits
+can reuse commissioning when installed task bytes are unchanged. Subjects, session
+paths, random seeds and trial counts can change without repeating commissioning;
+the calibrated reward ceiling is checked against the selected trial count on
+every run. Changing sensor, modality, timing or reward settings still changes the
+certified configuration. Existing certificates need regeneration after this code update.
 
 ```bash
 python -m hf_dm.cli --config configs/dm_50.yaml --preflight --preflight-duration 2
@@ -311,7 +394,7 @@ hardware opens. Four profiles ship in `configs/`:
 | Profile | Phase | Trials | Notable settings |
 |---------|-------|--------|------------------|
 | `centering_50.yaml` | `centering` | 50 | `centering_threshold_deg: 8.0` shaping |
-| `dm_50.yaml` | `decision_making` | 50 | full task, `streamdio_memory_mode: full` |
+| `dm_50.yaml` | `decision_making` | 50 | full task, bounded raw-event working history |
 | `dm_100.yaml` | `decision_making` | 100 | standard volume |
 | `dm_200.yaml` | `decision_making` | 200 | `streamdio_chunk_s: 45`, `streamdio_memory_mode: bounded` |
 
@@ -358,7 +441,7 @@ recorded in `session_export.cli_overrides` and the config snapshot.
 ### Session setup dialog
 
 By default, `hf-dm.cli` opens a small Tk dialog to choose the **mouse folder**, **modality**,
-**profile**, **free/forced trial counts**, and **session name** before the task starts. Bundled
+**profile**, **free/forced trial counts**, **lick sensor**, and **session name** before the task starts. Bundled
 profiles:
 
 | Profile | Free | Forced |
@@ -374,6 +457,57 @@ python -m hf_dm.cli --config configs/dm_50.yaml --no-session-dialog \
   --session-mouse-dir data/sessions/mouse01 --session-modality force \
   --session-profile "50 50/50" --session-name 20260629_force_5050
 ```
+
+### Selecting the lick sensor
+
+Both sensors can remain connected. Choose `capacitive` (default) or `optical` in the session
+setup dialog, or pass `--lick-source optical --lick-port 1` with `--no-session-dialog`.
+The selected source supplies the GUI lick indicators, session lick events, and trial counts;
+the other source does not contribute lick counts. The saved config records the selection.
+
+For the Sanworks optical lickometer, connect **Bpod behavior port 1 → RJ45 cable → port
+interface board → photogate**. Keep StreamDIO on Bpod **module port 1**, and leave the
+capacitive signal on StreamDIO pin 25. See the official
+[lickometer assembly](https://sanworks.github.io/Bpod_Wiki/assembly/lickometer-assembly/) and
+[port interface board assembly](https://sanworks.github.io/Bpod_Wiki/assembly/port-breakout-board-assembly/) instructions.
+The lickometer receives power through the port interface board. This task does not operate
+that board's valve or cue LED; reward delivery remains on the StreamDIO pump output.
+
+```yaml
+licks:
+  source: optical       # capacitive or optical
+  bpod_port: 1          # behavior port, not module port
+  optical_clock: streamdio  # bpod: original edges; streamdio: forwarded receipt timestamps
+  channels: [14]        # StreamDIO inputs used only for capacitive touch
+```
+
+Optical `Port1_High` counts a lick and `Port1_Low` clears the indicator (`high_only: true`).
+MATLAB-style `Port1In`/`Port1Out` names are also supported. Both
+edges retain Bpod hardware timestamps in the lick event log, with `source: bpod_optical`
+and `clock: bpod_session`; these timestamps use Bpod's session clock, while capacitive
+events use StreamDIO's clock. An output-free Bpod observation state captures optical
+events during ITIs and preflight. Short host gaps between state machines are not recorded.
+Capacitive power is switched off for optical sessions. No StreamDIO firmware change is needed.
+
+For unchanged wiring and a StreamDIO timestamp, select `streamdio` under **Optical timestamp
+clock** in session setup, or pass `--lick-source optical --lick-clock streamdio --lick-port 1`.
+Bpod records the physical edge; Python forwards one `['I', 'P', port, state]` marker through
+Bpod's existing module UART connection. StreamDIO firmware 5 already timestamps these
+markers as raw `port_input` events. The GUI and trial lick counts use the paired receipt.
+Only one marker is outstanding, and missing/mismatched receipts stop acquisition rather
+than silently substituting a timestamp from another clock. Reward, force and state timers
+continue to run on Bpod without additional lick-related state transitions.
+
+**Timing meaning:** `timestamp_us` is the StreamDIO UART-receipt time, not the original
+photogate edge time. This route includes Bpod-to-PC, host polling, and return USB/UART delay.
+`bpod_timestamp_us`, `bpod_relative_time_s`, and the original raw Bpod row preserve the
+physical edge time. `timestamp_origin: streamdio_uart_receive` and `relay_receipt_wait_s`
+identify receipt timestamps and the send-to-receipt host interval; that interval does not
+measure the entire edge-to-receipt delay. Both clocks are exported in `licks.csv` and the
+journal. Use the original Bpod timestamps for precise lick intervals. A physical split to
+a voltage-converted StreamDIO input would be required for direct same-clock edge capture.
+Shipped YAML files prefer StreamDIO receipts; older configs without `optical_clock` keep
+the working Bpod edge-time path. Capacitive licks remain direct StreamDIO events.
 
 ### Training stages
 
@@ -426,7 +560,8 @@ readout.
 ### Animal-use release gate
 
 The production YAML files set `animal_use.enabled: true`. Startup is blocked unless all of these
-match the current run: a clean exact Git tag and commit, dependency lock, config hash, reward
+match the current run: installed task/driver hashes from a clean checkout, dependency lock,
+package/Python versions, config hash, reward
 calibration hash and fit quality, hardware failsafe revision, Bpod/StreamDIO/camera identities,
 current subject weight/water limits, required peripherals, signed approvals, and a current
 all-PASS rig certificate. `WARN` never satisfies this gate.
@@ -576,9 +711,29 @@ triggers).
 
 ### Long sessions
 
-`dm_200` sets `streamdio_chunk_s: 45` and `streamdio_memory_mode: bounded`: the live task keeps only
-the most recent `streamdio_recent_events` rows in memory, writes completed chunks in a daemon thread,
-and reconstructs the full primary NPZ/CSV/timeline from those chunks at finalize.
+All shipped profiles bound the raw-event working history to about 50,000 recent
+rows. Every raw event is written to the recovery journal (WAL); final NPZ/CSV
+exports retain the full stream. `dm_200` also writes optional 45-second NPZ chunks.
+Bounding memory does not require those extra chunks. Finalization writes the raw
+NPZ array in 8,192-row blocks and streams CSV output; validation also reads the
+compressed raw array in blocks. The formats and raw timestamps are unchanged.
+Semantic event arrays and JSON-array members also stream, using at most 4 MiB of
+array data per block (or one row if a single record is larger). Unicode widths,
+field order and values retain the established NumPy representation. The JSON
+sidecar streams its text and shares the already-built event dictionaries with
+cold exports. Validation reads every semantic-array block, checks counts and JSON
+payloads, and rejects truncation, trailing bytes and object/pickle arrays.
+Optional chunk output has a two-block queue. If it falls behind, the complete WAL
+supplies final exports; if its writer cannot finish, recovery files are retained
+instead of publishing a completed session.
+
+The rig checks available space before connecting and every two seconds during
+acquisition, stopping through normal cleanup when a recording volume falls below
+2 GiB free. Full-resolution uncompressed video still needs substantial space
+(about 2.8 GB/min on the installed camera). This reserve is a guard, not a promise
+that every possible session's exports will fit. Semantic events, camera timelines
+and heartbeat analysis still grow with session length. Normal finalization and
+crash recovery both stream the high-rate raw records without full in-memory copies.
 
 ### Inspecting a session
 
@@ -671,9 +826,51 @@ the marker, or the journal:
 hf-dm recover-session data/sessions/decision_making/mouse01/2026-06-28/001
 ```
 
-Recovery preserves the original journal, repairs a truncated final line, restores completed trials +
-Bpod rows, folds in completed StreamDIO chunks, atomically rewrites NPZ/JSON, and runs the manifest
-validator. The marker is removed only after primary writes and exports succeed.
+New recordings declare an initial empty raw WAL and journal a raw-event count
+after periodic WAL flushes, completed trials and final close. The default periodic
+interval is one second. Both disk flushes run outside the incoming-sample lock.
+The count is a lower bound on the data that must exist; the checkpoint also records
+whether the WAL filesystem flush succeeded or was unsupported.
+
+Recovery streams the journal and preserves its exact original bytes before repair.
+It repairs only an unfinished final record, including a torn UTF-8 character;
+a complete final row missing just its newline is kept. Malformed newline-terminated
+rows, invalid schemas and sequence gaps stop recovery. Backups are included in the
+manifest, and subsequent recovery attempts and offline exports verify their recorded
+checksums. Changed originals get separate backups. Copied sessions require the local
+backup files; old absolute paths remain provenance only.
+
+Recovery restores completed trials and Bpod rows and compares the WAL and completed chunks in
+blocks. Their common prefix must agree; missing chunk indices, corrupt chunks,
+or interior WAL checksum failures stop recovery explicitly. A damaged final WAL
+record can be excluded, with its byte count reported and an exact
+`.wal.recovery-backup` retained and hashed in the manifest.
+
+Before changing the journal or exports, recovery requires enough raw records to
+meet the latest checkpoint. A missing declared WAL with no chunks, a shortened
+stream, or a damaged already-checkpointed record fails explicitly. Complete chunks
+can supply a missing WAL. Recovery reports the verified lower bound; older journals
+without independent count evidence report `raw_checkpoint_verified: false`.
+The checks cannot establish how many uncheckpointed samples were lost after the
+last count was saved, or replace missing records. A prior recovery's saved count
+also remains a lower bound on subsequent retries.
+
+Recovery retains existing chunks and writes any missing suffix synchronously in
+blocks of at most 8,192 events. It does not replay through the live writer queue
+or delete its input chunks. The regenerated NPZ/JSON/exports are validated before
+the WAL and incomplete marker are removed. Failed writes or validation leave the
+durable inputs and marker available for retry. Validation establishes consistency
+of the recovered records; it cannot recreate records that never reached storage.
+Recovery creates a manifest even if the original session disabled it, so this
+validation also works for sessions with optional exports turned off.
+
+Before deleting recovery inputs, recovery atomically checkpoints the validated
+manifest's checksum in the incomplete marker. If cleanup is interrupted, a retry
+verifies the saved bundle and finishes cleanup without rebuilding or replacing
+its data. Changed or missing completed artifacts stop the retry and retain the
+remaining evidence. A valid older bundle whose WAL was already deleted is also
+kept; an invalid older bundle with no WAL requires inspection instead of a blind
+rebuild. Checkpoints and backup references also work after copying a session.
 
 **Session QC.** `hf-dm session-qc` writes `session.qc.json` with PASS/WARN/FAIL for response rate,
 matched rate, response time, choice-loop stalls, and worst frame duration. Calibrated sessions also
@@ -696,7 +893,7 @@ timeline anchors, and stream/module/status consistency.
 ```bash
 pytest                              # hardware-free, headless
 ruff check src tests                # correctness lint
-mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_export.py
+mypy src/hf_dm/config.py src/hf_dm/data/recorder.py src/hf_dm/data/session_export.py src/hf_dm/data/raw_stream.py src/hf_dm/data/session_journal.py src/hf_dm/data/array_stream.py
 ```
 
 GitHub Actions runs Ruff, the stable-module mypy gate, and the full pytest suite on **Windows and
@@ -751,6 +948,7 @@ tests/                      # hardware-free pytest suite
 | bpod-core settings lock held | This task uses `data/runtime/bpod-core`; override with `HF_DM_BPOD_CORE_CONFIG_DIR`. Close the older `hf_dm.cli` process and rerun preflight |
 | StreamDIO `Access is denied` (COM7/COM8) | Another process owns the port — close notebooks/serial monitors/task processes; unplug/replug StreamDIO |
 | Detector LED changes but no licks | Flash the vendored `firmware/`; check cap-touch wiring/power, then thresholds |
+| Camera preview falls seconds behind | Both Mono8 backends now write raw PGM directly and preview from memory before saving, bypassing the slow SDK image encoder. The Video age indicator includes acquisition-to-GUI transit. See [rig bringup notes](docs/RIG_BRINGUP_2026_10.md) for measured results |
 | Frame2TTL sees no transitions | Run `--frame2ttl-diagnostic`; confirm the photodiode is over the lower-right patch |
 | No `bpod_state` markers | Run `--bpod-opcode-diagnostic` to verify state markers reach StreamDIO |
 

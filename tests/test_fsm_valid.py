@@ -248,7 +248,7 @@ def test_message_ids():
     assert ids.speaker_gate_on == 210
 
 
-def test_serial_relay_preloads_streamdio_state_markers():
+def test_serial_relay_preloads_rig_force_outputs_and_streamdio_state_markers():
     bpod = MagicMock()
     module = MagicMock()
     module.is_connected = True
@@ -256,13 +256,17 @@ def test_serial_relay_preloads_streamdio_state_markers():
     module.load_serial_message.return_value = True
     bpod.modules = {"Serial1": module}
 
-    SerialRelay(bpod, serial_channel_index=0)
+    relay = SerialRelay(bpod, serial_channel_index=0)
 
     module.set_relay.assert_called_once_with(False)
     loaded = {
         call.args[0]: list(call.args[1])
         for call in module.load_serial_message.call_args_list
     }
+    assert loaded[relay.ids.cw_force_on] == [3, 1]  # Teensy pin 21
+    assert loaded[relay.ids.cw_force_off] == [3, 0]
+    assert loaded[relay.ids.ccw_force_on] == [5, 1]  # Teensy pin 19
+    assert loaded[relay.ids.ccw_force_off] == [5, 0]
     assert loaded[STREAMDIO_STATE_MARKER_MESSAGE_IDS["Quiescence"]] == [
         STREAMDIO_BPOD_STATE_OPCODE,
         1,
@@ -273,22 +277,25 @@ def test_serial_relay_preloads_streamdio_state_markers():
     ]
 
 
-def test_serial_relay_sends_immediate_bytes_on_configured_output():
+@pytest.mark.parametrize("module_index", [0, 1, 2])
+def test_serial_relay_sends_immediate_bytes_using_raw_serial_protocol(module_index):
     bpod = MagicMock()
     module = MagicMock()
     module.is_connected = True
-    module.index = 0
+    module.index = module_index
     module.load_serial_message.return_value = True
-    serial_out = MagicMock()
-    bpod.modules = {"Serial1": module}
-    bpod.outputs = {"Serial1": serial_out}
+    module_name = f"Serial{module_index + 1}"
+    bpod.modules = {module_name: module}
 
-    relay = SerialRelay(bpod, serial_channel_index=0)
+    relay = SerialRelay(bpod, serial_channel_index=module_index)
     relay.send_bytes([5, 0, 3, 1], inter_byte_s=0)
 
     assert module.set_relay.call_count == 2
     assert all(call.args == (False,) for call in module.set_relay.call_args_list)
-    assert [call.args[0] for call in serial_out.override.call_args_list] == [5, 0, 3, 1]
+    assert [call.args[0] for call in bpod.serial0.write.call_args_list] == [
+        bytes((ord("T"), module_index + 1, 1, value)) for value in [5, 0, 3, 1]
+    ]
+    assert not bpod.outputs.mock_calls
 
 
 def test_serial_relay_clears_pending_input_before_bpod_run():

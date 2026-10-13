@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
-from hf_dm.config import SessionConfig
+from hf_dm.config import SessionConfig, TrainingPhase
 from hf_dm.hardware.bringup_constants import (
     CCW_FORCE_OUTPUT_CHANNEL,
     CW_FORCE_OUTPUT_CHANNEL,
@@ -311,9 +311,12 @@ class HardwareSelfTestSession(HFDecisionSession):
             (CW_FORCE_OUTPUT_CHANNEL, 0),
             (CCW_FORCE_OUTPUT_CHANNEL, 1),
             (CCW_FORCE_OUTPUT_CHANNEL, 0),
-            (self.config.licks.power_output_channel, 1),
-            (self.config.licks.power_output_channel, 0),
         }
+        if self.config.licks.source == "capacitive":
+            required_output_states.update({
+                (self.config.licks.power_output_channel, 1),
+                (self.config.licks.power_output_channel, 0),
+            })
         missing_outputs = sorted(required_output_states - output_states)
         if missing_outputs:
             fail(
@@ -324,7 +327,7 @@ class HardwareSelfTestSession(HFDecisionSession):
         noise_start_events = [event for event in events if event.event_type == "white_noise_start"]
         noise_end_events = [event for event in events if event.event_type == "white_noise_end"]
         if not noise_start_events or len(noise_start_events) != len(noise_end_events):
-            fail("white_noise_gate", "Bpod pin-27 timeout gate did not complete")
+            fail("white_noise_gate", "StreamDIO pin-26 timeout gate did not complete")
 
         video_events = [event for event in events if event.event_type == "video_recording_stopped"]
         video_frames = sum(int(event.payload.get("frames_saved", 0)) for event in video_events)
@@ -413,7 +416,7 @@ class HardwareSelfTestSession(HFDecisionSession):
             (
                 "white_noise_gate",
                 f"completed white-noise gate pulses={len(noise_end_events)}",
-                "Check Bpod pin 27 and the continuous sound source.",
+                "Check StreamDIO Teensy pin 26 and the continuous sound source.",
             ),
             (
                 "spinnaker_recording",
@@ -486,6 +489,10 @@ class HardwareSelfTestSession(HFDecisionSession):
 def shorten_for_hardware_self_test(config: SessionConfig) -> None:
     """Keep real reward durations while making the live diagnostic brief."""
     config.n_trials = 3
+    config.phase = TrainingPhase.DECISION_MAKING
+    config.task.modality = "force"
+    config.task.n_free_trials = 3
+    config.task.n_forced_trials = 0
     config.timing.quiescence_s = 0.05
     config.timing.inter_trial_min_s = 0.20
     config.timing.choice_timeout_s = 0.80

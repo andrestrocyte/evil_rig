@@ -14,7 +14,7 @@ from typing import Any, Callable
 from hf_dm.certification import (
     CERTIFICATION_KIND,
     CERTIFICATION_SCHEMA_VERSION,
-    REQUIRED_CERTIFICATION_CHECKS,
+    required_certification_checks,
     REQUIRED_HUMAN_APPROVALS,
     build_release_identity,
     probe_local_durable_storage,
@@ -95,21 +95,17 @@ def run_rig_certification(
                 config=config,
                 arguments=arguments,
             )
-        cap_report = output_path.with_name(f".{output_path.stem}.cap-touch.json")
-        runs["cap_touch"] = runner(
-            name="cap_touch",
-            config_path=source,
-            config=config,
-            arguments=[
-                "--cap-touch-diagnostic",
-                "--cap-touch-duration",
-                str(preflight_duration_s if cap_touch_duration_s <= 0 else cap_touch_duration_s),
-                "--cap-touch-report",
-                str(cap_report),
-            ],
-            report_path=cap_report,
-        )
-        cap_report.unlink(missing_ok=True)
+        if config.licks.source == "capacitive":
+            cap_report = output_path.with_name(f".{output_path.stem}.cap-touch.json")
+            runs["cap_touch"] = runner(
+                name="cap_touch", config_path=source, config=config,
+                arguments=[
+                    "--cap-touch-diagnostic", "--cap-touch-duration",
+                    str(preflight_duration_s if cap_touch_duration_s <= 0 else cap_touch_duration_s),
+                    "--cap-touch-report", str(cap_report),
+                ], report_path=cap_report,
+            )
+            cap_report.unlink(missing_ok=True)
     else:
         for name in (
             "preflight",
@@ -125,7 +121,7 @@ def run_rig_certification(
                 "error": "skipped because the configured results storage failed durability checks",
             }
 
-    machine_checks = _machine_checks(runs, storage)
+    machine_checks = _machine_checks(runs, storage, config)
     evidence = _load_physical_evidence(
         physical_evidence,
         now_s=started,
@@ -198,6 +194,9 @@ def _run_cli_diagnostic(
     arguments: list[str],
     report_path: Path | None = None,
 ) -> dict[str, Any]:
+    stop_request = os.environ.get("HF_DM_STOP_REQUEST")
+    if stop_request and Path(stop_request).exists():
+        return {"name": name, "status": "FAIL", "error": "Operator requested stop; diagnostic not started"}
     results_root = Path(config.results_dir).expanduser().resolve()
     before = {path.resolve() for path in results_root.rglob("session.json")} if results_root.exists() else set()
     command = [
@@ -258,6 +257,7 @@ def _run_cli_diagnostic(
 def _machine_checks(
     runs: dict[str, dict[str, Any]],
     storage: dict[str, Any],
+    config: SessionConfig | None = None,
 ) -> list[dict[str, Any]]:
     self_run = runs.get("hardware_self_test", {})
     self_report = self_run.get("self_test")
@@ -290,6 +290,18 @@ def _machine_checks(
     def result(name: str, passed: bool, detail: Any) -> dict[str, Any]:
         return {"name": name, "status": "PASS" if passed else "FAIL", "detail": detail}
 
+    lick_check = result(
+        "cap_touch", cap.get("detected_touch") is True and _transition_verified_off(cap.get("power_off")), cap,
+    )
+    if config is not None and config.licks.source == "optical":
+        events = (preflight.get("session") or {}).get("events", [])
+        edges = [event.get("payload", {}) for event in events if event.get("event_type") == "lick_edge"]
+        valid_edges = [edge for edge in edges if edge.get("clock") == config.licks.clock
+                       and edge.get("source") == "bpod_optical"]
+        lick_check = result("optical_lick", preflight.get("status") == "PASS"
+                            and {edge.get("value") for edge in valid_edges} == {0, 1},
+                            {"clock": config.licks.clock, "edges_seen": len(valid_edges), "preflight": preflight_end})
+
     return [
         result("preflight", preflight.get("status") == "PASS" and bool(preflight_end), preflight_end),
         result("storage_durability", storage.get("pass") is True, storage),
@@ -306,11 +318,7 @@ def _machine_checks(
             frame.get("detected") is True and barcode.get("all_match") is True,
             {"square": frame, "barcode": barcode},
         ),
-        result(
-            "cap_touch",
-            cap.get("detected_touch") is True and _transition_verified_off(cap.get("power_off")),
-            cap,
-        ),
+        lick_check,
         result("single_actuator_ownership", ownership.get("pass") is True, ownership),
         result(
             "streamdio_no_overrun",
@@ -393,7 +401,7 @@ def _merge_certification_checks(
                     by_name[name]["physical_evidence"] = incoming
             else:
                 by_name[name] = incoming
-    for name in REQUIRED_CERTIFICATION_CHECKS:
+    for name in required_certification_checks(config):
         if name not in by_name:
             by_name[name] = {
                 "name": name,
@@ -607,7 +615,10 @@ def _missing_release_identity(release: dict[str, Any]) -> list[str]:
         key
         for key in (
             "git_commit",
-            "git_exact_tag",
+            "runtime_code_identity_scheme",
+            "runtime_code_sha256",
+            "python_version",
+            "streamdio_driver_sha256",
             "requirements_lock_sha256",
             "package_versions",
             "config_sha256",

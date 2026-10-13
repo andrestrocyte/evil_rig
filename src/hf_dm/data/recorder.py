@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import queue
+import shutil
 import struct
 import subprocess
 import sys
@@ -15,15 +16,29 @@ import threading
 import time
 import zlib
 from collections import Counter, deque
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import ExitStack, closing
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import PackageNotFoundError, distribution as installed_distribution, version
+from itertools import islice, zip_longest
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
 
 from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
+from hf_dm.data.array_stream import BlockArray, StringArray
+from hf_dm.data.raw_stream import (
+    BLOCK_ROWS, RAW_DTYPE, ChunkRows, RawArray, RawRow, WalRows, write_npz,
+    WAL_MAGIC as _STREAMDIO_WAL_MAGIC,
+    WAL_MAGIC_V1,
+    WAL_PAYLOAD as _STREAMDIO_WAL_PAYLOAD,
+    WAL_RECORD,
+)
+from hf_dm.data.session_journal import (
+    backup_checksums, iter_journal, journal_backups, prepare_journal, scan_journal,
+)
 from hf_dm.timing_heartbeat import (
     analyze_timing_heartbeats,
     timing_heartbeat_qc_summary,
@@ -32,12 +47,47 @@ from hf_dm.timing_heartbeat import (
 Direction = Literal["cw", "ccw"]
 Choice = Literal["cw", "ccw", "timeout", "centering"]
 JournalMode = Literal["new", "resume", "disabled"]
-
-_STREAMDIO_WAL_MAGIC_V1 = b"HFDMSTR1\n"
-_STREAMDIO_WAL_MAGIC = b"HFDMSTR2\n"
-_STREAMDIO_WAL_PAYLOAD = struct.Struct("<24siiQdd")
+CHUNK_SHUTDOWN_TIMEOUT_S = 10.0
+# Retain the original private format aliases for existing diagnostics/tests.
+_STREAMDIO_WAL_MAGIC_V1 = WAL_MAGIC_V1
 _STREAMDIO_WAL_RECORD_V1 = _STREAMDIO_WAL_PAYLOAD
-_STREAMDIO_WAL_RECORD = struct.Struct("<24siiQddI")
+_STREAMDIO_WAL_RECORD = WAL_RECORD
+
+
+def _runtime_code_identity(package_root: Path) -> dict[str, Any]:
+    """Fingerprint installed task bytes, independent of repository-only changes."""
+    identity: dict[str, Any] = {
+        "runtime_code_identity_scheme": "hf_dm_package_tree_v1",
+        "runtime_code_sha256": None,
+    }
+
+    def fail_walk(error: OSError) -> None:
+        raise error
+
+    try:
+        digest = hashlib.sha256()
+        count = 0
+        for directory, directories, filenames in os.walk(package_root, onerror=fail_walk):
+            directories[:] = sorted(name for name in directories if name != "__pycache__")
+            for name in directories:
+                if (Path(directory) / name).is_symlink():
+                    raise OSError(f"Cannot fingerprint linked package directory: {name}")
+            for name in sorted(filenames):
+                source = Path(directory) / name
+                if source.suffix in {".pyc", ".pyo"}:
+                    continue
+                digest.update(source.relative_to(package_root).as_posix().encode("utf-8") + b"\0")
+                with source.open("rb") as handle:
+                    digest.update(hashlib.file_digest(handle, "sha256").digest())
+                count += 1
+        if count == 0:
+            raise OSError("Installed task package contains no source or asset files")
+        identity["runtime_code_sha256"] = digest.hexdigest()
+    except OSError as exc:
+        # Keep the scheme even on failure so certification cannot fall back to
+        # commit-only matching when installed bytes cannot be verified.
+        identity["runtime_code_error"] = f"{type(exc).__name__}: {exc}"
+    return identity
 
 
 def _git_identity(candidate: Path) -> dict[str, str | bool | None]:
@@ -137,7 +187,32 @@ def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
         if driver_spec is not None and driver_spec.origin:
             driver_path = Path(driver_spec.origin).resolve()
             streamdio_driver["module_path"] = str(driver_path)
-            streamdio_driver.update(_git_identity(driver_path.parent))
+            # A wheel inside this repo's .venv is not code from this repo's Git
+            # tree. PEP 610 records the actual pinned driver source revision.
+            try:
+                direct = json.loads(installed_distribution("MM-PybBod2").read_text("direct_url.json") or "{}")
+            except (PackageNotFoundError, ValueError):
+                direct = {}
+            streamdio_driver["source_url"] = direct.get("url")
+            vcs = direct.get("vcs_info", {})
+            if vcs.get("commit_id"):
+                streamdio_driver["git_commit"] = vcs["commit_id"]
+                streamdio_driver["identity_source"] = "installed_direct_url"
+            elif not any(part.lower() in {"site-packages", "dist-packages"} for part in driver_path.parts):
+                streamdio_driver.update(_git_identity(driver_path.parent))
+                streamdio_driver["identity_source"] = "editable_git_checkout"
+            # Bind the installed source bytes too: PEP 610 alone does not detect
+            # local edits to an installed wheel. Ignore paths and bytecode caches.
+            driver_files = (
+                sorted(driver_path.parent.rglob("*.py"))
+                if driver_path.name == "__init__.py" else [driver_path]
+            )
+            digest = hashlib.sha256()
+            for source in driver_files:
+                digest.update(source.relative_to(driver_path.parent).as_posix().encode("utf-8") + b"\0")
+                digest.update(hashlib.sha256(source.read_bytes()).digest())
+            if driver_files:
+                streamdio_driver["source_sha256"] = digest.hexdigest()
     except Exception:
         pass
 
@@ -152,6 +227,7 @@ def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
             pass
     return {
         **task_git,
+        **_runtime_code_identity(Path(__file__).resolve().parents[1]),
         "package_version": package_version,
         "package_versions": package_versions,
         "python_version": sys.version,
@@ -163,13 +239,20 @@ def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
     }
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_write_text(path: Path, text: str | Iterable[str]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
+            if isinstance(text, str):
+                handle.write(text)
+            else:
+                with ExitStack() as stack:
+                    chunks = iter(text)
+                    if close := getattr(chunks, "close", None):
+                        stack.callback(close)
+                    handle.writelines(chunks)
             handle.flush()
             fsync_best_effort(handle, path=temporary)
         os.replace(temporary, path)
@@ -185,7 +268,7 @@ def _atomic_write_npz(path: Path, **arrays: Any) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         with temporary.open("wb") as handle:
-            np.savez_compressed(handle, **arrays)
+            write_npz(handle, arrays)
             handle.flush()
             fsync_best_effort(handle, path=temporary)
         os.replace(temporary, path)
@@ -331,6 +414,7 @@ class SessionRecorder:
         self.debug_events_evicted = 0
         self.trials: list[TrialRecord] = []
         self.streamdio_events: list[tuple[str, int, int, int, float, float]] = []
+        self._recovery_streamdio_rows: Sequence[RawRow] | None = None
         self.bpod_trials: list[dict[str, Any]] = []
         self.fsm_definitions: dict[str, str] = {}
         self.metadata: dict[str, Any] = {}
@@ -345,16 +429,16 @@ class SessionRecorder:
             tuple[int | None, list[tuple[str, int, int, int, float, float]] | None]
         ] | None = None
         self._streamdio_chunk_thread: threading.Thread | None = None
+        self._streamdio_chunk_finish = threading.Event()
         self._streamdio_chunk_files: list[str] = []
         self._streamdio_chunk_error: str | None = None
-        self._streamdio_failed_chunk_rows: list[
-            tuple[str, int, int, int, float, float]
-        ] = []
         self._streamdio_memory_mode = "full"
         self._streamdio_memory_bounded = False
         self._streamdio_recent_max_events = 0
         self._streamdio_total_count = 0
         self._streamdio_counts: Counter[str] = Counter()
+        self._streamdio_channel_counts: Counter[tuple[str, int]] = Counter()
+        self._streamdio_index_lock = threading.Lock()
         self._max_event_count = 0
         self._max_trial_count = 0
         self._max_streamdio_event_count = 0
@@ -367,6 +451,9 @@ class SessionRecorder:
         self._streamdio_wal_path = self.base_path.with_suffix(".streamdio.wal")
         self._streamdio_wal_handle: Any = None
         self._streamdio_wal_lock = threading.Lock()
+        self._streamdio_wal_sync_lock = threading.Lock()
+        self._streamdio_wal_written_count = 0
+        self._streamdio_wal_checkpoint_count = -1
         self._streamdio_wal_fsync_s = 1.0
         self._streamdio_wal_fsync_stop = threading.Event()
         self._streamdio_wal_fsync_thread: threading.Thread | None = None
@@ -403,11 +490,8 @@ class SessionRecorder:
         if self._journal_mode == "resume":
             if not self._journal_path.exists():
                 raise FileNotFoundError(self._journal_path)
-            self._journal_sequence = sum(
-                1
-                for line in self._journal_path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            )
+            with self._journal_path.open(encoding="utf-8") as handle:
+                self._journal_sequence = sum(1 for line in handle if line.strip())
             self._journal_handle = self._journal_path.open(
                 "a",
                 encoding="utf-8",
@@ -415,6 +499,11 @@ class SessionRecorder:
                 buffering=1,
             )
             return
+        # A new journal declares this source even before the first raw event.
+        # Its absence after a crash must never be confused with an empty stream.
+        with self._streamdio_wal_path.open("xb", buffering=0) as wal:
+            wal.write(_STREAMDIO_WAL_MAGIC)
+            fsync_best_effort(wal, path=self._streamdio_wal_path)
         self._journal_handle = self._journal_path.open(
             "w",
             encoding="utf-8",
@@ -428,6 +517,8 @@ class SessionRecorder:
             "session_start_wall_s": self._session_start_wall,
             "session_start_mono_s": self._session_start_mono,
             **self.runtime_provenance,
+            "streamdio_wal": self._streamdio_wal_path.name,
+            "streamdio_checkpoint_version": 1,
         }
         self._journal_append("session_header", header, durable=True)
         _atomic_write_text(
@@ -463,9 +554,11 @@ class SessionRecorder:
             }
             self._journal_handle.write(json.dumps(row, separators=(",", ":")) + "\n")
             self._journal_handle.flush()
+            # The complete line already exists even if its durability flush
+            # fails. Reusing its sequence would corrupt subsequent error logs.
+            self._journal_sequence += 1
             if durable:
                 fsync_best_effort(self._journal_handle, path=self._journal_path)
-            self._journal_sequence += 1
 
     def close_journal(self) -> None:
         with self._journal_lock:
@@ -629,15 +722,22 @@ class SessionRecorder:
             self._set_streamdio_wal_background_error(exc)
             self.raise_if_background_error()
             raise AssertionError("unreachable")
-        self._streamdio_total_count += 1
-        self._streamdio_counts[row[0]] += 1
-        self.streamdio_events.append(row)
-        self._prune_streamdio_events_if_needed()
+        with self._streamdio_index_lock:
+            self._streamdio_total_count += 1
+            self._streamdio_counts[row[0]] += 1
+            self._streamdio_channel_counts[(row[0], row[1])] += 1
+            self.streamdio_events.append(row)
+            self._prune_streamdio_events_if_needed()
         self._max_streamdio_event_count = max(
             self._max_streamdio_event_count,
             len(self.streamdio_events),
         )
         self._buffer_streamdio_chunk(row)
+
+    def streamdio_counts_snapshot(self) -> Counter[tuple[str, int]]:
+        """Exact interval counts even when the in-memory stream is rolling."""
+        with self._streamdio_index_lock:
+            return self._streamdio_channel_counts.copy()
 
     def finalize(self, summary: SessionSummary) -> Path:
         if self._finalized:
@@ -646,10 +746,38 @@ class SessionRecorder:
         finalize_start = time.perf_counter()
         self.summary = summary
         self._append_session_water_log(summary)
+        camera = self.stream_summaries.get("spinnaker_video", {})
+        if "frames_saved" in camera:
+            # All producers have stopped before finalization. Use the complete
+            # counter, never the rolling cache or the recorder's wall duration.
+            triggers = self._streamdio_counts.get("camera", 0)
+            frames = int(camera["frames_saved"])
+            preview_only_simulation = (
+                self.metadata.get("run_mode") == "simulation"
+                and camera.get("backend") == "spinnaker_sim"
+                and frames == 0
+            )
+            alignment: dict[str, Any] = {
+                "status": "PASS" if frames == triggers and frames > 0 else "FAIL",
+                "recorded_triggers": triggers,
+                "saved_frames": frames,
+                "frame_count_minus_triggers": frames - triggers,
+                "count_source": "streamdio_camera_events",
+            }
+            if preview_only_simulation:
+                alignment.update(
+                    status="NOT_APPLICABLE",
+                    frame_count_minus_triggers=None,
+                    reason="Simulated camera provides previews without recording physical images",
+                )
+            self.register_stream("spinnaker_video", {**camera, "trigger_alignment": alignment})
+            self.log_event("camera_trigger_alignment", alignment)
         self.log_event("session_end", {"end_reason": summary.end_reason})
         self._journal_append("session_summary", asdict(summary), durable=True)
-        self.close_journal()
-        self._close_streamdio_wal(durable=True)
+        try:
+            self._close_streamdio_wal(durable=True)
+        finally:
+            self.close_journal()
         self.raise_if_background_error()
         self._finalize_streamdio_chunks()
 
@@ -657,10 +785,10 @@ class SessionRecorder:
         json_path = self.base_path.with_suffix(".json")
 
         trials_arr = self._trials_to_structured()
-        events_arr = self._events_to_structured()
+        events_arr = self._event_array()
         final_streamdio_events = self._streamdio_rows_for_finalize()
         self._discard_partial_streamdio_chunks()
-        streamdio_arr = self._streamdio_rows_to_structured(final_streamdio_events)
+        streamdio_arr = RawArray(final_streamdio_events)
         timing_heartbeat_qc = timing_heartbeat_qc_summary(
             analyze_timing_heartbeats(
                 final_streamdio_events,
@@ -675,29 +803,12 @@ class SessionRecorder:
                 trials=trials_arr,
                 events=events_arr,
                 streamdio_events=streamdio_arr,
-                bpod_trials_json=np.array(
-                    [json.dumps(trial) for trial in self.bpod_trials],
-                    dtype=str,
-                ),
-                trials_json=np.array(
-                    [json.dumps(asdict(trial), default=str) for trial in self.trials],
-                    dtype=str,
-                ),
-                events_json=np.array(
-                    [json.dumps(asdict(event), default=str) for event in self.events],
-                    dtype=str,
-                ),
-                debug_events_json=np.array(
-                    [json.dumps(asdict(event), default=str) for event in self.debug_events],
-                    dtype=str,
-                ),
-                fsm_definitions_json=np.array(
-                    [
-                        json.dumps({"fsm_name": name, "fsm_json": fsm_json}, default=str)
-                        for name, fsm_json in self.fsm_definitions.items()
-                    ],
-                    dtype=str,
-                ),
+                bpod_trials_json=StringArray(self.bpod_trials, json.dumps),
+                trials_json=StringArray(self.trials, lambda trial: json.dumps(asdict(trial), default=str)),
+                events_json=StringArray(self.events, lambda event: json.dumps(asdict(event), default=str)),
+                debug_events_json=StringArray(self.debug_events, lambda event: json.dumps(asdict(event), default=str)),
+                fsm_definitions_json=StringArray(self.fsm_definitions.items(), lambda item: json.dumps(
+                    {"fsm_name": item[0], "fsm_json": item[1]}, default=str)),
                 summary_json=np.array([json.dumps(asdict(summary))], dtype=str),
                 session_metadata_json=np.array(
                     [json.dumps(self.metadata, default=str)],
@@ -716,15 +827,16 @@ class SessionRecorder:
             except OSError:
                 pass
 
-        streamdio_counts = Counter(event[0] for event in final_streamdio_events)
-        if not streamdio_counts and self._streamdio_counts:
-            streamdio_counts = Counter(self._streamdio_counts)
+        streamdio_counts = Counter(self._streamdio_counts)
+        trial_dicts = [asdict(trial) for trial in self.trials]
+        event_dicts = [asdict(event) for event in self.events]
+        debug_event_dicts = [asdict(event) for event in self.debug_events]
         meta = {
             "summary": asdict(summary),
             "metadata": self.metadata,
-            "trials": [asdict(t) for t in self.trials],
-            "events": [asdict(e) for e in self.events],
-            "debug_events_recent": [asdict(e) for e in self.debug_events],
+            "trials": trial_dicts,
+            "events": event_dicts,
+            "debug_events_recent": debug_event_dicts,
             "debug_events": {
                 "ring_capacity": self.debug_events.maxlen,
                 "recent_count": len(self.debug_events),
@@ -751,7 +863,7 @@ class SessionRecorder:
         }
         if npz_error is not None:
             meta["npz_error"] = npz_error
-        _atomic_write_text(json_path, json.dumps(meta, indent=2))
+        _atomic_write_text(json_path, json.JSONEncoder(indent=2).iterencode(meta))
         artifact_bytes = 0
         for path in (npz_path, json_path):
             if path.exists():
@@ -773,9 +885,9 @@ class SessionRecorder:
                     base_path=self.base_path,
                     summary=summary,
                     metadata=self.metadata,
-                    trials=[asdict(trial) for trial in self.trials],
-                    events=[asdict(event) for event in self.events],
-                    debug_events=[asdict(event) for event in self.debug_events],
+                    trials=trial_dicts,
+                    events=event_dicts,
+                    debug_events=debug_event_dicts,
                     streamdio_events=final_streamdio_events,
                     bpod_trials=self.bpod_trials,
                     fsm_definitions=self.fsm_definitions,
@@ -822,7 +934,8 @@ class SessionRecorder:
                     export_error_path,
                     json.dumps({"error": export_error}, indent=2),
                 )
-        if json_path.exists() and npz_error is None and export_error is None:
+        if (json_path.exists() and npz_error is None and export_error is None
+                and self._recovery_streamdio_rows is None):
             try:
                 self._incomplete_marker_path.unlink(missing_ok=True)
                 self._streamdio_wal_path.unlink(missing_ok=True)
@@ -908,13 +1021,12 @@ class SessionRecorder:
             0,
             int(self.export_options.get("streamdio_recent_events", 50000) or 0),
         )
-        if self._streamdio_chunk_s <= 0.0:
-            self._streamdio_memory_bounded = False
-            self._streamdio_memory_mode = "full"
-            return
         self._streamdio_memory_bounded = requested_mode in {"bounded", "rolling", "chunked"}
         if self._streamdio_memory_bounded and self._streamdio_recent_max_events <= 0:
             self._streamdio_recent_max_events = 50000
+        # Every raw event is durably journaled regardless of optional NPZ chunks.
+        if self._streamdio_chunk_s <= 0.0:
+            return
         try:
             from hf_dm.data.session_export import session_bundle_dir
 
@@ -923,7 +1035,8 @@ class SessionRecorder:
                 session_bundle_dir(self.base_path, layout=layout) / "continuous_streams"
             )
             self._streamdio_chunk_dir.mkdir(parents=True, exist_ok=True)
-            self._streamdio_chunk_queue = queue.Queue()
+            self._streamdio_chunk_queue = queue.Queue(maxsize=2)
+            self._streamdio_chunk_finish.clear()
             self._streamdio_chunk_thread = threading.Thread(
                 target=self._streamdio_chunk_writer,
                 name="hf-dm-streamdio-chunk-writer",
@@ -939,7 +1052,6 @@ class SessionRecorder:
         self,
         row: tuple[str, int, int, int, float, float],
     ) -> None:
-        self._start_streamdio_wal_fsync_worker()
         event_type = row[0].encode("utf-8")
         if len(event_type) > 24:
             raise ValueError(f"StreamDIO event type exceeds WAL limit: {row[0]!r}")
@@ -966,6 +1078,8 @@ class SessionRecorder:
                 raise OSError(
                     f"Short StreamDIO WAL write: {written} of {len(record)} bytes"
                 )
+            self._streamdio_wal_written_count += 1
+        self._start_streamdio_wal_fsync_worker()
 
     def _start_streamdio_wal_fsync_worker(self) -> None:
         with self._streamdio_wal_lock:
@@ -981,8 +1095,6 @@ class SessionRecorder:
 
     def _streamdio_wal_fsync_loop(self) -> None:
         while not self._streamdio_wal_fsync_stop.wait(self._streamdio_wal_fsync_s):
-            if not self._streamdio_wal_path.exists():
-                continue
             try:
                 self._sync_streamdio_wal()
                 self._streamdio_wal_fsync_count += 1
@@ -1006,17 +1118,31 @@ class SessionRecorder:
         # the potentially slow filesystem flush after releasing that lock.  The
         # high-rate StreamDIO callback is therefore never held up by fsync.  The
         # absolute path remains as a fallback during recovery/finalization.
-        sync_fd: int | None = None
-        with self._streamdio_wal_lock:
-            if self._streamdio_wal_handle is not None:
-                sync_fd = os.dup(self._streamdio_wal_handle.fileno())
-        if sync_fd is not None:
-            with os.fdopen(sync_fd, "rb", buffering=0) as sync_handle:
-                return fsync_best_effort(sync_handle, path=self._streamdio_wal_path)
-        if not self._streamdio_wal_path.exists():
-            return True
-        with self._streamdio_wal_path.open("r+b", buffering=0) as sync_handle:
-            return fsync_best_effort(sync_handle, path=self._streamdio_wal_path)
+        # Serialize the sync/checkpoint pair so a concurrent trial flush cannot
+        # append an older checkpoint after a newer one. Appends do not take this
+        # lock, and neither disk flush holds the high-rate append lock.
+        with self._streamdio_wal_sync_lock:
+            if not self._streamdio_wal_path.exists():
+                raise FileNotFoundError(f"StreamDIO WAL disappeared: {self._streamdio_wal_path}")
+            sync_fd: int | None = None
+            with self._streamdio_wal_lock:
+                count = self._streamdio_wal_written_count
+                if self._streamdio_wal_handle is not None:
+                    sync_fd = os.dup(self._streamdio_wal_handle.fileno())
+            if sync_fd is not None:
+                with os.fdopen(sync_fd, "rb", buffering=0) as sync_handle:
+                    synced = fsync_best_effort(sync_handle, path=self._streamdio_wal_path)
+            else:
+                with self._streamdio_wal_path.open("r+b", buffering=0) as sync_handle:
+                    synced = fsync_best_effort(sync_handle, path=self._streamdio_wal_path)
+            with self._journal_lock:
+                if (self._journal_mode == "new" and self._journal_handle is not None
+                        and count > self._streamdio_wal_checkpoint_count):
+                    self._journal_append("streamdio_checkpoint", {
+                        "event_count": count, "wal_fsync_succeeded": synced,
+                    }, durable=True)
+                    self._streamdio_wal_checkpoint_count = count
+            return synced
 
     def _set_streamdio_wal_background_error(self, exc: BaseException) -> None:
         if self._streamdio_wal_background_error is None:
@@ -1039,17 +1165,19 @@ class SessionRecorder:
 
     def _close_streamdio_wal(self, *, durable: bool = False) -> None:
         self._stop_streamdio_wal_fsync_worker()
-        with self._streamdio_wal_lock:
-            if self._streamdio_wal_handle is None:
-                return
-            self._streamdio_wal_handle.flush()
+        try:
             if durable:
-                fsync_best_effort(
-                    self._streamdio_wal_handle,
-                    path=self._streamdio_wal_path,
-                )
-            self._streamdio_wal_handle.close()
-            self._streamdio_wal_handle = None
+                self.raise_if_background_error()
+                if self._streamdio_wal_handle is not None:
+                    self._sync_streamdio_wal()
+        finally:
+            with self._streamdio_wal_lock:
+                if self._streamdio_wal_handle is not None:
+                    try:
+                        self._streamdio_wal_handle.flush()
+                    finally:
+                        self._streamdio_wal_handle.close()
+                        self._streamdio_wal_handle = None
 
     def _prune_streamdio_events_if_needed(self) -> None:
         if not self._streamdio_memory_bounded or self._streamdio_recent_max_events <= 0:
@@ -1067,6 +1195,8 @@ class SessionRecorder:
     ) -> None:
         if self._streamdio_chunk_s <= 0.0 or self._streamdio_chunk_queue is None:
             return
+        if self._streamdio_chunk_error is not None:
+            return  # optional chunks stop; the complete WAL remains authoritative
         relative_s = float(row[4])
         if self._streamdio_chunk_start_s is None:
             self._streamdio_chunk_start_s = relative_s
@@ -1081,25 +1211,42 @@ class SessionRecorder:
         rows = self._streamdio_chunk_buffer
         self._streamdio_chunk_buffer = []
         self._streamdio_chunk_start_s = None
-        self._streamdio_chunk_queue.put((self._streamdio_chunk_index, rows))
-        self._streamdio_chunk_index += 1
+        if self._streamdio_chunk_error is None:
+            try:
+                self._streamdio_chunk_queue.put_nowait((self._streamdio_chunk_index, rows))
+                self._streamdio_chunk_index += 1
+            except queue.Full:
+                self._streamdio_chunk_error = "chunk writer backlog exceeded two blocks; using complete WAL"
 
     def _finalize_streamdio_chunks(self) -> None:
         if self._streamdio_chunk_queue is None:
             return
         self._enqueue_streamdio_chunk()
-        self._streamdio_chunk_queue.put((None, None))
+        # A separate finish signal cannot block behind a full writer queue.
+        self._streamdio_chunk_finish.set()
         if self._streamdio_chunk_thread is not None:
-            self._streamdio_chunk_thread.join(timeout=10.0)
+            self._streamdio_chunk_thread.join(timeout=CHUNK_SHUTDOWN_TIMEOUT_S)
             if self._streamdio_chunk_thread.is_alive():
                 self._streamdio_chunk_error = "chunk writer did not stop within timeout"
+                # It could still publish a chunk. Do not create a manifest or
+                # delete recovery data until that writer has actually stopped.
+                raise RuntimeError(self._streamdio_chunk_error + "; recovery WAL retained")
         self._streamdio_chunk_thread = None
+        while not self._streamdio_chunk_queue.empty():
+            self._streamdio_chunk_queue.get_nowait()
 
     def _streamdio_chunk_writer(self) -> None:
         assert self._streamdio_chunk_queue is not None
         assert self._streamdio_chunk_dir is not None
         while True:
-            index, rows = self._streamdio_chunk_queue.get()
+            if self._streamdio_chunk_error is not None:
+                return
+            try:
+                index, rows = self._streamdio_chunk_queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._streamdio_chunk_finish.is_set():
+                    return
+                continue
             if index is None:
                 return
             path = self._streamdio_chunk_dir / f"streamdio_chunk_{int(index):03d}.npz"
@@ -1119,29 +1266,31 @@ class SessionRecorder:
                         time.sleep(0.05 * (attempt + 1))
             if error is not None:
                 self._streamdio_chunk_error = f"{type(error).__name__}: {error}"
-                self._streamdio_failed_chunk_rows.extend(rows or [])
+                return
 
-    def _streamdio_rows_for_finalize(self) -> list[tuple[str, int, int, int, float, float]]:
-        if not self._streamdio_memory_bounded:
-            return list(self.streamdio_events)
+    def _streamdio_rows_for_finalize(self) -> Sequence[RawRow]:
+        if self._recovery_streamdio_rows is not None:
+            return self._recovery_streamdio_rows
+        if not self._streamdio_memory_bounded or self._journal_mode == "resume":
+            return self.streamdio_events
         if self._streamdio_wal_path.exists():
             try:
-                wal_rows, trailing_bytes = load_streamdio_wal(self._streamdio_wal_path)
-                if trailing_bytes == 0 and len(wal_rows) == self._streamdio_total_count:
+                wal_rows = WalRows(self._streamdio_wal_path)
+                if len(wal_rows) == self._streamdio_total_count:
+                    # Validate before primary output; subsequent passes also
+                    # check CRCs, with only one small block resident at a time.
+                    for _ in wal_rows:
+                        pass
                     return wal_rows
-                self._streamdio_chunk_error = (
+                raise ValueError(
                     "StreamDIO WAL incomplete at finalize: "
-                    f"{len(wal_rows)} of {self._streamdio_total_count} events, "
-                    f"{trailing_bytes} trailing bytes"
+                    f"{len(wal_rows)} of {self._streamdio_total_count} events"
                 )
             except Exception as exc:
-                self._streamdio_chunk_error = (
-                    f"StreamDIO WAL read failed: {type(exc).__name__}: {exc}"
-                )
-        rows = self._load_streamdio_chunk_rows()
-        if rows or self._streamdio_failed_chunk_rows:
-            return [*rows, *self._streamdio_failed_chunk_rows]
-        return list(self.streamdio_events)
+                raise RuntimeError(f"StreamDIO WAL read failed; recovery evidence retained: {exc}") from exc
+        if self._streamdio_total_count:
+            raise RuntimeError("StreamDIO WAL missing; refusing incomplete bounded export")
+        return []
 
     def _discard_partial_streamdio_chunks(self) -> None:
         """Remove a misleading partial chunk set after a terminal writer error.
@@ -1162,31 +1311,42 @@ class SessionRecorder:
                 )
         self._streamdio_chunk_files.clear()
 
-    def _load_streamdio_chunk_rows(self) -> list[tuple[str, int, int, int, float, float]]:
-        rows: list[tuple[str, int, int, int, float, float]] = []
-        for value in sorted(self._streamdio_chunk_files):
-            path = Path(value)
-            if not path.exists():
-                continue
-            try:
-                with np.load(path, allow_pickle=True) as data:
-                    if "streamdio_events" not in data.files:
-                        continue
-                    for row in data["streamdio_events"]:
-                        rows.append(
-                            (
-                                str(row["event_type"]),
-                                int(row["channel"]),
-                                int(row["value"]),
-                                int(row["module_timestamp_us"]),
-                                float(row["relative_time_s"]),
-                                float(row["host_perf_counter_s"]),
-                            )
-                        )
-            except Exception as exc:
-                self._streamdio_chunk_error = f"{type(exc).__name__}: {exc}"
-                return []
-        return rows
+    def _load_streamdio_chunk_rows(self) -> ChunkRows:
+        return ChunkRows([Path(value) for value in self._streamdio_chunk_files])
+
+    def _complete_recovery_chunks(self, rows: Sequence[RawRow], *, existing_count: int) -> None:
+        """Append missing durable suffix synchronously; never delete a recovery source.
+
+        Offline replay can outrun the live bounded queue. Use block-limited writes
+        here instead, preserving all existing prefix chunks for retry after failure.
+        """
+        if existing_count == len(rows) or (self._streamdio_chunk_s <= 0 and not self._streamdio_chunk_files):
+            return
+        chunk_dir = self._streamdio_chunk_dir
+        assert chunk_dir is not None
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        block: list[RawRow] = []
+
+        def flush() -> None:
+            path = chunk_dir / f"streamdio_chunk_{len(self._streamdio_chunk_files):03d}.npz"
+            if path.exists():
+                raise RuntimeError(f"Refusing to overwrite existing recovery chunk: {path}")
+            _atomic_write_npz(path, streamdio_events=RawArray(block))
+            self._streamdio_chunk_files.append(str(path))
+            block.clear()
+
+        with ExitStack() as stack:
+            iterator = iter(rows)
+            if close := getattr(iterator, "close", None):
+                stack.callback(close)
+            for row in islice(iterator, existing_count, None):
+                block.append(row)
+                if len(block) >= BLOCK_ROWS or (
+                    self._streamdio_chunk_s > 0 and row[4] - block[0][4] >= self._streamdio_chunk_s
+                ):
+                    flush()
+        if block:
+            flush()
 
     def _trials_to_structured(self) -> np.ndarray:
         dtype = [
@@ -1334,20 +1494,29 @@ class SessionRecorder:
         return np.array(rows, dtype=dtype)
 
     def _events_to_structured(self) -> np.ndarray:
-        payloads = [json.dumps(event.payload) for event in self.events]
-        event_type_chars = max(1, *(len(event.event_type) for event in self.events))
-        payload_chars = max(1, *(len(payload) for payload in payloads))
-        dtype = [
+        # Compatibility helper for callers explicitly requesting an in-memory array.
+        array = self._event_array()
+        return np.array(list(array.iter_rows()), dtype=array.dtype)
+
+    def _event_array(self) -> BlockArray:
+        count = len(self.events)
+        event_type_chars = max(1, max((len(event.event_type) for event in self.events), default=0))
+        payload_chars = max(1, max((len(json.dumps(event.payload)) for event in self.events), default=0))
+        dtype = np.dtype([
             ("wall_time_s", "f8"),
             ("monotonic_s", "f8"),
             ("event_type", f"U{event_type_chars}"),
             ("payload_json", f"U{payload_chars}"),
-        ]
-        rows = [
-            (event.wall_time_s, event.monotonic_s, event.event_type, payload)
-            for event, payload in zip(self.events, payloads, strict=True)
-        ]
-        return np.array(rows, dtype=dtype)
+        ])
+
+        def rows() -> Iterator[tuple[float, float, str, str]]:
+            for event in self.events:
+                payload = json.dumps(event.payload)
+                if len(event.event_type) > event_type_chars or len(payload) > payload_chars:
+                    raise ValueError("Event grew after array sizing; refusing truncation")
+                yield (event.wall_time_s, event.monotonic_s, event.event_type, payload)
+
+        return BlockArray(count, dtype, rows)
 
     def _streamdio_to_structured(self) -> np.ndarray:
         return self._streamdio_rows_to_structured(self.streamdio_events)
@@ -1356,15 +1525,7 @@ class SessionRecorder:
     def _streamdio_rows_to_structured(
         rows: list[tuple[str, int, int, int, float, float]],
     ) -> np.ndarray:
-        dtype = [
-            ("event_type", "U24"),
-            ("channel", "i2"),
-            ("value", "i4"),
-            ("module_timestamp_us", "u8"),
-            ("relative_time_s", "f8"),
-            ("host_perf_counter_s", "f8"),
-        ]
-        return np.array(rows, dtype=dtype)
+        return np.array(rows, dtype=RAW_DTYPE)
 
 
 _JOURNAL_SUFFIX = ".journal.jsonl"
@@ -1375,47 +1536,8 @@ def load_streamdio_wal(
 ) -> tuple[list[tuple[str, int, int, int, float, float]], int]:
     """Load complete raw StreamDIO WAL records and report a truncated tail."""
 
-    wal_path = Path(path)
-    rows: list[tuple[str, int, int, int, float, float]] = []
-    with wal_path.open("rb") as handle:
-        magic = handle.read(len(_STREAMDIO_WAL_MAGIC))
-        if magic == _STREAMDIO_WAL_MAGIC:
-            record_struct = _STREAMDIO_WAL_RECORD
-            has_checksum = True
-        elif magic == _STREAMDIO_WAL_MAGIC_V1:
-            record_struct = _STREAMDIO_WAL_RECORD_V1
-            has_checksum = False
-        else:
-            raise ValueError(f"Invalid StreamDIO WAL header: {wal_path}")
-        trailing_bytes = 0
-        while True:
-            record = handle.read(record_struct.size)
-            if not record:
-                break
-            if len(record) != record_struct.size:
-                trailing_bytes = len(record)
-                break
-            if has_checksum:
-                payload = record[:-4]
-                expected_crc = struct.unpack("<I", record[-4:])[0]
-                if (zlib.crc32(payload) & 0xFFFFFFFF) != expected_crc:
-                    trailing_bytes = len(record) + len(handle.read())
-                    break
-                unpacked = _STREAMDIO_WAL_PAYLOAD.unpack(payload)
-            else:
-                unpacked = _STREAMDIO_WAL_RECORD_V1.unpack(record)
-            event_type, channel, value, timestamp_us, relative_s, host_s = unpacked
-            rows.append(
-                (
-                    event_type.rstrip(b"\0").decode("utf-8"),
-                    int(channel),
-                    int(value),
-                    int(timestamp_us),
-                    float(relative_s),
-                    float(host_s),
-                )
-            )
-    return rows, trailing_bytes
+    rows = WalRows(Path(path), recover_tail=True)
+    return list(rows), rows.trailing_bytes
 
 
 def resolve_session_journal(path: Path | str) -> Path:
@@ -1449,110 +1571,131 @@ def load_session_journal(
     *,
     repair_trailing: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
-    journal_path = resolve_session_journal(path)
-    original = journal_path.read_text(encoding="utf-8")
-    lines = original.splitlines()
-    nonempty = [index for index, line in enumerate(lines) if line.strip()]
-    last_nonempty = nonempty[-1] if nonempty else -1
-    rows: list[dict[str, Any]] = []
-    repaired = False
-    valid_lines: list[str] = []
-    for index, line in enumerate(lines):
-        text = line.strip()
-        if not text:
-            continue
-        try:
-            row = json.loads(text)
-        except json.JSONDecodeError as exc:
-            if repair_trailing and index == last_nonempty:
-                repaired = True
-                break
-            raise ValueError(
-                f"Invalid session journal JSON at {journal_path}:{index + 1}: {exc.msg}"
-            ) from exc
-        if not isinstance(row, dict):
-            raise ValueError(f"Session journal row is not an object: {journal_path}:{index + 1}")
-        if row.get("schema_version") != 1:
-            raise ValueError(f"Unsupported session journal schema: {journal_path}:{index + 1}")
-        if row.get("sequence") != len(rows):
-            raise ValueError(
-                f"Session journal sequence mismatch: {journal_path}:{index + 1}: "
-                f"{row.get('sequence')} != {len(rows)}"
-            )
-        if not isinstance(row.get("payload"), dict):
-            raise ValueError(f"Session journal payload is not an object: {journal_path}:{index + 1}")
-        rows.append(row)
-        valid_lines.append(json.dumps(row, separators=(",", ":")))
-    if not rows or rows[0].get("kind") != "session_header":
-        raise ValueError(f"Session journal is missing its header: {journal_path}")
-    if repaired:
-        _backup_recovery_journal(journal_path, original)
-        _atomic_write_text(journal_path, "\n".join(valid_lines) + "\n")
-    return rows, repaired
-
-
-def _backup_recovery_journal(path: Path, original: str) -> Path:
-    backup = path.with_name(f"{path.name}.recovery-backup")
-    if not backup.exists():
-        _atomic_write_text(backup, original)
-    return backup
-
-
-def _remove_prior_journal_summaries(
-    path: Path,
-    rows: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], bool]:
-    filtered = [row for row in rows if row.get("kind") != "session_summary"]
-    if len(filtered) == len(rows):
-        return rows, False
-    original = path.read_text(encoding="utf-8")
-    _backup_recovery_journal(path, original)
-    for sequence, row in enumerate(filtered):
-        row["sequence"] = sequence
-    _atomic_write_text(
-        path,
-        "\n".join(json.dumps(row, separators=(",", ":")) for row in filtered) + "\n",
-    )
-    return filtered, True
+    """Compatibility loader; recovery itself streams rows instead of building a list."""
+    scan = scan_journal(resolve_session_journal(path), tolerate_tail=repair_trailing)
+    repaired = bool(repair_trailing and (scan.trailing_bytes or scan.needs_newline))
+    if repair_trailing:
+        scan = prepare_journal(scan)
+    return list(iter_journal(scan)), repaired
 
 
 def _reconcile_streamdio_recovery_rows(
-    wal_rows: list[tuple[str, int, int, int, float, float]],
-    chunk_rows: list[tuple[str, int, int, int, float, float]],
-) -> tuple[list[tuple[str, int, int, int, float, float]], str]:
-    """Choose the complete prefix-compatible StreamDIO recovery source.
+    wal_rows: Sequence[RawRow],
+    chunk_rows: Sequence[RawRow],
+) -> tuple[Sequence[RawRow], str]:
+    """Validate every row of both sources, then retain the longer agreed prefix.
 
-    Both stores originate from the same ordered callback stream.  A crash may
-    leave either one with a shorter durable tail, but they must agree for their
-    common prefix.  Divergence is treated as corruption rather than silently
-    publishing a plausible-looking merged stream.
+    Sequential comparison avoids both full copies and quadratic file indexing.
+    Consume the longer tail too, so a CRC/ZIP failure cannot hide beyond overlap.
     """
-
+    with ExitStack() as stack:
+        iterators = [iter(wal_rows), iter(chunk_rows)]
+        for iterator in iterators:
+            if close := getattr(iterator, "close", None):
+                stack.callback(close)
+        for index, (wal, chunk) in enumerate(zip_longest(*iterators)):
+            if wal is not None and chunk is not None and wal != chunk:
+                raise RuntimeError(
+                    "StreamDIO recovery sources diverge at event "
+                    f"{index}; refusing silent WAL/chunk data reconciliation"
+                )
     if not wal_rows and not chunk_rows:
         return [], "none"
     if not wal_rows:
-        return list(chunk_rows), "chunks_only"
+        return chunk_rows, "chunks_only"
     if not chunk_rows:
-        return list(wal_rows), "wal_only"
-    common_length = min(len(wal_rows), len(chunk_rows))
-    mismatch = next(
-        (
-            index
-            for index in range(common_length)
-            if wal_rows[index] != chunk_rows[index]
-        ),
-        None,
-    )
-    if mismatch is not None:
-        raise RuntimeError(
-            "StreamDIO recovery sources diverge at event "
-            f"{mismatch}; refusing silent WAL/chunk data reconciliation"
-        )
+        return wal_rows, "wal_only"
     if len(wal_rows) > len(chunk_rows):
-        return list(wal_rows), "wal_extends_chunks"
+        return wal_rows, "wal_extends_chunks"
     if len(chunk_rows) > len(wal_rows):
-        return list(chunk_rows), "chunks_extend_wal"
-    return list(wal_rows), "wal_chunks_identical"
+        return chunk_rows, "chunks_extend_wal"
+    return wal_rows, "wal_chunks_identical"
+
+
+def _preserve_damaged_wal(path: Path) -> Path:
+    """Keep exact damaged bytes before finalization can remove the original WAL."""
+    backup = path.with_name(f"{path.name}.recovery-backup")
+    if backup.exists():
+        # A retry may reuse identical evidence, but must never replace a different
+        # prior backup. Refuse and leave both source and backup available.
+        with path.open("rb") as source, backup.open("rb") as prior:
+            while True:
+                block = source.read(1024 * 1024)
+                if block != prior.read(1024 * 1024):
+                    raise RuntimeError(f"Existing WAL recovery backup differs: {backup}")
+                if not block:
+                    return backup
+    temporary = backup.with_name(f"{backup.name}.tmp")
+    try:
+        with path.open("rb") as source, temporary.open("wb") as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+            target.flush()
+            fsync_best_effort(target, path=temporary)
+        os.replace(temporary, backup)
+        fsync_directory_best_effort(backup.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return backup
+
+
+def _checkpoint_recovery_completion(marker: Path, journal: Path, result: dict[str, Any]) -> None:
+    from hf_dm.data.session_export import sha256_file
+
+    state = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else {
+        "schema_version": 1, "status": "incomplete", "journal": journal.name,
+    }
+    manifest = Path(result["manifest"])
+    state["recovery_completion"] = {
+        "schema_version": 1,
+        "manifest": manifest.resolve().relative_to(journal.parent.resolve()).as_posix(),
+        "manifest_sha256": sha256_file(manifest),
+        "result": result,
+    }
+    # This durable record precedes either unlink. A retry must verify the saved
+    # bundle rather than reconstruct it from a WAL that was already removed.
+    _atomic_write_text(marker, json.dumps(state, indent=2))
+
+
+def _cleanup_recovered_session(marker: Path, journal: Path) -> None:
+    base_name = journal.name[:-len(_JOURNAL_SUFFIX)]
+    journal.with_name(f"{base_name}.streamdio.wal").unlink(missing_ok=True)
+    marker.unlink(missing_ok=True)
+    fsync_directory_best_effort(journal.parent)
+
+
+def _resume_recovery_completion(marker: Path, journal: Path) -> dict[str, Any] | None:
+    if not marker.exists():
+        return None
+    state = json.loads(marker.read_text(encoding="utf-8"))
+    completion = state.get("recovery_completion")
+    if completion is None:
+        return None
+    if (not isinstance(completion, dict) or completion.get("schema_version") != 1
+            or not isinstance(completion.get("result"), dict)):
+        raise RuntimeError("Invalid recovery completion checkpoint; inputs retained")
+    from hf_dm.data.session_export import sha256_file, validate_session
+
+    manifest_name = str(completion.get("manifest", "")).replace("\\", "/")
+    manifest = (journal.parent / manifest_name).resolve()
+    if not manifest.is_relative_to(journal.parent.resolve()) or not manifest.is_file():
+        raise RuntimeError("Recovery completion manifest is missing or outside its session")
+    if sha256_file(manifest) != completion.get("manifest_sha256"):
+        raise RuntimeError("Recovery completion manifest checksum mismatch; inputs retained")
+    validation = validate_session(manifest)
+    if not validation.get("valid"):
+        raise RuntimeError(f"Completed recovery no longer validates; inputs retained: {validation.get('errors')}")
+    result = dict(completion["result"])
+    base_name = journal.name[:-len(_JOURNAL_SUFFIX)]
+    result.update({"journal": str(journal), "artifact": str(journal.with_name(f"{base_name}.npz")),
+                   "bundle_dir": str(manifest.parent), "manifest": str(manifest),
+                   "validation": validation, "resumed_completed_recovery": True})
+    # Rebase returned evidence paths for sessions copied to a different directory.
+    result["journal_recovery_backups"] = [str(journal.parent / Path(str(path).replace("\\", "/")).name)
+                                          for path in result.get("journal_recovery_backups", [])]
+    if backup := result.get("streamdio_wal_recovery_backup"):
+        result["streamdio_wal_recovery_backup"] = str(journal.parent / Path(str(backup).replace("\\", "/")).name)
+    _cleanup_recovered_session(marker, journal)
+    return result
 
 
 def recover_session_journal(
@@ -1567,29 +1710,83 @@ def recover_session_journal(
         journal_path.parent / "manifest.json",
         journal_path.parent / f"{base_name}_bundle" / "manifest.json",
     )
+    if completed := _resume_recovery_completion(incomplete_marker, journal_path):
+        return completed
+    # Older recoveries have no checkpoint. If their WAL has already been deleted,
+    # a fully valid existing bundle is the durable source: never overwrite it.
+    if incomplete_marker.exists() and not journal_path.with_name(f"{base_name}.streamdio.wal").exists():
+        from hf_dm.data.session_export import validate_session
+        for manifest_path in manifest_candidates:
+            if not manifest_path.exists():
+                continue
+            validation = validate_session(manifest_path)
+            if not validation.get("valid"):
+                # There is no WAL left to establish that reconstruction is
+                # complete. Preserve the existing artifacts for inspection.
+                raise RuntimeError("Existing recovery bundle does not validate and its WAL is missing; inputs retained")
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            primary = journal_path.with_name(f"{base_name}.npz")
+            primary_indexed = any((manifest_path.parent / item["path"]).resolve() == primary.resolve()
+                                  for item in manifest_data.get("artifacts", []))
+            if not primary_indexed:
+                continue
+            counts = manifest_data["counts"]
+            completed = {
+                "journal": str(journal_path), "artifact": str(primary), "bundle_dir": str(manifest_path.parent),
+                "manifest": str(manifest_path), "validation": validation,
+                "repaired_trailing_record": False, "replaced_prior_summary": False,
+                "recovered_trials": counts["trials"], "recovered_bpod_trials": counts["bpod_trials"],
+                "recovered_streamdio_events": counts["streamdio_events"],
+                "streamdio_recovery_source": "verified_existing_bundle", "resumed_completed_recovery": True,
+            }
+            _checkpoint_recovery_completion(incomplete_marker, journal_path, completed)
+            _cleanup_recovered_session(incomplete_marker, journal_path)
+            return completed
     if not incomplete_marker.exists() and any(item.exists() for item in manifest_candidates):
         raise RuntimeError(
             f"Session is already finalized; refusing recovery without an incomplete marker: "
             f"{journal_path.parent}"
         )
-    rows, repaired_tail = load_session_journal(journal_path, repair_trailing=True)
-    if not incomplete_marker.exists() and any(
-        row.get("kind") == "session_summary" for row in rows
-    ):
+    scan = scan_journal(journal_path, tolerate_tail=True)
+    if not incomplete_marker.exists() and scan.summary_count:
         raise RuntimeError(
             f"Session journal already contains a final summary; refusing recovery without an "
             f"incomplete marker: {journal_path.parent}"
         )
-    rows, removed_summary = _remove_prior_journal_summaries(journal_path, rows)
-    header = dict(rows[0]["payload"])
+    repaired_tail = bool(scan.trailing_bytes or scan.needs_newline)
+    removed_summary = bool(scan.summary_count)
+    journal_trailing_bytes = scan.trailing_bytes
+    journal_newline_added = scan.needs_newline
+    header = dict(scan.header)
     subject_id = str(header.get("subject_id") or "unknown")
     phase = str(header.get("phase") or "unknown")
     wal_name = str(header.get("streamdio_wal") or f"{base_name}.streamdio.wal")
     wal_path = journal_path.parent / wal_name
-    wal_rows: list[tuple[str, int, int, int, float, float]] = []
+    wal_rows: Sequence[RawRow] = []
     wal_trailing_bytes = 0
     if wal_path.exists():
-        wal_rows, wal_trailing_bytes = load_streamdio_wal(wal_path)
+        wal_rows = WalRows(wal_path, recover_tail=True)
+        wal_trailing_bytes = wal_rows.trailing_bytes
+
+    from hf_dm.data.session_export import session_bundle_dir, validate_session
+
+    layout = scan.export_layout
+    chunk_dir = session_bundle_dir(journal_path.with_name(base_name), layout=layout) / "continuous_streams"
+    chunk_files = sorted(chunk_dir.glob("streamdio_chunk_*.npz"))
+    chunk_streamdio = ChunkRows(chunk_files)
+    recovered_streamdio, streamdio_recovery_source = _reconcile_streamdio_recovery_rows(wal_rows, chunk_streamdio)
+    raw_minimum_count = scan.raw_minimum_count
+    if header.get("streamdio_checkpoint_version") == 1 and not wal_path.exists() and not chunk_files:
+        raise RuntimeError("Missing raw StreamDIO sources: declared WAL and chunks are absent; inputs retained")
+    if raw_minimum_count is not None and len(recovered_streamdio) < raw_minimum_count:
+        raise RuntimeError(
+            f"Missing raw StreamDIO events: recovered {len(recovered_streamdio)}, "
+            f"journal checkpoint requires at least {raw_minimum_count}; inputs retained"
+        )
+    # Verify the independent lower bound before repairing the journal or writing
+    # any replacement artifacts. CRC-valid truncation is still data loss.
+    scan = prepare_journal(scan, remove_summaries=True)
+    journal_recovery_backups = [str(item) for item in journal_backups(journal_path)]
 
     recorder = SessionRecorder(
         journal_path.parent,
@@ -1598,130 +1795,142 @@ def recover_session_journal(
         base_name=base_name,
         journal_mode="resume",
     )
-    recorder.events.clear()
-    recorder.trials.clear()
-    recorder.bpod_trials.clear()
-    recorder.fsm_definitions.clear()
-    recorder.metadata.clear()
-    recorder.stream_summaries.clear()
-    recorder.export_options.clear()
-    recorder._session_start_wall = float(
-        header.get("session_start_wall_s", recorder._session_start_wall)
-    )
-    recorder._session_start_mono = float(
-        header.get("session_start_mono_s", recorder._session_start_mono)
-    )
+    try:
+        recorder.events.clear()
+        recorder.trials.clear()
+        recorder.bpod_trials.clear()
+        recorder.fsm_definitions.clear()
+        recorder.metadata.clear()
+        recorder.stream_summaries.clear()
+        recorder.export_options.clear()
+        recorder._session_start_wall = float(
+            header.get("session_start_wall_s", recorder._session_start_wall)
+        )
+        recorder._session_start_mono = float(
+            header.get("session_start_mono_s", recorder._session_start_mono)
+        )
 
-    for row in rows[1:]:
-        kind = row.get("kind")
-        payload = dict(row["payload"])
-        if kind == "event":
-            recorder.events.append(SessionEvent(**payload))
-        elif kind == "trial":
-            recorder.trials.append(TrialRecord(**payload))
-        elif kind == "bpod_trial":
-            recorder.bpod_trials.append(payload)
-        elif kind == "metadata":
-            recorder.metadata.update(payload)
-        elif kind == "export_options":
-            recorder.export_options.update(payload)
-        elif kind == "stream_summary":
-            name = str(payload.get("name") or "unknown")
-            stream_summary = payload.get("summary")
-            if isinstance(stream_summary, dict):
-                recorder.stream_summaries[name] = dict(stream_summary)
-        elif kind == "fsm_definition":
-            fsm_name = payload.get("fsm_name")
-            fsm_json = payload.get("fsm_json")
-            if fsm_name is not None and fsm_json is not None:
-                recorder.fsm_definitions[str(fsm_name)] = str(fsm_json)
+        with closing(iter_journal(scan)) as rows:
+            for row in rows:
+                kind = row.get("kind")
+                payload = row["payload"]
+                if kind == "event":
+                    recorder.events.append(SessionEvent(**payload))
+                elif kind == "trial":
+                    recorder.trials.append(TrialRecord(**payload))
+                elif kind == "bpod_trial":
+                    recorder.bpod_trials.append(payload)
+                elif kind == "metadata":
+                    recorder.metadata.update(payload)
+                elif kind == "export_options":
+                    recorder.export_options.update(payload)
+                elif kind == "stream_summary":
+                    name = str(payload.get("name") or "unknown")
+                    stream_summary = payload.get("summary")
+                    if isinstance(stream_summary, dict):
+                        recorder.stream_summaries[name] = dict(stream_summary)
+                elif kind == "fsm_definition":
+                    fsm_name = payload.get("fsm_name")
+                    fsm_json = payload.get("fsm_json")
+                    if fsm_name is not None and fsm_json is not None:
+                        recorder.fsm_definitions[str(fsm_name)] = str(fsm_json)
 
-    if recorder.stream_summaries:
-        recorder.metadata["stream_summaries"] = dict(recorder.stream_summaries)
-    recorder._max_event_count = len(recorder.events)
-    recorder._max_trial_count = len(recorder.trials)
-    recorder._max_bpod_trial_count = len(recorder.bpod_trials)
+        if recorder.stream_summaries:
+            recorder.metadata["stream_summaries"] = dict(recorder.stream_summaries)
+        # Recovery always validates what it reconstructs, even when the original
+        # session disabled optional export duplication. A manifest is required
+        # for that check; the original configuration snapshot stays unchanged.
+        recovery_manifest_added = not bool(recorder.export_options.get("manifest", True))
+        recorder.export_options["manifest"] = True
+        recorder._max_event_count = len(recorder.events)
+        recorder._max_trial_count = len(recorder.trials)
+        recorder._max_bpod_trial_count = len(recorder.bpod_trials)
 
-    from hf_dm.data.session_export import session_bundle_dir, validate_session
-
-    layout = str(recorder.export_options.get("layout", "mm_hierarchy"))
-    chunk_dir = session_bundle_dir(recorder.base_path, layout=layout) / "continuous_streams"
-    recorder._streamdio_chunk_files = [str(item) for item in sorted(chunk_dir.glob("streamdio_chunk_*.npz"))]
-    chunk_streamdio = recorder._load_streamdio_chunk_rows()
-    recovered_streamdio, streamdio_recovery_source = _reconcile_streamdio_recovery_rows(
-        wal_rows,
-        chunk_streamdio,
-    )
-    recorder.streamdio_events = recovered_streamdio
-    recorder._streamdio_total_count = len(recovered_streamdio)
-    recorder._streamdio_counts = Counter(row[0] for row in recovered_streamdio)
-    recorder._max_streamdio_event_count = len(recovered_streamdio)
-    recorder._streamdio_chunk_s = float(recorder.export_options.get("streamdio_chunk_s", 0.0) or 0.0)
-    recorder._streamdio_memory_mode = str(
-        recorder.export_options.get("streamdio_memory_mode", "full")
-    )
-    recorder._streamdio_memory_bounded = bool(recorder._streamdio_chunk_files)
-
-    # Either durable store can contain the longer crash-safe tail.  Rebuild every
-    # chunk from the reconciled stream instead of publishing a partial index.
-    if recovered_streamdio and recorder._streamdio_chunk_s > 0.0:
-        for prior_chunk in chunk_dir.glob("streamdio_chunk_*.npz"):
-            prior_chunk.unlink()
-        recorder._streamdio_chunk_files.clear()
-        recorder._streamdio_chunk_index = 0
-        recorder._configure_streamdio_chunking()
+        recorder._streamdio_chunk_files = [str(item) for item in chunk_files]
+        recorder._recovery_streamdio_rows = recovered_streamdio
+        recorder._streamdio_total_count = len(recovered_streamdio)
         for stream_row in recovered_streamdio:
-            recorder._buffer_streamdio_chunk(stream_row)
+            recorder._streamdio_counts[stream_row[0]] += 1
+            recorder._streamdio_channel_counts[(stream_row[0], stream_row[1])] += 1
+        recorder._streamdio_chunk_s = float(recorder.export_options.get("streamdio_chunk_s", 0.0) or 0.0)
+        recorder._streamdio_memory_mode = "recovery_streaming"
+        recorder._streamdio_memory_bounded = True
+        recorder._streamdio_chunk_dir = chunk_dir
+        wal_backup = _preserve_damaged_wal(wal_path) if wal_trailing_bytes else None
+        recovery_backup_sha256 = backup_checksums(
+            [Path(item) for item in journal_recovery_backups] + ([wal_backup] if wal_backup else []))
+        recorder._complete_recovery_chunks(recovered_streamdio, existing_count=len(chunk_streamdio))
 
-    recorder.log_event(
-        "session_recovered",
-        {
+        recorder.log_event(
+            "session_recovered",
+            {
+                "journal": str(journal_path),
+                "repaired_trailing_record": repaired_tail,
+                "replaced_prior_summary": removed_summary,
+                "journal_trailing_bytes": journal_trailing_bytes,
+                "journal_newline_added": journal_newline_added,
+                "journal_recovery_backups": journal_recovery_backups,
+                "recovery_backup_sha256": recovery_backup_sha256,
+                "manifest_enabled_for_recovery": recovery_manifest_added,
+                "recovered_trials": len(recorder.trials),
+                "recovered_bpod_trials": len(recorder.bpod_trials),
+                "recovered_streamdio_events": len(recovered_streamdio),
+                "raw_checkpoint_event_count": raw_minimum_count,
+                "raw_checkpoint_verified": raw_minimum_count is not None,
+                "streamdio_wal_events": len(wal_rows),
+                "streamdio_chunk_events": len(chunk_streamdio),
+                "streamdio_recovery_source": streamdio_recovery_source,
+                "streamdio_wal_trailing_bytes": wal_trailing_bytes,
+                "streamdio_wal_recovery_backup": None if wal_backup is None else str(wal_backup),
+            },
+        )
+        config_metadata = recorder.metadata.get("config")
+        planned = len(recorder.trials)
+        if isinstance(config_metadata, dict):
+            try:
+                planned = int(config_metadata.get("n_trials", planned))
+            except (TypeError, ValueError):
+                pass
+        summary = SessionSummary(
+            subject_id=subject_id,
+            phase=phase,
+            n_trials_planned=max(planned, len(recorder.trials)),
+            n_trials_completed=len(recorder.trials),
+            end_reason=str(end_reason),
+            consecutive_failures=0,
+            session_start_wall_s=recorder._session_start_wall,
+            session_end_wall_s=time.time(),
+            engagement_idle_triggered=False,
+        )
+        artifact = recorder.finalize(summary)
+        bundle_dir = session_bundle_dir(recorder.base_path, layout=layout)
+        validation = validate_session(bundle_dir)
+        result = {
             "journal": str(journal_path),
+            "artifact": str(artifact),
+            "bundle_dir": str(bundle_dir),
+            "manifest": validation.get("manifest"),
+            "validation": validation,
             "repaired_trailing_record": repaired_tail,
             "replaced_prior_summary": removed_summary,
+            "journal_trailing_bytes": journal_trailing_bytes,
+            "journal_newline_added": journal_newline_added,
+            "journal_recovery_backups": journal_recovery_backups,
+            "recovery_backup_sha256": recovery_backup_sha256,
             "recovered_trials": len(recorder.trials),
             "recovered_bpod_trials": len(recorder.bpod_trials),
             "recovered_streamdio_events": len(recovered_streamdio),
+            "raw_checkpoint_event_count": raw_minimum_count,
+            "raw_checkpoint_verified": raw_minimum_count is not None,
             "streamdio_wal_events": len(wal_rows),
             "streamdio_chunk_events": len(chunk_streamdio),
             "streamdio_recovery_source": streamdio_recovery_source,
             "streamdio_wal_trailing_bytes": wal_trailing_bytes,
-        },
-    )
-    config_metadata = recorder.metadata.get("config")
-    planned = len(recorder.trials)
-    if isinstance(config_metadata, dict):
-        try:
-            planned = int(config_metadata.get("n_trials", planned))
-        except (TypeError, ValueError):
-            pass
-    summary = SessionSummary(
-        subject_id=subject_id,
-        phase=phase,
-        n_trials_planned=max(planned, len(recorder.trials)),
-        n_trials_completed=len(recorder.trials),
-        end_reason=str(end_reason),
-        consecutive_failures=0,
-        session_start_wall_s=recorder._session_start_wall,
-        session_end_wall_s=time.time(),
-        engagement_idle_triggered=False,
-    )
-    artifact = recorder.finalize(summary)
-    bundle_dir = session_bundle_dir(recorder.base_path, layout=layout)
-    validation = validate_session(bundle_dir)
-    return {
-        "journal": str(journal_path),
-        "artifact": str(artifact),
-        "bundle_dir": str(bundle_dir),
-        "manifest": validation.get("manifest"),
-        "validation": validation,
-        "repaired_trailing_record": repaired_tail,
-        "replaced_prior_summary": removed_summary,
-        "recovered_trials": len(recorder.trials),
-        "recovered_bpod_trials": len(recorder.bpod_trials),
-        "recovered_streamdio_events": len(recovered_streamdio),
-        "streamdio_wal_events": len(wal_rows),
-        "streamdio_chunk_events": len(chunk_streamdio),
-        "streamdio_recovery_source": streamdio_recovery_source,
-        "streamdio_wal_trailing_bytes": wal_trailing_bytes,
-    }
+            "streamdio_wal_recovery_backup": None if wal_backup is None else str(wal_backup),
+        }
+        if validation.get("valid"):
+            _checkpoint_recovery_completion(incomplete_marker, journal_path, result)
+            _cleanup_recovered_session(incomplete_marker, journal_path)
+        return result
+    finally:
+        recorder.close_journal()

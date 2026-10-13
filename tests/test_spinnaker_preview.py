@@ -116,12 +116,21 @@ def test_capture_stats_counts_saved_skipped_and_observed_frames():
         "incomplete_frames": 2,
         "acquisition_timeouts": 3,
         "save_errors": 1,
-        "frames_skipped": 5,
-        "frames_observed": 15,
+        "frames_skipped": 3,
+        "frames_observed": 13,
     }
 
 
-def test_spinnaker_does_not_teardown_sdk_while_capture_thread_is_alive():
+def test_camera_wait_timeouts_do_not_invent_lost_frames():
+    stats = _capture_stats(frames_saved=10, incomplete_frames=0, acquisition_timeouts=3)
+    assert stats["frames_observed"] == 10
+    assert stats["frames_skipped"] == 0
+    assert stats["acquisition_timeouts"] == 3
+
+
+@pytest.mark.parametrize("backend", [HeadlessSpinnakerRecorder, _SpinnakerCRecorder])
+@pytest.mark.parametrize("preview_stop_fails", [False, True])
+def test_spinnaker_does_not_teardown_sdk_while_capture_thread_is_alive(backend, preview_stop_fails):
     class HungThread:
         def join(self, timeout):
             self.timeout = timeout
@@ -129,19 +138,28 @@ def test_spinnaker_does_not_teardown_sdk_while_capture_thread_is_alive():
         def is_alive(self):
             return True
 
-    recorder = object.__new__(HeadlessSpinnakerRecorder)
+    recorder = object.__new__(backend)
     recorder._c_backend = None
     recorder._running = True
     recorder._thread = HungThread()
     recorder._acquisition_timeout_ms = 10
     recorder._preview_dispatcher = types.SimpleNamespace(stop=lambda: None)
     recorder._error = None
-    recorder._cleanup_pyspin = lambda: (_ for _ in ()).throw(
+    recorder._cleanup_errors = []
+    recorder._cleanup = recorder._cleanup_pyspin = lambda: (_ for _ in ()).throw(
         AssertionError("SDK teardown must not run")
     )
+    if preview_stop_fails:
+        recorder._preview_dispatcher.stop = lambda: (_ for _ in ()).throw(
+            RuntimeError("preview stop failed")
+        )
 
-    with pytest.raises(TimeoutError, match="capture thread did not stop"):
+    with pytest.raises(TimeoutError, match="capture thread did not stop") as caught:
         recorder.stop()
+    assert "capture_thread_stop" in recorder._cleanup_errors[0]
+    assert recorder._thread.is_alive()
+    if preview_stop_fails:
+        assert "preview stop failed" in caught.value.__notes__[0]
 
 
 @pytest.mark.parametrize("failure", ["node", "entry", "read", "set"])
@@ -245,3 +263,223 @@ def test_health_reasons_delegates_to_c_backend():
     recorder._c_backend = backend
 
     assert recorder.health_reasons() == ["capture_error: spin error"]
+
+
+@pytest.mark.parametrize("save_fails", [False, True])
+@pytest.mark.parametrize("release_fails", [False, True])
+def test_c_capture_copies_mono_pixels_preserves_padding_and_releases_image(tmp_path, save_fails, release_fails):
+    import ctypes
+    from hf_dm.camera.spinnaker import _SpinnakerCRecorder
+
+    recorder = _SpinnakerCRecorder(
+        tmp_path, serial_number=None, fps=30, exposure_us=10000,
+        pixel_format="Mono8", gain_db=None, gamma=None, acquisition_timeout_ms=100,
+        preview_callback=lambda frame: None, preview_min_interval_s=0,
+    )
+    raw = ctypes.create_string_buffer(bytes([1, 2, 3, 4, 99, 99, 5, 6, 7, 8, 99, 99]))
+    previews, released, timestamps = [], [], []
+    recorder._preview_dispatcher = types.SimpleNamespace(
+        enabled=True, submit=lambda frame: previews.append(frame) or True,
+    )
+    recorder._timestamps = types.SimpleNamespace(write=lambda *args, **kw: timestamps.append((args, kw)))
+
+    def assign(value):
+        def call(_image, pointer):
+            pointer._obj.value = value
+            return 0
+        return call
+
+    def acquire(_camera, _timeout, pointer):
+        pointer._obj.value = 1
+        recorder._running = False
+        return 0
+
+    def release(_image):
+        released.append(True)
+        ctypes.memset(raw, 0, len(raw))
+        return -1000 if release_fails and len(released) == 1 else 0
+
+    recorder._fn = {
+        "spinCameraGetNextImageEx": acquire,
+        "spinImageIsIncomplete": assign(0),
+        "spinImageGetTimeStamp": assign(123456789),
+        "spinImageGetWidth": assign(4),
+        "spinImageGetHeight": assign(2),
+        "spinImageGetStride": assign(6),
+        "spinImageGetData": assign(ctypes.addressof(raw)),
+        "spinImageRelease": release,
+        "spinImageSaveFromExt": lambda *args: pytest.fail("Mono8 must bypass SDK encoder"),
+    }
+    target = tmp_path / "frame_000000000.pgm"
+    if save_fails:
+        target.mkdir()
+    recorder._running = True
+    recorder._capture_loop()
+    assert released == [True]
+    if save_fails:
+        assert recorder.error is not None
+        assert recorder._save_errors == 1
+        assert recorder.frame_count == 0
+        assert not timestamps
+    else:
+        if release_fails:
+            assert "Image release failed" in recorder.error
+        else:
+            assert recorder.error is None
+        assert recorder.frame_count == 1
+        assert target.read_bytes() == b"P5\n4 2\n255\n" + bytes(range(1, 9))
+        assert timestamps[0][0] == (0, 123456789, target.name)
+        assert timestamps[0][1]["received_mono_s"] == previews[0]["acquired_mono_s"]
+        assert previews[0]["data"] == bytes(range(1, 9))
+        assert previews[0]["acquired_mono_s"] <= previews[0]["monotonic_s"]
+    if release_fails:
+        assert len(recorder._unreleased_images) == 1
+        assert recorder._cleanup() == []
+        assert recorder._unreleased_images == []
+        assert released == [True, True]
+        assert "Image release failed" in recorder._cleanup_errors[0]
+
+
+def test_preview_cadence_keeps_target_rate_under_jitter_without_catchup():
+    from hf_dm.camera.spinnaker import _PreviewCadence
+
+    cadence = _PreviewCadence(1 / 15)
+    emitted = [index for index in range(300) if cadence.due(
+        100 + index / 30 + (0.002 if index % 2 else 0)
+    )]
+    assert 149 <= len(emitted) <= 151
+    assert cadence.due(200)
+    assert not cadence.due(200.001)
+
+
+def test_c_mono_fast_path_retains_sdk_fallback_for_other_pixel_formats(tmp_path):
+    from hf_dm.camera.spinnaker import _SpinnakerCRecorder
+    recorder = _SpinnakerCRecorder(
+        tmp_path, serial_number=None, fps=30, exposure_us=10000,
+        pixel_format="Mono16", gain_db=None, gamma=None, acquisition_timeout_ms=100,
+    )
+    assert recorder._read_mono_image(None) is None
+
+
+def test_c_camera_configuration_unlocks_trigger_nodes_before_required_writes():
+    from hf_dm.camera.spinnaker import _SpinnakerCRecorder
+    recorder = object.__new__(_SpinnakerCRecorder)
+    recorder._camera = None
+    recorder._exposure_us = 10000
+    recorder._pixel_format = "Mono8"
+    recorder._gain_db = recorder._gamma = None
+    recorder._check = lambda *args: None
+    recorder._apply_roi = lambda *args: None
+    recorder._record_optional_settings = lambda *args: None
+    recorder._set_bool = recorder._set_float = lambda *args, **kwargs: None
+    mode = "TriggerWidth"
+    commands = []
+
+    def set_enum(_map, name, value, **kwargs):
+        nonlocal mode
+        if name in {"TriggerMode", "ExposureAuto"} and mode == "TriggerWidth":
+            raise RuntimeError("Node unavailable in TriggerWidth mode")
+        commands.append((name, value))
+        if name == "ExposureMode":
+            mode = value
+
+    recorder._set_enum = set_enum
+    recorder._configure_camera()
+    assert mode == "TriggerWidth"
+    assert commands.index(("ExposureMode", "Timed")) < commands.index(("TriggerMode", "Off"))
+    assert commands.index(("TriggerSource", "Line0")) < commands.index(("TriggerMode", "On"))
+    assert commands[-2:] == [("TriggerMode", "On"), ("ExposureMode", "TriggerWidth")]
+
+
+@pytest.mark.parametrize("save_fails", [False, True])
+@pytest.mark.parametrize("release_fails", [False, True])
+def test_pyspin_copies_mono_pixels_previews_before_save_and_releases(tmp_path, monkeypatch, save_fails, release_fails):
+    import csv
+    import numpy as np
+    from hf_dm.camera import spinnaker
+
+    r = HeadlessSpinnakerRecorder(tmp_path, "test", "test", preview_callback=lambda frame: None)
+    r.session_dir.mkdir()
+    pixels = np.arange(12, dtype=np.uint8).reshape(2, 6)[:, :4]  # padded, noncontiguous view
+    expected = pixels.tobytes()
+    previews, actions = [], []
+    r._preview_dispatcher = types.SimpleNamespace(enabled=True, submit=lambda frame: previews.append(frame) or True)
+    r._timestamps = spinnaker._FrameTimestampWriter(r.session_dir)
+
+    class Image:
+        def IsIncomplete(self):
+            return False
+
+        def GetTimeStamp(self):
+            return 123456789
+
+        def GetNDArray(self):
+            return pixels
+
+        def Save(self, path):
+            pytest.fail("Mono8 must bypass the SDK encoder")
+
+        def Release(self):
+            actions.append("release")
+            pixels[:] = 0
+            if release_fails and actions.count("release") == 1:
+                raise RuntimeError("image release failed")
+
+    def next_image(timeout):
+        r._running = False
+        return Image()
+
+    save = spinnaker._save_mono_pgm
+
+    def checked_save(*args):
+        assert previews[0]["data"] == expected
+        actions.append("save")
+        if save_fails:
+            raise TimeoutError("disk timeout")
+        save(*args)
+
+    monkeypatch.setattr(spinnaker, "_save_mono_pgm", checked_save)
+    r._camera = types.SimpleNamespace(GetNextImage=next_image)
+    r._running = True
+    r._capture_loop()
+    r._timestamps.close()
+    assert actions == ["save", "release"]
+    assert previews[0]["data"] == expected
+    assert r._acquisition_timeouts == 0
+    with r._timestamps.path.open() as handle:
+        rows = list(csv.DictReader(handle))
+    if save_fails:
+        assert r._save_errors == 1
+        assert "disk timeout" in r.error
+        assert rows == []
+    else:
+        if release_fails:
+            assert "Image release failed" in r.error
+        else:
+            assert r.error is None
+        assert r.frame_count == 1
+        assert (r.session_dir / rows[0]["filename"]).read_bytes() == b"P5\n4 2\n255\n" + expected
+        assert int(rows[0]["camera_timestamp_ns"]) == 123456789
+        assert float(rows[0]["received_monotonic_s"]) == previews[0]["acquired_mono_s"]
+        assert float(rows[0]["received_monotonic_s"]) <= float(rows[0]["monotonic_s"])
+    if release_fails:
+        assert len(r._unreleased_images) == 1
+        assert r._cleanup_pyspin() is None
+        assert r._unreleased_images == []
+        assert actions.count("release") == 2
+        assert "Image release failed" in r._cleanup_errors[0]
+
+
+def test_pyspin_timeout_after_stop_is_normal_end_of_trigger_stream(tmp_path):
+    r = HeadlessSpinnakerRecorder(tmp_path, "test", "test")
+
+    def next_image(timeout):
+        r._running = False
+        raise RuntimeError("Spinnaker timeout")
+
+    r._timestamps = object()
+    r._camera = types.SimpleNamespace(GetNextImage=next_image)
+    r._running = True
+    r._capture_loop()
+    assert r.error is None
+    assert r._acquisition_timeouts == 1

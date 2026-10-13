@@ -50,6 +50,12 @@ REQUIRED_HUMAN_APPROVALS = frozenset(
 )
 
 
+def required_certification_checks(config: SessionConfig) -> frozenset[str]:
+    if config.licks.source == "optical":
+        return (REQUIRED_CERTIFICATION_CHECKS - {"cap_touch"}) | {"optical_lick"}
+    return REQUIRED_CERTIFICATION_CHECKS
+
+
 class AnimalUseGateError(RuntimeError):
     """Raised before animal acquisition when any release requirement is unproven."""
 
@@ -83,6 +89,10 @@ def certified_config_payload(config: SessionConfig) -> dict[str, Any]:
     # certificate that otherwise matches the exact task and hardware contract.
     payload["subject_id"] = None
     payload["results_dir"] = None
+    # Session length is checked against calibrated reward limits on every run.
+    # Reordering or choosing fewer trials does not change the hardware contract.
+    payload["n_trials"] = None
+    payload["random_seed"] = None
     reward = payload.get("reward")
     if isinstance(reward, dict):
         # The calibration artifact itself is bound separately by SHA-256.
@@ -90,8 +100,16 @@ def certified_config_payload(config: SessionConfig) -> dict[str, Any]:
     camera = payload.get("camera")
     if isinstance(camera, dict):
         camera["save_dir"] = None
+    monitor = payload.get("monitor")
+    if isinstance(monitor, dict) and monitor.get("record_path"):
+        # 'auto' resolves to a new absolute path after hardware opens. Preserve
+        # whether telemetry recording is enabled, not its per-session filename.
+        monitor["record_path"] = "<session>"
     task = payload.get("task")
     if isinstance(task, dict):
+        task["profile_name"] = None
+        task["n_free_trials"] = None
+        task["n_forced_trials"] = None
         task["selected_mouse_dir"] = None
         task["session_name"] = None
         task["session_dir"] = None
@@ -157,10 +175,13 @@ def build_release_identity(
         "git_commit": runtime.get("git_commit"),
         "git_exact_tag": runtime.get("git_exact_tag"),
         "git_dirty": runtime.get("git_dirty"),
+        "runtime_code_identity_scheme": runtime.get("runtime_code_identity_scheme"),
+        "runtime_code_sha256": runtime.get("runtime_code_sha256"),
         "requirements_lock_sha256": runtime.get("requirements_lock_sha256"),
         "package_versions": runtime.get("package_versions"),
         "python_version": runtime.get("python_version"),
         "streamdio_driver": runtime.get("streamdio_driver"),
+        "streamdio_driver_sha256": (runtime.get("streamdio_driver") or {}).get("source_sha256"),
         "config_sha256": certified_config_sha256(config),
         "source_config_sha256": source_sha256,
         "calibration_sha256": calibration_sha256,
@@ -295,12 +316,14 @@ def evaluate_animal_use_gate(
         "required_runtime_hardware",
         (not config.animal_use.require_camera or (config.camera.required and config.camera.record_video))
         and (not config.animal_use.require_speaker or config.speaker.required)
-        and (not config.animal_use.require_licks or config.licks.power_required),
+        and (not config.animal_use.require_licks
+             or config.licks.source == "optical" or config.licks.power_required),
         {
             "camera_required": config.camera.required,
             "camera_record_video": config.camera.record_video,
             "speaker_required": config.speaker.required,
             "lick_power_required": config.licks.power_required,
+            "lick_source": config.licks.source,
         },
     )
 
@@ -342,14 +365,22 @@ def evaluate_animal_use_gate(
     if not isinstance(certified_release, dict):
         certified_release = {}
     release_keys = (
-        "git_commit",
-        "git_exact_tag",
+        "streamdio_driver_sha256",
         "requirements_lock_sha256",
         "package_versions",
         "config_sha256",
         "calibration_sha256",
         "hardware_failsafe_revision",
     )
+    if identity.get("runtime_code_identity_scheme") or certified_release.get("runtime_code_identity_scheme"):
+        # A clean documentation/test-only commit need not repeat commissioning.
+        # Both sides must carry a matching installed-code hash; missing hashes
+        # and old certificates fail closed against a newly fingerprinted runtime.
+        release_keys += ("runtime_code_identity_scheme", "runtime_code_sha256", "python_version")
+    else:
+        # Historical provenance supplied during offline evaluation retains its
+        # original exact-commit semantics. Live capture always includes a scheme.
+        release_keys += ("git_commit",)
     mismatches = {
         key: {"certified": certified_release.get(key), "current": identity.get(key)}
         for key in release_keys
@@ -367,7 +398,7 @@ def evaluate_animal_use_gate(
     }
     missing_or_failed = {
         name: check_status.get(name)
-        for name in sorted(REQUIRED_CERTIFICATION_CHECKS)
+        for name in sorted(required_certification_checks(config))
         if check_status.get(name) != "PASS"
     }
     extra_nonpass = {
