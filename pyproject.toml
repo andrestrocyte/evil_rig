@@ -21,9 +21,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-sound = ["pybpod-soundcard-module"]
+# pybpod_soundcard_module, from MM_PyBpod2 (not on PyPI)
+sound = ["MM-PybBod2 @ git+https://github.com/andrestrocyte/MM_PyBpod2.git@a176c0e38520a4f29554198ae30711a08546d75d"]
 video = ["opencv-python>=4.0"]
-mm = ["pybpod-soundcard-module", "opencv-python>=4.0"]
+mm = ["MM-PybBod2 @ git+https://github.com/andrestrocyte/MM_PyBpod2.git@a176c0e38520a4f29554198ae30711a08546d75d", "opencv-python>=4.0"]
 dev = ["pytest==9.1.1", "mypy==2.2.0", "ruff==0.15.20", "types-PyYAML>=6.0"]
 
 [project.scripts]

@@ -1,7 +1,8 @@
 # Cross-platform Python 3.12 acquisition/CI lock, regenerated from a clean install.
 # PySpin is vendor-distributed and intentionally absent; see README camera setup.
 # streamdio follows its development branch until the first release; the installed
-# commit is recorded in each session's runtime provenance.
+# commit is recorded in each session's runtime provenance. MM_PyBpod2 supplies the
+# sound card driver (pybpod_soundcard_module) that plays the continuous white noise.
 annotated-types==0.7.0
 ast_serialize==0.6.0
 bpod-core==0.1.0a15
@@ -42,3 +43,4 @@ tzdata==2026.5
 xxhash==3.8.1
 zeroconf==0.150.0
 streamdio @ git+https://github.com/MathiasMahn/StreamDIO@development#subdirectory=software
+MM-PybBod2 @ git+https://github.com/andrestrocyte/MM_PyBpod2.git@a176c0e38520a4f29554198ae30711a08546d75d

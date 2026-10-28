@@ -293,7 +293,9 @@ python -m pip install -e . --no-deps
 
 (`scripts\install_rig.ps1` does the same and adds a desktop shortcut.) The lock installs the
 StreamDIO host driver, `streamdio`, from the `development` branch of its repository until its
-first release; each session's runtime provenance records the exact commit. To try another
+first release; each session's runtime provenance records the exact commit. It also installs
+the sound card driver that plays the white noise (`pybpod_soundcard_module`, part of
+[MM_PyBpod2](https://github.com/andrestrocyte/MM_PyBpod2) at a pinned commit). To try another
 version, pass `-StreamDio "-e C:\path\to\StreamDIO\software"` (or a git URL) to the install
 script. Deploy from this checkout with an editable install: the checkout remains the source of
 the rig profiles and operator documentation.
@@ -309,7 +311,7 @@ the fixed-layout firmware does not announce itself: pass its Teensy `Serial` por
 ```bash
 pip install -e ".[video]"   # offline FFV1 preview-video exporter (OpenCV)
 pip install -e ".[mm]"      # MM-style cold-path helpers (soundcard + OpenCV)
-pip install -e ".[sound]"   # pybpod soundcard module
+pip install -e ".[sound]"   # sound card driver (MM_PyBpod2's pybpod_soundcard_module)
 pip install -e ".[dev]"     # pytest, mypy, ruff, types-PyYAML
 ```
 
