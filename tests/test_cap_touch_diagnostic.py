@@ -1,3 +1,9 @@
+from dataclasses import replace
+from pathlib import Path
+
+from streamdio.testing import FakeModule, fake_streamdio
+
+from hf_dm.config import SessionConfig
 from hf_dm.hardware.bringup_constants import (
     CAP_TOUCH_INPUT_CHANNEL,
     CAP_TOUCH_INPUT_PIN,
@@ -5,6 +11,24 @@ from hf_dm.hardware.bringup_constants import (
 )
 from hf_dm.session.cap_touch_diagnostic import CapTouchDiagnosticState
 from hf_dm.session.cap_touch_diagnostic import _interpret_cap_touch_report
+from hf_dm.session.cap_touch_diagnostic import run_cap_touch_diagnostic
+
+CONFIG = Path(__file__).resolve().parents[1] / "configs" / "dm_50.yaml"
+
+
+def test_raw_analog_mode_still_reports_the_detector_status():
+    module = FakeModule()
+    config = SessionConfig.from_yaml(CONFIG)
+    config.ports = replace(
+        config.ports, dio_config_port=module.config_port, dio_stream_port=module.stream_port
+    )
+    with fake_streamdio(module):
+        report = run_cap_touch_diagnostic(config, duration_s=0.3, raw_analog=True)
+
+    assert report["mode"] == "raw_analog"
+    assert report["status_count"] > 0
+    assert report["final_status"]["enabled"] is True
+    assert report["final_status"]["baseline"] is not None
 
 
 def test_cap_touch_diagnostic_counts_lick_edges_status_and_force_separately():

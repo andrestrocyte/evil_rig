@@ -261,10 +261,9 @@ def run_cap_touch_diagnostic(
         next_print_s = 0.0
         while time.perf_counter() < deadline:
             now = time.perf_counter()
-            status: dict[str, Any] | None = None
-            if not raw_analog:
-                status = client.get_cap_touch_status()
-                state.add_status(status)
+            # The detector keeps running in raw mode, so its status is read in both.
+            status = client.get_cap_touch_status()
+            state.add_status(status)
             if now >= next_print_s:
                 snap = state.snapshot()
                 if raw_analog:
@@ -276,16 +275,14 @@ def run_cap_touch_diagnostic(
                         f"span={snap['cap_touch_analog_span']} "
                         f"samples={snap['cap_touch_analog_sample_count']}"
                     )
-                else:
-                    assert status is not None
-                    print(
-                        "touch status: "
-                        f"adc={snap['adc_last']} baseline={snap['baseline_last']} "
-                        f"active={int(status.get('state', 0))} "
-                        f"hi_edges={snap['high_edge_count']} "
-                        f"lo_edges={snap['low_edge_count']} "
-                        f"threshold={status.get('rising_high_threshold')}"
-                    )
+                print(
+                    "touch status: "
+                    f"adc={snap['adc_last']} baseline={snap['baseline_last']} "
+                    f"active={int(status.get('state', 0))} "
+                    f"hi_edges={snap['high_edge_count']} "
+                    f"lo_edges={snap['low_edge_count']} "
+                    f"threshold={status.get('rising_high_threshold')}"
+                )
                 next_print_s = now + 0.5
             time.sleep(poll_interval_s)
         listen_finished_mono_s = time.perf_counter()
