@@ -1,4 +1,4 @@
-"""Serial relay setup on Bpod (breakout board bytes, same as bringup notebooks)."""
+"""Bpod -> StreamDIO serial messages: outputs by module number, state markers."""
 
 from __future__ import annotations
 
@@ -13,12 +13,13 @@ from hf_dm.hardware.bringup_constants import (
     PUMP_OUTPUT_CHANNEL,
     SERIAL_GATE_OFF_MESSAGE_ID,
     SERIAL_GATE_ON_MESSAGE_ID,
-    SPEAKER_GATE_OPCODE,
+    SPEAKER_OUTPUT_CHANNEL,
     STREAMDIO_BPOD_STATE_OPCODE,
     STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID,
     STREAMDIO_STATE_MARKER_MESSAGE_IDS,
     STREAMDIO_STATE_MARKERS,
 )
+from hf_dm.streamdio.channel_map import MODULE_OUTPUT_NUMBERS
 
 
 def wait_until_perf_counter(deadline_s: float, spin_window_s: float = 0.025) -> None:
@@ -41,6 +42,11 @@ class RelayMessageIds:
     ccw_force_off: int = 6
     speaker_gate_on: int = SERIAL_GATE_ON_MESSAGE_ID
     speaker_gate_off: int = SERIAL_GATE_OFF_MESSAGE_ID
+
+
+def _output_message(channel: int, level: int) -> list[int]:
+    """StreamDIO's Serial1 output command for evil_rig output ``channel``."""
+    return [MODULE_OUTPUT_NUMBERS[int(channel)], int(level)]
 
 
 def _serial_module_name(bpod: Bpod, serial_channel_index: int) -> str:
@@ -86,21 +92,16 @@ class SerialRelay:
 
     def _load_messages(self) -> None:
         m = self.module
+        on = 1 if self.speaker_gate_active_high else 0
         pairs = [
-            (self.ids.pump_on, [PUMP_OUTPUT_CHANNEL, 1]),
-            (self.ids.pump_off, [PUMP_OUTPUT_CHANNEL, 0]),
-            (self.ids.cw_force_on, [CW_FORCE_OUTPUT_CHANNEL, 1]),
-            (self.ids.cw_force_off, [CW_FORCE_OUTPUT_CHANNEL, 0]),
-            (self.ids.ccw_force_on, [CCW_FORCE_OUTPUT_CHANNEL, 1]),
-            (self.ids.ccw_force_off, [CCW_FORCE_OUTPUT_CHANNEL, 0]),
-            (
-                self.ids.speaker_gate_on,
-                [SPEAKER_GATE_OPCODE, 1 if self.speaker_gate_active_high else 0],
-            ),
-            (
-                self.ids.speaker_gate_off,
-                [SPEAKER_GATE_OPCODE, 0 if self.speaker_gate_active_high else 1],
-            ),
+            (self.ids.pump_on, _output_message(PUMP_OUTPUT_CHANNEL, 1)),
+            (self.ids.pump_off, _output_message(PUMP_OUTPUT_CHANNEL, 0)),
+            (self.ids.cw_force_on, _output_message(CW_FORCE_OUTPUT_CHANNEL, 1)),
+            (self.ids.cw_force_off, _output_message(CW_FORCE_OUTPUT_CHANNEL, 0)),
+            (self.ids.ccw_force_on, _output_message(CCW_FORCE_OUTPUT_CHANNEL, 1)),
+            (self.ids.ccw_force_off, _output_message(CCW_FORCE_OUTPUT_CHANNEL, 0)),
+            (self.ids.speaker_gate_on, _output_message(SPEAKER_OUTPUT_CHANNEL, on)),
+            (self.ids.speaker_gate_off, _output_message(SPEAKER_OUTPUT_CHANNEL, 1 - on)),
         ]
         pairs.extend(
             (
@@ -162,7 +163,7 @@ class SerialRelay:
             raise RuntimeError("Incomplete Bpod optical-marker USB write")
 
     def set_channel_state(self, channel: int, state: bool) -> None:
-        self.send_bytes([int(channel), 1 if state else 0])
+        self.send_bytes(_output_message(channel, 1 if state else 0))
 
     def set_force_direction(self, direction: str | None) -> None:
         if direction == "cw":
@@ -191,7 +192,7 @@ class SerialRelay:
 
     def speaker_gate(self, enabled: bool) -> None:
         on_level = 1 if self.speaker_gate_active_high else 0
-        self.send_bytes([SPEAKER_GATE_OPCODE, on_level if enabled else 1 - on_level])
+        self.set_channel_state(SPEAKER_OUTPUT_CHANNEL, bool(on_level if enabled else 1 - on_level))
 
     def pulse_speaker_gate(self, duration_s: float) -> None:
         self.speaker_gate(True)

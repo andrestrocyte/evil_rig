@@ -465,3 +465,16 @@ def test_alyx_token_is_rejected_in_yaml():
             raise AssertionError("YAML credential was accepted")
 
     assert "integrations.alyx_token" in fields
+
+
+def test_cap_touch_thresholds_the_module_would_refuse_are_flagged():
+    config = SessionConfig.from_yaml("configs/dm_50.yaml")
+    assert "licks.cap_touch_*" not in {issue.field for issue in config_validation_issues(config)}
+
+    config.licks.cap_touch_delta_high = 80
+    config.licks.cap_touch_delta_low = 90  # the release must sit below the touch
+    issues = {issue.field: issue for issue in config_validation_issues(config)}
+    assert "off_delta" in issues["licks.cap_touch_*"].message
+
+    config.licks.source = "optical"  # no lick detector on the module
+    assert "licks.cap_touch_*" not in {issue.field for issue in config_validation_issues(config)}

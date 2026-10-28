@@ -14,6 +14,7 @@ from hf_dm.fsm.reference import (
     build_reward_fsm,
 )
 from hf_dm.fsm.relay import RelayMessageIds, SerialRelay
+from hf_dm.streamdio.channel_map import hfdm_channel_map
 from hf_dm.data.recorder import SessionRecorder
 from hf_dm.hardware.bringup_constants import (
     STREAMDIO_BPOD_STATE_OPCODE,
@@ -263,10 +264,25 @@ def test_serial_relay_preloads_rig_force_outputs_and_streamdio_state_markers():
         call.args[0]: list(call.args[1])
         for call in module.load_serial_message.call_args_list
     }
-    assert loaded[relay.ids.cw_force_on] == [3, 1]  # Teensy pin 21
-    assert loaded[relay.ids.cw_force_off] == [3, 0]
-    assert loaded[relay.ids.ccw_force_on] == [5, 1]  # Teensy pin 19
-    assert loaded[relay.ids.ccw_force_off] == [5, 0]
+    # Outputs by their number in the StreamDIO map: [output, level].
+    outputs = [
+        channel.name
+        for channel in hfdm_channel_map()
+        if channel.FUNCTION in {"digital_out", "pulse_out"}
+    ]
+
+    def output(message_id):
+        number, level = loaded[message_id]
+        return outputs[number - 1], level
+
+    assert output(relay.ids.pump_on) == ("pump", 1)
+    assert output(relay.ids.pump_off) == ("pump", 0)
+    assert output(relay.ids.cw_force_on) == ("cwforce", 1)  # Teensy pin 21
+    assert output(relay.ids.cw_force_off) == ("cwforce", 0)
+    assert output(relay.ids.ccw_force_on) == ("ccwforce", 1)  # Teensy pin 19
+    assert output(relay.ids.ccw_force_off) == ("ccwforce", 0)
+    assert output(relay.ids.speaker_gate_on) == ("speaker", 1)  # Teensy pin 26
+    assert output(relay.ids.speaker_gate_off) == ("speaker", 0)
     assert loaded[STREAMDIO_STATE_MARKER_MESSAGE_IDS["Quiescence"]] == [
         STREAMDIO_BPOD_STATE_OPCODE,
         1,

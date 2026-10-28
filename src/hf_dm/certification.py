@@ -551,6 +551,7 @@ def _missing_hardware_identity(
         ("bpod", "serial_number"),
         ("bpod", "firmware"),
         ("streamdio", "firmware_version"),
+        ("streamdio", "build_id"),
         ("camera", "serial_number"),
         ("camera", "firmware_version"),
     )

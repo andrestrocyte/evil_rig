@@ -1,6 +1,5 @@
 from collections import Counter
 from types import SimpleNamespace
-import threading
 
 import numpy as np
 import pytest
@@ -60,26 +59,16 @@ def test_storage_guard_checks_destination_before_hardware_and_preserves_reserve(
 
 def test_camera_history_survives_driver_ring_without_analog_scan():
     from hf_dm.streamdio.client import StreamDIOClient
-    class Driver:
-        _event_lock = threading.Lock()
-        _all_events_history = []
-        _event_history = []
-        def clear_event_history(self):
-            self._all_events_history.clear()
-        def start_streaming(self, callback):
-            self.callback = callback
-            return True
-        def get_event_history(self, **kwargs):
-            pytest.fail('camera access must not scan the analog history')
-    client = StreamDIOClient.__new__(StreamDIOClient)
-    client._dio = Driver()
-    client.start_streaming()
-    raw = client._dio
+
+    client = StreamDIOClient(baudrate=0)
+    client._camera_output = 6  # the camera trigger's module output number
+    client._analog = {1: 13}
     for index in range(60000):
-        raw._all_events_history.append(('analog_input', 13, 1, index, index/1000))
+        client._dispatch_event("analog_in", 1, 1, index, index / 1000)
         if index % 30 == 0:
-            raw.callback('camera', 0, 0, index, index/1000)
-    assert len(raw._all_events_history) == 50000
+            client._dispatch_event("dio_output", 6, 1, index, index / 1000)
+            client._dispatch_event("dio_output", 6, 0, index + 1, index / 1000)
+    # One camera event per frame (the trigger's rising edge), none for the analog.
     assert len(client.get_camera_events()) == 2000
     assert client.get_camera_events()[0] == (0, 0)
     copy = client.get_camera_events()

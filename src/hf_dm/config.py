@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import re
 from dataclasses import asdict, dataclass, field, fields
@@ -22,7 +23,6 @@ from hf_dm.hardware.bringup_constants import (
     FORCE_ANALOG_CHANNEL,
     LICK_INPUT_CHANNEL,
     PULSE_INPUT_CHANNEL,
-    SPEAKER_NOISE_SAMPLE_INTERVAL_US,
 )
 from hf_dm.streamdio.wheel import WheelKinematics
 
@@ -153,7 +153,6 @@ class LickConfig:
 
 @dataclass
 class SpeakerConfig:
-    sample_interval_us: int = SPEAKER_NOISE_SAMPLE_INTERVAL_US
     frequency_hz: float = 6000.0
     volume: float = 1.0
     gate_active_high: bool = True
@@ -537,12 +536,6 @@ class SessionConfig:
                 cap_touch_delta_low=optional_lick_int("cap_touch_delta_low"),
             ),
             speaker=SpeakerConfig(
-                sample_interval_us=int(
-                    speaker_raw.get(
-                        "sample_interval_us",
-                        SPEAKER_NOISE_SAMPLE_INTERVAL_US,
-                    )
-                ),
                 frequency_hz=float(speaker_raw.get("frequency_hz", 6000.0)),
                 volume=float(speaker_raw.get("volume", 1.0)),
                 gate_active_high=bool(speaker_raw.get("gate_active_high", True)),
@@ -1183,6 +1176,17 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
         ),
         config.licks.power_output_channel,
     )
+    streamdio_map_error = _streamdio_map_error(config)
+    require(
+        streamdio_map_error is None,
+        "licks.cap_touch_*",
+        f"StreamDIO would refuse the channel map: {streamdio_map_error}",
+        (
+            config.licks.cap_touch_min_high_threshold,
+            config.licks.cap_touch_delta_high,
+            config.licks.cap_touch_delta_low,
+        ),
+    )
 
     # All digital inputs share one StreamDIO DI bank, so any overlap means two
     # subsystems would consume each other's edges (the analog force channel is
@@ -1206,7 +1210,6 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
         else:
             seen_inputs[channel] = field_name
     speaker = config.speaker
-    require(speaker.sample_interval_us > 0, "speaker.sample_interval_us", "must be greater than zero", speaker.sample_interval_us)
     require(finite(speaker.frequency_hz) and speaker.frequency_hz > 0, "speaker.frequency_hz", "must be finite and greater than zero", speaker.frequency_hz)
     require(finite(speaker.volume) and 0 <= speaker.volume <= 1, "speaker.volume", "must be between zero and one", speaker.volume)
 
@@ -1361,6 +1364,27 @@ def config_validation_issues(config: SessionConfig) -> list[ConfigValidationIssu
             animal.hardware_failsafe_revision,
         )
     return issues
+
+
+@functools.lru_cache(maxsize=1)
+def _streamdio_board() -> Any:
+    # streamdio's simulated v1.1 board table, parity-tested against the firmware's
+    from streamdio.testing import FakeModule
+
+    return FakeModule().board_info()
+
+
+def _streamdio_map_error(config: SessionConfig) -> str | None:
+    """Why the module would refuse this session's channel map, checked offline."""
+    from streamdio import StreamDIOConfigError
+
+    from hf_dm.streamdio.channel_map import session_channel_map
+
+    try:
+        session_channel_map(config).validate(_streamdio_board())
+    except StreamDIOConfigError as exc:
+        return str(exc)
+    return None
 
 
 def validate_session_config(config: SessionConfig) -> SessionConfig:

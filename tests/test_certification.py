@@ -51,7 +51,7 @@ def _release_fixture(tmp_path):
         "package_versions": {"bpod-hf-dm": "0.1.0", "bpod-core": "0.1.0a12"},
         "python_version": "3.12.test",
         "streamdio_driver": {
-            "module": "pybpod_streamDIO_module",
+            "module": "streamdio",
             "module_path": "C:/vendor/streamdio.py",
             "git_commit": "c" * 40,
             "git_dirty": False,
@@ -68,7 +68,7 @@ def _release_fixture(tmp_path):
         "release": release,
         "hardware": {
             "bpod": {"serial_number": "17032730", "firmware": [23, 10]},
-            "streamdio": {"firmware_version": 6, "serial_number": "streamdio-rig1"},
+            "streamdio": {"firmware_version": 1, "build_id": "f2ac047", "serial_number": "streamdio-rig1"},
             "camera": {"serial_number": "20137635", "firmware_version": "2112.0.125.0"},
         },
         "checks": [

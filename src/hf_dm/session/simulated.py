@@ -24,7 +24,7 @@ from hf_dm.hardware.bringup_constants import (
     CW_FORCE_OUTPUT_CHANNEL,
     FRAME2TTL_INPUT_CHANNEL,
     PUMP_OUTPUT_CHANNEL,
-    SPEAKER_GATE_PIN,
+    SPEAKER_OUTPUT_CHANNEL,
     STREAMDIO_STATE_MARKER_IDS_BY_MESSAGE_ID,
     STREAMDIO_STATE_MARKER_MESSAGE_IDS,
     STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE,
@@ -176,26 +176,13 @@ class SimulatedRelay:
 
     def speaker_gate(self, enabled: bool) -> dict:
         self.ops.append(("speaker_gate", bool(enabled), time.perf_counter()))
-        now = time.perf_counter()
-        return {
-            "enabled": bool(enabled),
-            "acknowledged": True,
-            "command_start_mono_s": now,
-            "command_end_mono_s": now,
-            "status": {
-                "enabled": bool(enabled),
-                "pin": SPEAKER_GATE_PIN,
-                "sample_interval_us": 100,
-                "samples_generated": 1 if enabled else 0,
-                "current_state": 0,
-            },
-        }
+        return {**self._transition(SPEAKER_OUTPUT_CHANNEL, enabled), "enabled": bool(enabled)}
 
     def pulse_speaker_gate(self, duration_s: float) -> dict:
         on = self.speaker_gate(True)
         time.sleep(max(0.0, float(duration_s)))
         off = self.speaker_gate(False)
-        return {"on": on, "active_status": on["status"], "off": off}
+        return {"on": on, "off": off}
 
     def cap_touch_power(self, enabled: bool) -> dict:
         self.ops.append(("cap_touch_power", bool(enabled), time.perf_counter()))

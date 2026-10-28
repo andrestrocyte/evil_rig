@@ -120,7 +120,7 @@ def _fake_runner(**kwargs):
                 "events": events,
                 "metadata": {
                     "bpod": {"serial_number": "17032730", "firmware": [23, 10]},
-                    "streamdio_module_info": {"firmware_version": 4},
+                    "streamdio_module_info": {"firmware_version": 1, "build_id": "f2ac047"},
                 },
                 "stream_summaries": {"streamdio": {"buffer_overruns": 0}},
             },

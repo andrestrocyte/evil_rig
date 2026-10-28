@@ -5,13 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bpod-hf-dm"
 version = "0.1.2"
-description = "Head-fixed decision-making task (wheel + force) on bpod-core with StreamDIO bringup compatibility"
+description = "Head-fixed decision-making task (wheel + force) on bpod-core and StreamDIO"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = "MIT"
 authors = [{ name = "HF DM Team" }]
 dependencies = [
-  "bpod-core==0.1.0a12",
+  "bpod-core==0.1.0a15",
+  # The StreamDIO host driver, from its development branch until the first release.
+  "streamdio @ git+https://github.com/MathiasMahn/StreamDIO@development#subdirectory=software",
   "numpy==1.26.4",
   "pyyaml==6.0.3",
   "pyserial==3.5",
@@ -50,3 +52,8 @@ select = ["E4", "E7", "E9", "F"]
 [tool.mypy]
 python_version = "3.12"
 follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+# streamdio does not ship type information (py.typed) yet.
+module = ["streamdio", "streamdio.*"]
+ignore_missing_imports = true

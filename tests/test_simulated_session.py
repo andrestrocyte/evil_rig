@@ -262,7 +262,10 @@ def test_default_balancing_preserves_seeded_trial_record_snapshot(tmp_path):
     assert provenance["python_version"]
     assert provenance["python_executable"]
     assert provenance["requirements_lock_sha256"]
-    assert provenance["streamdio_driver"]["module"] == "pybpod_streamDIO_module"
+    assert provenance["streamdio_driver"]["module"] == "streamdio"
+    assert provenance["package_versions"]["streamdio"]
+    # Installed from the StreamDIO repository: the commit is the driver's identity.
+    assert provenance["streamdio_driver"]["git_commit"]
     assert header["payload"]["git_commit"] == provenance["git_commit"]
     assert header["payload"]["git_dirty"] == provenance["git_dirty"]
     assert all(trial.reward_volume_ul is None for trial in session.recorder.trials)

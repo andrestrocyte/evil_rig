@@ -1,4 +1,4 @@
-"""StreamDIO wrapper: imports MM_PyBpod2 module (same as bringup notebooks)."""
+"""StreamDIO client: the ``streamdio`` driver, speaking evil_rig's channel numbers."""
 
 from __future__ import annotations
 
@@ -8,83 +8,73 @@ import time
 from collections import defaultdict, deque
 from typing import Any, Callable
 
+from streamdio import ModuleConfig, StreamDIO
+
 from hf_dm.hardware.bringup_constants import (
-    CAP_TOUCH_DEFAULT_DELTA_HIGH,
-    CAP_TOUCH_DEFAULT_DELTA_LOW,
-    CAP_TOUCH_DEFAULT_MIN_HIGH_THRESHOLD,
+    CAMERA_TRIGGER_PIN,
     CAP_TOUCH_INPUT_CHANNEL,
     CAP_TOUCH_INPUT_PIN,
     DEFAULT_CAMERA_EXPOSURE_US,
     DEFAULT_CAMERA_FREQUENCY_HZ,
-    DIRECTION_INPUT_CHANNEL,
-    FORCE_ANALOG_CHANNEL,
-    FORCE_ANALOG_PIN,
-    FORCE_ANALOG_SAMPLE_INTERVAL_US,
-    INPUT_REFRACTORY_PERIOD_US,
-    LICK_INPUT_CHANNEL,
-    PULSE_INPUT_CHANNEL,
-    STREAMDIO_ANALOG_INPUT_EVENT_BASE,
-    STREAMDIO_BPOD_STATE_EVENT_BASE,
-    STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION,
-    STREAMDIO_CAP_TOUCH_DIGITIZER_FIRMWARE_VERSION,
-    STREAMDIO_DIO_INPUT_EVENT_BASE,
-    STREAMDIO_DIO_OUTPUT_EVENT_BASE,
-    STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE,
-    STREAMDIO_TIMING_HEARTBEAT_FIRMWARE_VERSION,
+    SPEAKER_GATE_PIN,
+    STREAMDIO_TIMING_HEARTBEAT_PERIOD_US,
 )
-from hf_dm.hardware.discovery import resolve_streamdio_ports
+from hf_dm.streamdio.channel_map import (
+    ANALOG_CHANNELS,
+    CAMERA,
+    INPUT_CHANNELS,
+    LICK,
+    OUTPUT_CHANNELS,
+    SPEAKER,
+)
 from hf_dm.timing_heartbeat import TIMING_HEARTBEAT_EVENT_TYPE
 
+logger = logging.getLogger(__name__)
 
-class _TimingHeartbeatLogFilter(logging.Filter):
-    """Suppress only MM_PyBpod2's per-heartbeat WARNING log line."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        return f"Diagnostic event {STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE} " not in message
-
-
-def _uint12(value: int) -> int:
-    return max(0, min(4095, int(value)))
+# The in-RAM history is a debugging view: the session recorder keeps the stream.
+DRIVER_HISTORY_EVENTS = 50_000
+CAMERA_STOP_TIMEOUT_S = 0.5
+# Detector state as the fixed-layout firmware reported its polarity.
+_POLARITY_CODES = {None: 0, "rising": 1, "falling": 2}
 
 
 def _json_safe(value: Any) -> Any:
     return value.item() if hasattr(value, "item") else value
 
 
+def _number_table(dio: StreamDIO, event_type: str, logical: dict[str, int]) -> dict[int, int]:
+    """Module channel number -> evil_rig channel number, for the running map."""
+    table: dict[int, int] = {}
+    number = 1
+    while (name := dio.channel_name(event_type, number)) is not None:
+        if name in logical:
+            table[number] = logical[name]
+        number += 1
+    return table
+
+
 class StreamDIOClient:
-    """Thin facade over pybpod_streamDIO_module.StreamDIOProtocol."""
+    """The StreamDIO module, with events and outputs in evil_rig's channel numbers.
+
+    Events reach the callback as the rest of evil_rig records them: ``dio_input``,
+    ``dio_output`` and ``analog_input`` carry evil_rig channel numbers, each camera
+    trigger is one ``camera`` event (its rising edge), and the module's delivery
+    heartbeat is a ``timing_heartbeat`` event. Other events pass through unchanged.
+    """
 
     def __init__(self, config_port: str = "AUTO", stream_port: str = "AUTO", *, baudrate: int):
-        # The bringup driver logs every 1 kHz analog sample at INFO and pybpod's
-        # ArCOM logger can emit byte-level DEBUG messages. Both streams can stall
-        # the task/display loop even though experiment data are already retained
-        # by StreamDIO and this session recorder.
-        for name in ("stream_dio_protocol", "stream_dio_base"):
-            driver_logger = logging.getLogger(f"pybpod_streamDIO_module.{name}")
-            driver_logger.setLevel(logging.WARNING)
-            if not any(isinstance(item, _TimingHeartbeatLogFilter) for item in driver_logger.filters):
-                driver_logger.addFilter(_TimingHeartbeatLogFilter())
-        logging.getLogger("pybpodapi.com.arcom").setLevel(logging.WARNING)
-        try:
-            from pybpod_streamDIO_module.stream_dio_protocol import StreamDIOProtocol
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "pybpod_streamDIO_module is not installed. Install MM_PyBpod2 "
-                "into this environment, or vendor the StreamDIO driver explicitly."
-            ) from exc
-        StreamDIOProtocol.DIO_INPUT_EVENT_BASE = STREAMDIO_DIO_INPUT_EVENT_BASE
-        StreamDIOProtocol.DIO_OUTPUT_EVENT_BASE = STREAMDIO_DIO_OUTPUT_EVENT_BASE
-        StreamDIOProtocol.ANALOG_INPUT_EVENT_BASE = STREAMDIO_ANALOG_INPUT_EVENT_BASE
-        StreamDIOProtocol.BPOD_STATE_EVENT_BASE = STREAMDIO_BPOD_STATE_EVENT_BASE
-
-        self._protocol_cls = StreamDIOProtocol
         self.config_port = config_port
         self.stream_port = stream_port
-        self.baudrate = baudrate
-        self._dio: Any = None
+        self.baudrate = baudrate  # USB serial: the module ignores it
+        self._dio: StreamDIO | None = None
         self._callback: Callable[..., None] | None = None
         self._config_lock = threading.Lock()
+        self._map: ModuleConfig | None = None
+        self._inputs: dict[int, int] = {}
+        self._outputs: dict[int, int] = {}
+        self._module_outputs: dict[int, int] = {}
+        self._analog: dict[int, int] = {}
+        self._camera_output: int | None = None
         self._output_condition = threading.Condition()
         self._output_states: dict[int, int] = {}
         self._output_sequences: dict[int, int] = defaultdict(int)
@@ -96,124 +86,106 @@ class StreamDIOClient:
         self._last_buffer_stats: dict[str, int] = {}
         self._camera_events: list[tuple[int, float]] = []
 
-    def open(
-        self,
-        excluded_bpod_port: str | None = None,
-        excluded_bpod_ports: set[str] | None = None,
-    ) -> None:
-        cfg, stream = resolve_streamdio_ports(
-            self.config_port,
-            self.stream_port,
-            excluded_port=excluded_bpod_port,
-            excluded_ports=excluded_bpod_ports,
-            baud=self.baudrate,
-        )
-        self.config_port = cfg
-        self.stream_port = stream
-        self._dio = self._protocol_cls(config_port=cfg, stream_port=stream, connect=False)
+    def open(self) -> None:
+        """Connect to both USB interfaces; ``AUTO`` ports are found by listening."""
+        config_port = None if self.config_port == "AUTO" else self.config_port
+        stream_port = None if self.stream_port == "AUTO" else self.stream_port
         try:
-            self._dio.open()
-            # The driver supplies a historical pin-27 default. Read the actual
-            # firmware value before recording hardware identity or certification.
-            speaker_status = self._dio.get_speaker_status()
-            self._dio.module_info["speaker_pin"] = int(speaker_status["pin"])
-            # Firmware initialization drives all module outputs low.
-            n_outputs = int(self._dio.module_info["n_output_channels"])
+            self._dio = StreamDIO(
+                config_port=config_port,
+                stream_port=stream_port,
+                history_maxlen=DRIVER_HISTORY_EVENTS,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to open StreamDIO config={self.config_port}, stream={self.stream_port}. "
+                "If Windows reports 'Access is denied', close old hf-dm-run/python "
+                "processes, serial monitors, or unplug/replug the StreamDIO USB device."
+            ) from exc
+        self.config_port = self._dio.config_port
+        self.stream_port = self._dio.stream_port
+
+    def apply_map(self, channel_map: ModuleConfig) -> dict[str, Any]:
+        """Make ``channel_map`` the module's map; outputs start at their initial level.
+
+        The driver checks it against the board, applies it and compares the hash it
+        reads back. Any Bpod object created earlier must re-read the module
+        (``bpod.update_modules()``): its event names and count follow the map.
+        """
+        dio = self._require_dio()
+        with self._config_lock:
+            dio.apply_config(channel_map)
+            status = dio.config_status()
+            dio.start_latency_heartbeat(STREAMDIO_TIMING_HEARTBEAT_PERIOD_US // 1000)
+            self._map = channel_map
+            self._inputs = _number_table(dio, "dio_input", INPUT_CHANNELS)
+            self._outputs = _number_table(dio, "dio_output", OUTPUT_CHANNELS)
+            self._module_outputs = {
+                logical: number for number, logical in self._outputs.items()
+            }
+            self._analog = _number_table(dio, "analog_in", ANALOG_CHANNELS)
+            self._camera_output = next(
+                (
+                    number
+                    for number in range(1, len(channel_map) + 1)
+                    if dio.channel_name("dio_output", number) == CAMERA
+                ),
+                None,
+            )
             with self._output_condition:
-                self._output_states = {channel: 0 for channel in range(1, n_outputs + 1)}
+                self._output_states = {
+                    logical: 0 for logical in self._module_outputs
+                }
+                for channel in channel_map:
+                    if channel.name in OUTPUT_CHANNELS and hasattr(channel, "initial"):
+                        self._output_states[OUTPUT_CHANNELS[channel.name]] = int(
+                            channel.initial
+                        )
                 self._output_sequences = defaultdict(int)
                 self._output_events = {}
                 self._output_event_history = defaultdict(lambda: deque(maxlen=64))
-        except Exception as exc:
-            # Retain the handle so session cleanup can close a partial connection.
-            raise RuntimeError(
-                f"Failed to open StreamDIO config={cfg}, stream={stream}. "
-                "If Windows reports 'Access is denied', close old hf-dm-run/python "
-                "processes, PyBpod notebooks, serial monitors, or unplug/replug the "
-                "StreamDIO USB device."
-            ) from exc
+        return {str(key): _json_safe(value) for key, value in status.items()}
 
-    def configure_rotary_and_force(
-        self,
-        lick_channels: tuple[int, ...] = (LICK_INPUT_CHANNEL,),
-        extra_input_channels: tuple[int, ...] = (),
-    ) -> None:
-        if self._dio is None:
-            raise RuntimeError("StreamDIO not connected")
-        with self._config_lock:
-            firmware_version = int(self._dio.module_info.get("firmware_version", 0))
-            if firmware_version < STREAMDIO_TIMING_HEARTBEAT_FIRMWARE_VERSION:
-                raise RuntimeError(
-                    "StreamDIO firmware does not emit the required 100 ms timing "
-                    f"heartbeat. Found firmware version {firmware_version}; expected "
-                    f"{STREAMDIO_TIMING_HEARTBEAT_FIRMWARE_VERSION} or newer. Flash "
-                    "firmware/Module_DIO_streeaming_100us_cycle before running a task."
-                )
-            if LICK_INPUT_CHANNEL in {int(channel) for channel in lick_channels}:
-                if firmware_version < STREAMDIO_CAP_TOUCH_DIGITIZER_FIRMWARE_VERSION:
-                    raise RuntimeError(
-                        "StreamDIO firmware does not include the cap-touch digitizer. "
-                        f"Found firmware version {firmware_version}; expected "
-                        f"{STREAMDIO_CAP_TOUCH_DIGITIZER_FIRMWARE_VERSION} or newer. "
-                        "Flash firmware/Module_DIO_streeaming_100us_cycle before running "
-                        "with cap-touch licks on channel 14."
-                    )
-            enable_vector = [False] * int(self._dio.module_info["n_input_channels"])
-            enable_vector[PULSE_INPUT_CHANNEL - 1] = True
-            enable_vector[DIRECTION_INPUT_CHANNEL - 1] = True
-            for channel in tuple(lick_channels) + tuple(extra_input_channels):
-                if 1 <= int(channel) <= len(enable_vector):
-                    enable_vector[int(channel) - 1] = True
-            ok = self._dio.configure_module(
-                refractory_period=INPUT_REFRACTORY_PERIOD_US,
-                input_channels_enabled=enable_vector,
-                analog_input={
-                    "channel": FORCE_ANALOG_CHANNEL,
-                    "enabled": True,
-                    "sample_interval_us": FORCE_ANALOG_SAMPLE_INTERVAL_US,
-                },
-            )
-            if not ok:
-                raise RuntimeError("StreamDIO configure_module failed")
-            status = self._dio.get_analog_input_status()
-        if not status.get("enabled"):
-            raise RuntimeError(f"Analog force not enabled: {status}")
-        if int(status.get("channel", -1)) != FORCE_ANALOG_CHANNEL:
-            raise RuntimeError(f"Unexpected force channel: {status}")
-        if int(status.get("pin", -1)) != FORCE_ANALOG_PIN:
-            raise RuntimeError(f"Unexpected force pin: {status}")
+    @property
+    def channel_map(self) -> ModuleConfig | None:
+        return self._map
 
-    def configure_cap_touch_analog_diagnostic(
-        self,
-        *,
-        sample_interval_us: int = FORCE_ANALOG_SAMPLE_INTERVAL_US,
-    ) -> dict[str, Any]:
-        """Temporarily stream cap-touch pin 25 as the only analog channel."""
+    def module_output_number(self, channel: int) -> int:
+        """The module's number for evil_rig output ``channel``."""
+        try:
+            return self._module_outputs[int(channel)]
+        except KeyError:
+            raise RuntimeError(f"Output channel {channel} is not in the StreamDIO map") from None
+
+    @property
+    def module_info(self) -> dict[str, Any]:
+        """The module's identity: what a rig certificate binds, stable across sessions.
+
+        The firmware build (``build_id``) identifies the firmware exactly; the version
+        stays 1 until StreamDIO's first release. What changes from session to session
+        (the map, its hash, the boot ID) is in :meth:`map_info`.
+        """
         if self._dio is None:
-            raise RuntimeError("StreamDIO not connected")
-        with self._config_lock:
-            enable_vector = [False] * int(self._dio.module_info["n_input_channels"])
-            ok = self._dio.configure_module(
-                refractory_period=INPUT_REFRACTORY_PERIOD_US,
-                input_channels_enabled=enable_vector,
-                analog_input={
-                    "channel": CAP_TOUCH_INPUT_CHANNEL,
-                    "enabled": True,
-                    "sample_interval_us": int(sample_interval_us),
-                },
-            )
-            if not ok:
-                raise RuntimeError("StreamDIO cap-touch analog diagnostic config failed")
-            status = self._dio.get_analog_input_status()
-        if not status.get("enabled"):
-            raise RuntimeError(f"Analog cap-touch not enabled: {status}")
-        if int(status.get("channel", -1)) != CAP_TOUCH_INPUT_CHANNEL:
-            raise RuntimeError(f"Unexpected cap-touch analog channel: {status}")
-        if int(status.get("pin", -1)) != CAP_TOUCH_INPUT_PIN:
-            raise RuntimeError(f"Unexpected cap-touch analog pin: {status}")
+            return {}
+        info = {
+            key: _json_safe(self._dio.module_info.get(key))
+            for key in ("name", "firmware_version", "build_id", "board_id")
+        }
+        info["board"] = getattr(self._dio.board, "name", None)
+        info["speaker_pin"] = SPEAKER_GATE_PIN
+        info["camera_pin"] = CAMERA_TRIGGER_PIN
+        return info
+
+    def map_info(self) -> dict[str, Any]:
+        """The running map, as applied this session: channels, hash, boot ID."""
+        if self._dio is None or self._map is None:
+            return {}
         return {
-            str(key): value.item() if hasattr(value, "item") else value
-            for key, value in dict(status).items()
+            "channel_map": self._map.to_dict(),
+            **{
+                key: _json_safe(self._dio.module_info.get(key))
+                for key in ("config_source", "config_hash", "boot_id", "n_bpod_events")
+            },
         }
 
     def start_camera_session(
@@ -221,69 +193,57 @@ class StreamDIOClient:
         frequency_hz: int = DEFAULT_CAMERA_FREQUENCY_HZ,
         exposure_us: int = DEFAULT_CAMERA_EXPOSURE_US,
     ) -> None:
-        if self._dio is None:
-            raise RuntimeError("StreamDIO not connected")
+        dio = self._require_dio()
         with self._config_lock:
-            if not self._dio.start_camera_triggers(frequency=frequency_hz, exposure_us=exposure_us):
-                raise RuntimeError("Failed to start camera triggers on StreamDIO")
-            status = self._camera_trigger_status()
-            if (
-                not isinstance(status, dict)
-                or not bool(status.get("camera_enabled"))
-                or int(status.get("camera_frequency", -1)) != int(frequency_hz)
-                or int(status.get("camera_exposure_us", -1)) != int(exposure_us)
-            ):
-                raise RuntimeError(f"Unexpected camera trigger status after start: {status}")
+            camera = dio.pulses[CAMERA]
+            camera.start(hz=frequency_hz, width_us=exposure_us)
+            status = camera.status()
+        if (
+            not status.get("running")
+            or round(float(status.get("frequency_hz", -1)), 3) != round(float(frequency_hz), 3)
+            or int(status.get("width_us", -1)) != int(exposure_us)
+        ):
+            raise RuntimeError(f"Unexpected camera trigger status after start: {status}")
 
     def stop_camera(self) -> None:
-        if self._dio is not None:
-            with self._config_lock:
-                if not self._dio.stop_camera_triggers():
-                    raise RuntimeError("Failed to stop camera triggers on StreamDIO")
-                status = self._camera_trigger_status()
-                if not isinstance(status, dict) or bool(status.get("camera_enabled", True)):
+        if self._dio is None:
+            return
+        with self._config_lock:
+            camera = self._dio.pulses[CAMERA]
+            camera.stop()
+            # A stop takes effect after the frame in progress.
+            deadline = time.perf_counter() + CAMERA_STOP_TIMEOUT_S
+            while (status := camera.status()).get("running"):
+                if time.perf_counter() > deadline:
                     raise RuntimeError(f"Camera triggers remained enabled after stop: {status}")
-
-    def _camera_trigger_status(self) -> Any:
-        """Read back firmware state, failing closed if the pinned probe is unavailable."""
-        status_probe = getattr(self._dio, "_streamdio_get_equipment_status", None)
-        if not callable(status_probe):
-            raise RuntimeError(
-                "StreamDIO driver has no equipment status probe; "
-                "camera trigger verification is required"
-            )
-        return status_probe()
+                time.sleep(0.005)
 
     def start_streaming(self, callback: Callable[..., None] | None = None) -> None:
-        if self._dio is None:
-            raise RuntimeError("StreamDIO not connected")
-        self._dio.clear_event_history()
+        dio = self._require_dio()
+        if self._map is None:
+            raise RuntimeError("Apply the StreamDIO channel map before streaming")
+        dio.clear_event_history()
         self._camera_events = []
-        # The durable recorder owns the complete high-rate stream. The vendor's
-        # extra debug histories must not grow for the entire session as well.
-        event_lock = getattr(self._dio, "_event_lock", None)
-        if event_lock is not None:
-            with event_lock:
-                for name in ("_event_history", "_all_events_history"):
-                    if hasattr(self._dio, name):
-                        setattr(self._dio, name, deque(maxlen=50000))
         self._callback = callback
-
-        # The bringup driver's start_streaming() queries the current timestamp on
-        # the stream USB endpoint after streaming has begun. At 1 kHz that read
-        # can consume event bytes instead of the timestamp reply and shift packet
-        # alignment. Read it while the endpoint is idle, then let startup reuse it.
-        timestamp_getter = getattr(self._dio, "_streamdio_get_current_timestamp", None)
-        pre_stream_timestamp = timestamp_getter() if callable(timestamp_getter) else 0
-        if callable(timestamp_getter):
-            self._dio._streamdio_get_current_timestamp = lambda: pre_stream_timestamp
-        try:
-            started = self._dio.start_streaming(callback=self._dispatch_event)
-        finally:
-            if callable(timestamp_getter):
-                self._dio._streamdio_get_current_timestamp = timestamp_getter
-        if not started:
+        if not dio.start_streaming(callback=self._dispatch_event):
             raise RuntimeError("StreamDIO start_streaming failed")
+
+    def _translate(
+        self, event_type: str, channel: int | None, value: int | None
+    ) -> tuple[str, int | None, int | None] | None:
+        """A driver event in evil_rig's terms; None for events evil_rig drops."""
+        if event_type == "dio_input" and channel is not None:
+            return event_type, self._inputs.get(int(channel), int(channel)), value
+        if event_type == "dio_output" and channel is not None:
+            if int(channel) == self._camera_output:
+                # One event per frame, at the trigger's rising edge.
+                return ("camera", None, None) if value else None
+            return event_type, self._outputs.get(int(channel), int(channel)), value
+        if event_type == "analog_in" and channel is not None:
+            return "analog_input", self._analog.get(int(channel), int(channel)), value
+        if event_type == "latency_heartbeat":
+            return TIMING_HEARTBEAT_EVENT_TYPE, None, None
+        return event_type, channel, value
 
     def _dispatch_event(
         self,
@@ -295,16 +255,12 @@ class StreamDIOClient:
     ) -> None:
         host_mono_s = time.perf_counter()
         host_wall_s = time.time()
+        translated = self._translate(event_type, channel, value)
+        if translated is None:
+            return
+        event_type, channel, value = translated
         if event_type == "camera":
             self._camera_events.append((int(timestamp_us), float(relative_time)))
-        if (
-            event_type == "diagnostic"
-            and channel is not None
-            and int(channel) == STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE
-        ):
-            event_type = TIMING_HEARTBEAT_EVENT_TYPE
-            channel = None
-            value = None
         if event_type == "dio_output" and channel is not None and value is not None:
             channel_i = int(channel)
             value_i = int(value)
@@ -318,11 +274,7 @@ class StreamDIOClient:
                     float(relative_time),
                     host_mono_s,
                 )
-                history = getattr(self, "_output_event_history", None)
-                if history is None:
-                    history = defaultdict(lambda: deque(maxlen=64))
-                    self._output_event_history = history
-                history[channel_i].append(
+                self._output_event_history[channel_i].append(
                     (
                         sequence,
                         value_i,
@@ -352,17 +304,17 @@ class StreamDIOClient:
         timeout_s: float = 0.15,
     ) -> dict[str, Any]:
         """Set an output through verified USB1 and await its physical pin-change event."""
-        if self._dio is None:
-            raise RuntimeError("StreamDIO not connected")
+        dio = self._require_dio()
         channel_i = int(channel)
         state_i = 1 if bool(state) else 0
+        module_number = self.module_output_number(channel_i)
         with self._output_condition:
             prior_state = self._output_states.get(channel_i)
             prior_sequence = self._output_sequences[channel_i]
 
         with self._config_lock:
             command_start = time.perf_counter()
-            acknowledged = bool(self._dio.manual_override_output(channel_i, state_i))
+            acknowledged = bool(dio.manual_override_output(module_number, state_i))
             command_end = time.perf_counter()
         if not acknowledged:
             raise RuntimeError(
@@ -378,7 +330,7 @@ class StreamDIOClient:
             "changed": prior_state != state_i,
             "event_verified": False,
         }
-        if not verify_event or not getattr(self._dio, "streaming_active", False):
+        if not verify_event or not dio.streaming_active:
             with self._output_condition:
                 self._output_states[channel_i] = state_i
             return result
@@ -437,7 +389,7 @@ class StreamDIOClient:
         deadline = time.perf_counter() + max(0.0, float(timeout_s))
         with self._output_condition:
             while True:
-                history = getattr(self, "_output_event_history", {}).get(channel_i, ())
+                history = self._output_event_history.get(channel_i, ())
                 for sequence, value, timestamp_us, relative_s, host_mono_s in history:
                     if int(sequence) > int(after_sequence) and int(value) == state_i:
                         return {
@@ -480,161 +432,73 @@ class StreamDIOClient:
             f"channel {channel_i} state {state_i} after sequence {after_sequence}"
         )
 
-    def set_speaker_noise(
-        self,
-        enabled: bool,
-        *,
-        sample_interval_us: int,
-    ) -> dict[str, Any]:
-        """Control firmware-generated white noise and verify module status."""
-        if self._dio is None:
-            raise RuntimeError("StreamDIO not connected")
-        with self._config_lock:
-            command_start = time.perf_counter()
-            acknowledged = bool(
-                self._dio.configure_speaker_noise(
-                    bool(enabled),
-                    sample_interval_us=int(sample_interval_us),
-                )
-            )
-            command_end = time.perf_counter()
-            if not acknowledged:
-                raise RuntimeError(f"StreamDIO rejected speaker noise enabled={bool(enabled)}")
-            status = {
-                str(key): value.item() if hasattr(value, "item") else value
-                for key, value in dict(self._dio.get_speaker_status()).items()
-            }
-        if bool(status.get("enabled")) != bool(enabled):
-            raise RuntimeError(f"Unexpected StreamDIO speaker status: {status}")
-        return {
-            "enabled": bool(enabled),
-            "acknowledged": True,
-            "command_start_mono_s": command_start,
-            "command_end_mono_s": command_end,
-            "status": status,
-        }
-
     def get_cap_touch_status(self) -> dict[str, Any]:
-        """Read the firmware-local cap-touch ADC digitizer status from USB1."""
-        if self._dio is None:
-            raise RuntimeError("StreamDIO not connected")
-        config_arcom = getattr(self._dio, "_config_arcom", None)
-        if config_arcom is None:
-            raise RuntimeError("StreamDIO driver does not expose the config ArCOM port")
+        """The module's cap-touch lick detector, in the fixed-layout firmware's terms."""
+        dio = self._require_dio()
+        if self._map is None or LICK not in {channel.name for channel in self._map}:
+            return {"enabled": False, "channel": CAP_TOUCH_INPUT_CHANNEL, "pin": CAP_TOUCH_INPUT_PIN}
         with self._config_lock:
-            config_arcom.write(ord("l"), "uint8")
-            status = {
-                "enabled": bool(config_arcom.read(1, "uint8", "builtin")),
-                "channel": int(config_arcom.read(1, "uint8", "builtin")),
-                "pin": int(config_arcom.read(1, "uint8", "builtin")),
-                "state": int(config_arcom.read(1, "uint8", "builtin")),
-                "polarity": int(config_arcom.read(1, "uint8", "builtin")),
-                "last_value": int(config_arcom.read(1, "uint16", "builtin")),
-                "baseline": int(config_arcom.read(1, "uint16", "builtin")),
-                "rising_high_threshold": int(config_arcom.read(1, "uint16", "builtin")),
-                "rising_low_threshold": int(config_arcom.read(1, "uint16", "builtin")),
-                "falling_high_threshold": int(config_arcom.read(1, "uint16", "builtin")),
-                "falling_low_threshold": int(config_arcom.read(1, "uint16", "builtin")),
-            }
-        return status
+            status = dio.thresholds[LICK].status()
+        active = status.get("active")
+        return {
+            "enabled": bool(status.get("enabled")),
+            "channel": CAP_TOUCH_INPUT_CHANNEL,
+            "pin": CAP_TOUCH_INPUT_PIN,
+            "state": int(status.get("level", 0)),
+            "polarity": _POLARITY_CODES.get(active, 0),
+            "last_value": int(status.get("sample", 0)),
+            "baseline": int(status.get("baseline", 0)),
+            "rising_high_threshold": status.get("rising_on"),
+            "rising_low_threshold": status.get("rising_off"),
+            "falling_high_threshold": status.get("falling_on"),
+            "falling_low_threshold": status.get("falling_off"),
+            "blanking": bool(status.get("blanking")),
+            "samples": int(status.get("samples", 0)),
+        }
 
     def get_module_status(self) -> dict[str, Any]:
         """Return a one-shot StreamDIO status snapshot for cold-path reports."""
-        if self._dio is None:
-            raise RuntimeError("StreamDIO not connected")
+        dio = self._require_dio()
         status: dict[str, Any] = {
             "config_port": self.config_port,
             "stream_port": self.stream_port,
-            "streaming_active": bool(getattr(self._dio, "streaming_active", False)),
-            "module_info": {
-                str(key): _json_safe(value)
-                for key, value in dict(getattr(self._dio, "module_info", {}) or {}).items()
-            },
+            "streaming_active": bool(dio.streaming_active),
+            "module_info": self.module_info,
+            "buffer_stats": self._buffer_stats(),
         }
         with self._config_lock:
-            for name, getter_name in (
-                ("analog_input_status", "get_analog_input_status"),
-                ("speaker_status", "get_speaker_status"),
+            for name, read in (
+                ("config_status", dio.config_status),
+                ("analog_input_status", lambda: dio.analog["force"].status()),
+                ("speaker_status", lambda: dio.outputs[SPEAKER].status()),
             ):
-                getter = getattr(self._dio, getter_name, None)
-                if not callable(getter):
-                    continue
                 try:
                     status[name] = {
-                        str(key): _json_safe(value)
-                        for key, value in dict(getter()).items()
+                        str(key): _json_safe(value) for key, value in dict(read()).items()
                     }
                 except Exception as exc:
                     status[f"{name}_error"] = f"{type(exc).__name__}: {exc}"
-        speaker_pin = status.get("speaker_status", {}).get("pin")
-        if speaker_pin is not None:
-            status["module_info"]["speaker_pin"] = speaker_pin
+        if "speaker_status" in status:
+            status["speaker_status"]["pin"] = SPEAKER_GATE_PIN
         return status
 
-    def configure_cap_touch_digitizer(
-        self,
-        *,
-        min_high_threshold: int | None = None,
-        delta_high: int | None = None,
-        delta_low: int | None = None,
-    ) -> dict[str, Any]:
-        """Configure firmware-local cap-touch ADC-to-digital thresholds."""
-        if self._dio is None:
-            raise RuntimeError("StreamDIO not connected")
-        firmware_version = int(self._dio.module_info.get("firmware_version", 0))
-        if firmware_version < STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION:
-            raise RuntimeError(
-                "StreamDIO firmware does not support runtime cap-touch threshold "
-                f"configuration. Found firmware version {firmware_version}; expected "
-                f"{STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION} or newer. Flash "
-                "firmware/Module_DIO_streeaming_100us_cycle before using tuned "
-                "cap-touch thresholds."
-            )
-        config_arcom = getattr(self._dio, "_config_arcom", None)
-        if config_arcom is None:
-            raise RuntimeError("StreamDIO driver does not expose the config ArCOM port")
-        min_high = _uint12(
-            CAP_TOUCH_DEFAULT_MIN_HIGH_THRESHOLD
-            if min_high_threshold is None
-            else min_high_threshold
-        )
-        high_delta = _uint12(
-            CAP_TOUCH_DEFAULT_DELTA_HIGH if delta_high is None else delta_high
-        )
-        low_delta = _uint12(CAP_TOUCH_DEFAULT_DELTA_LOW if delta_low is None else delta_low)
-        if low_delta > high_delta:
-            low_delta = high_delta
-        with self._config_lock:
-            config_arcom.write(ord("t"), "uint8")
-            config_arcom.write(min_high, "uint16")
-            config_arcom.write(high_delta, "uint16")
-            config_arcom.write(low_delta, "uint16")
-            acknowledged = bool(config_arcom.read(1, "uint8", "builtin"))
-        if not acknowledged:
-            raise RuntimeError("StreamDIO rejected cap-touch threshold configuration")
-        return self.get_cap_touch_status()
-
     def stop_streaming(self) -> None:
-        if self._dio is not None and getattr(self._dio, "streaming_active", False):
+        if self._dio is not None and self._dio.streaming_active:
             self._dio.stop_streaming()
-            stats = getattr(self._dio, "_buffer_stats", None)
-            if isinstance(stats, dict):
-                self._last_buffer_stats = {
-                    str(key): int(value)
-                    for key, value in stats.items()
-                    if isinstance(value, (int, float))
-                }
-            time.sleep(0.05)
+            self._last_buffer_stats = self._buffer_stats()
+
+    def _buffer_stats(self) -> dict[str, int]:
+        if self._dio is None:
+            return {}
+        return {
+            str(key): int(value)
+            for key, value in self._dio.get_buffer_stats().items()
+            if isinstance(value, (int, float))
+        }
 
     def get_buffer_stats(self) -> dict[str, int]:
         if self._dio is not None:
-            stats = getattr(self._dio, "_buffer_stats", None)
-            if isinstance(stats, dict):
-                return {
-                    str(key): int(value)
-                    for key, value in stats.items()
-                    if isinstance(value, (int, float))
-                }
+            return self._buffer_stats()
         return dict(self._last_buffer_stats)
 
     def get_camera_events(self) -> list[tuple[int, float]]:
@@ -649,6 +513,7 @@ class StreamDIOClient:
         for stage, operation in (
             ("stop_streaming", self.stop_streaming),
             ("stop_camera", self.stop_camera),
+            # Also drives every output low, as the module's emergency off.
             ("driver_close", dio.close),
         ):
             try:
@@ -660,6 +525,11 @@ class StreamDIOClient:
         if errors:
             raise RuntimeError("StreamDIO close failed: " + "; ".join(errors))
 
+    def _require_dio(self) -> StreamDIO:
+        if self._dio is None:
+            raise RuntimeError("StreamDIO not connected")
+        return self._dio
+
     @property
-    def raw(self) -> Any:
+    def raw(self) -> StreamDIO | None:
         return self._dio

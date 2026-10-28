@@ -169,28 +169,30 @@ def capture_runtime_provenance(cwd: Path | str | None = None) -> dict[str, Any]:
             break
 
     package_versions: dict[str, str | None] = {}
-    for distribution in ("bpod-hf-dm", "bpod-core", "numpy", "PyYAML", "pyserial", "pygame"):
+    for distribution in (
+        "bpod-hf-dm", "bpod-core", "streamdio", "numpy", "PyYAML", "pyserial", "pygame"
+    ):
         try:
             package_versions[distribution] = version(distribution)
         except PackageNotFoundError:
             package_versions[distribution] = None
 
     streamdio_driver: dict[str, Any] = {
-        "module": "pybpod_streamDIO_module",
+        "module": "streamdio",
         "module_path": None,
         "git_commit": None,
         "git_dirty": None,
         "git_root": None,
     }
     try:
-        driver_spec = importlib.util.find_spec("pybpod_streamDIO_module")
+        driver_spec = importlib.util.find_spec("streamdio")
         if driver_spec is not None and driver_spec.origin:
             driver_path = Path(driver_spec.origin).resolve()
             streamdio_driver["module_path"] = str(driver_path)
             # A wheel inside this repo's .venv is not code from this repo's Git
             # tree. PEP 610 records the actual pinned driver source revision.
             try:
-                direct = json.loads(installed_distribution("MM-PybBod2").read_text("direct_url.json") or "{}")
+                direct = json.loads(installed_distribution("streamdio").read_text("direct_url.json") or "{}")
             except (PackageNotFoundError, ValueError):
                 direct = {}
             streamdio_driver["source_url"] = direct.get("url")

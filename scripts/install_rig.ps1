@@ -1,6 +1,8 @@
 param(
     [string]$Python = "python",
-    [string]$StreamDioDriver = "",
+    # Another streamdio source for this install, e.g. a local checkout
+    # ("-e C:\Code\git\StreamDIO\software") or a branch/tag/commit URL.
+    [string]$StreamDio = "",
     [switch]$Dev,
     [switch]$NoShortcut
 )
@@ -31,11 +33,8 @@ if ($Dev) { Copy-Item -LiteralPath $rigLock -Destination $runtimeLock -Force }
 else { Get-Content -LiteralPath $rigLock | Where-Object { $_ -notmatch $excluded } | Set-Content -LiteralPath $runtimeLock }
 Install-RigPackages @('-r', $runtimeLock)
 Install-RigPackages @('--no-deps', '-e', $rigRoot)
-if (-not $StreamDioDriver) {
-    # This is the verified neutral-settings driver revision, also documented in README.
-    $StreamDioDriver = 'git+https://github.com/andrestrocyte/MM_PyBpod2.git@a176c0e38520a4f29554198ae30711a08546d75d'
-}
-Install-RigPackages @('--no-deps', $StreamDioDriver)
+# requirements.lock installs the StreamDIO driver (streamdio) from its repository.
+if ($StreamDio) { Install-RigPackages (@('--no-deps', '--force-reinstall') + ($StreamDio -split ' ')) }
 & $rigPython -m hf_dm.operator_app --check-install
 if ($LASTEXITCODE -ne 0) { throw "Installed launcher check failed" }
 if (-not $NoShortcut) {

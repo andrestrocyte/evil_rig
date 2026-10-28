@@ -16,6 +16,7 @@ from hf_dm.hardware.bringup_constants import (
     CAP_TOUCH_POWER_PIN,
     FORCE_ANALOG_CHANNEL,
 )
+from hf_dm.streamdio.channel_map import hfdm_channel_map
 from hf_dm.streamdio.client import StreamDIOClient
 from hf_dm.streamdio.outputs import StreamDIOOutputs
 
@@ -217,8 +218,8 @@ def run_cap_touch_diagnostic(
     )
     if raw_analog:
         print(
-            "Raw analog mode: force ADC is temporarily disabled and cap-touch "
-            "ch14/pin25 is streamed directly."
+            "Raw analog mode: the lick detector's samples on ch14/pin25 are streamed "
+            "as well as its edges."
         )
     else:
         print(
@@ -227,33 +228,25 @@ def run_cap_touch_diagnostic(
         )
     try:
         client.open()
-        module_info = {
-            str(key): value.item() if hasattr(value, "item") else value
-            for key, value in dict(client.raw.module_info).items()
-        }
+        analog_status = client.apply_map(
+            hfdm_channel_map(
+                frame2ttl=False,
+                lick_min_on_level=requested_thresholds["min_high_threshold"],
+                lick_on_delta=requested_thresholds["delta_high"],
+                lick_off_delta=requested_thresholds["delta_low"],
+                lick_raw=raw_analog,
+                speaker_active_high=config.speaker.gate_active_high,
+            )
+        )
+        module_info = client.module_info
         print(f"StreamDIO firmware: {module_info.get('firmware_version')}")
-        if raw_analog:
-            analog_status = client.configure_cap_touch_analog_diagnostic()
-            print(f"Cap-touch raw analog config: {json.dumps(analog_status, sort_keys=True)}")
-        else:
-            client.configure_rotary_and_force(lick_channels=state.lick_channels)
-            threshold_requested = any(value is not None for value in requested_thresholds.values())
-            firmware_version = int(module_info.get("firmware_version", 0))
-            if threshold_requested or firmware_version >= 4:
-                threshold_status = client.configure_cap_touch_digitizer(
-                    min_high_threshold=requested_thresholds["min_high_threshold"],
-                    delta_high=requested_thresholds["delta_high"],
-                    delta_low=requested_thresholds["delta_low"],
-                )
-                print(
-                    "Cap-touch threshold config: "
-                    f"{json.dumps(threshold_status, sort_keys=True)}"
-                )
+        threshold_status = client.get_cap_touch_status()
+        print(f"Cap-touch threshold config: {json.dumps(threshold_status, sort_keys=True)}")
         client.start_streaming(callback=state.handle_event)
         outputs = StreamDIOOutputs(
             client,
             cap_touch_power_channel=config.licks.power_output_channel,
-            speaker_sample_interval_us=config.speaker.sample_interval_us,
+            speaker_gate_active_high=config.speaker.gate_active_high,
         )
         power_on = outputs.cap_touch_power(True)
         print(f"Power ON verified: {json.dumps(power_on, sort_keys=True)}")

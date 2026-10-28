@@ -40,7 +40,6 @@ licks:
   cap_touch_delta_low: 90
 
 speaker:
-  sample_interval_us: 100
   frequency_hz: 6000.0
   volume: 1.0
   gate_active_high: true

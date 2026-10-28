@@ -11,7 +11,7 @@ from hf_dm.hardware.bringup_constants import (
     CCW_FORCE_OUTPUT_CHANNEL,
     CW_FORCE_OUTPUT_CHANNEL,
     PUMP_OUTPUT_CHANNEL,
-    SPEAKER_NOISE_SAMPLE_INTERVAL_US,
+    SPEAKER_OUTPUT_CHANNEL,
 )
 from hf_dm.streamdio.client import StreamDIOClient
 
@@ -24,11 +24,11 @@ class StreamDIOOutputs:
         dio: StreamDIOClient,
         *,
         cap_touch_power_channel: int = CAP_TOUCH_POWER_OUTPUT_CHANNEL,
-        speaker_sample_interval_us: int = SPEAKER_NOISE_SAMPLE_INTERVAL_US,
+        speaker_gate_active_high: bool = True,
     ) -> None:
         self.dio = dio
         self.cap_touch_power_channel = int(cap_touch_power_channel)
-        self.speaker_sample_interval_us = int(speaker_sample_interval_us)
+        self.speaker_gate_active_high = bool(speaker_gate_active_high)
 
     def set_channel_state(self, channel: int, state: bool) -> dict[str, Any]:
         return self.dio.set_output_channel(channel, state)
@@ -68,31 +68,17 @@ class StreamDIOOutputs:
         return self.set_channel_state(self.cap_touch_power_channel, enabled)
 
     def speaker_gate(self, enabled: bool) -> dict[str, Any]:
-        return self.dio.set_speaker_noise(
-            enabled,
-            sample_interval_us=self.speaker_sample_interval_us,
-        )
+        """Enable or disable the amplifier playing the PC sound card's white noise."""
+        level = bool(enabled) == self.speaker_gate_active_high
+        result = self.set_channel_state(SPEAKER_OUTPUT_CHANNEL, level)
+        result["enabled"] = bool(enabled)
+        return result
 
     def pulse_speaker_gate(self, duration_s: float) -> dict[str, Any]:
         on = self.speaker_gate(True)
         wait_until_perf_counter(time.perf_counter() + max(0.0, float(duration_s)))
-        active_status = {
-            str(key): value.item() if hasattr(value, "item") else value
-            for key, value in dict(self.dio.raw.get_speaker_status()).items()
-        }
-        samples_before = int(on["status"].get("samples_generated", 0))
-        samples_after = int(active_status.get("samples_generated", 0))
-        if duration_s > 0.0 and samples_after <= samples_before:
-            raise RuntimeError(
-                "StreamDIO speaker was enabled but generated no white-noise samples"
-            )
         off = self.speaker_gate(False)
-        return {
-            "on": on,
-            "active_status": active_status,
-            "samples_generated_during_pulse": samples_after - samples_before,
-            "off": off,
-        }
+        return {"on": on, "off": off}
 
     def all_off(self) -> dict[str, Any]:
         result = self.task_outputs_off()

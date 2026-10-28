@@ -50,7 +50,6 @@ from hf_dm.hardware.bringup_constants import (
     CW_FORCE_OUTPUT_CHANNEL,
     FORCE_ANALOG_CHANNEL,
     PUMP_OUTPUT_CHANNEL,
-    STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION,
     STREAMDIO_STATE_MARKER_IDS,
     STREAMDIO_STATE_MARKER_NAMES,
     STREAMDIO_TIMING_HEARTBEAT_EVENT_CODE,
@@ -75,6 +74,7 @@ from hf_dm.valve_calibration import (
     RewardCalibration,
     resolve_reward_calibration_path,
 )
+from hf_dm.streamdio.channel_map import session_channel_map
 from hf_dm.streamdio.client import StreamDIOClient
 from hf_dm.streamdio.outputs import StreamDIOOutputs
 from hf_dm.streamdio.wheel import Direction, WheelAccumulator
@@ -125,6 +125,7 @@ class HFDecisionSession:
         self.speaker_relay: SerialRelay | None = None
         self.white_noise_player: WhiteNoisePlayer | None = None
         self.dio: StreamDIOClient | None = None
+        self._streamdio_config_status: dict[str, Any] = {}
         self.wheel = WheelAccumulator(config.wheel)
         self.display: TaskDisplay | None = None
         self.recorder: SessionRecorder | None = None
@@ -249,18 +250,18 @@ class HFDecisionSession:
             baudrate=ports.baudrate,
         )
         excluded = self._bpod_serial_ports()
-        self.dio.open(excluded_bpod_ports=excluded)
+        self.dio.open()
         # Install the emergency output path immediately after USB1 is open so a
         # later configuration/display/camera failure can still attempt all-off.
         self.relay = StreamDIOOutputs(
             self.dio,
             cap_touch_power_channel=self.config.licks.power_output_channel,
-            speaker_sample_interval_us=self.config.speaker.sample_interval_us,
+            speaker_gate_active_high=self.config.speaker.gate_active_high,
         )
-        self.dio.configure_rotary_and_force(
-            lick_channels=self.config.licks.streamdio_channels,
-            extra_input_channels=self._frame2ttl_input_channels(),
-        )
+        self._streamdio_config_status = self.dio.apply_map(session_channel_map(self.config))
+        # The Bpod read the module's event names and count before the map changed;
+        # re-reading them also installs the matching serial event allocation.
+        self.bpod.update_modules()
         self.display = TaskDisplay(self.config.display, self.config.frame2ttl)
         out, base_name = resolve_session_output(
             Path(self.config.results_dir),
@@ -284,6 +285,7 @@ class HFDecisionSession:
                 "config_port": self.dio.config_port,
                 "stream_port": self.dio.stream_port,
                 "module_info": self._streamdio_module_info(),
+                "channel_map": self.dio.map_info(),
                 "force_channel": FORCE_ANALOG_CHANNEL,
                 "lick_channels": list(self.config.licks.streamdio_channels),
                 "lick_source": self.config.licks.source,
@@ -407,11 +409,11 @@ class HFDecisionSession:
                 "bpod_port": self.bpod.port,
                 "bpod": self._bpod_descriptor(),
                 "bpod_usb_ports": sorted(excluded),
-                "bpod_event_allocation": getattr(
-                    self.bpod,
-                    "hf_dm_event_allocation",
-                    None,
-                ),
+                "bpod_module_event_counts": {
+                    str(name): int(module.n_events)
+                    for name, module in self.bpod.modules.items()
+                },
+                "streamdio_config_status": self._streamdio_config_status,
                 "dio_config": self.dio.config_port,
                 "dio_stream": self.dio.stream_port,
                 "streamdio_module_info": self._streamdio_module_info(),
@@ -922,14 +924,7 @@ class HFDecisionSession:
     def _streamdio_module_info(self) -> dict:
         if self.dio is None:
             return {}
-        raw = getattr(self.dio, "raw", None)
-        module_info = getattr(raw, "module_info", None)
-        if not isinstance(module_info, dict):
-            return {}
-        return {
-            str(key): value.item() if hasattr(value, "item") else value
-            for key, value in module_info.items()
-        }
+        return dict(getattr(self.dio, "module_info", None) or {})
 
     def _connected_hardware_identity(self) -> dict[str, Any]:
         camera: dict[str, Any] = {}
@@ -1047,27 +1042,13 @@ class HFDecisionSession:
         )
 
     def _configure_cap_touch_digitizer_from_config(self) -> None:
+        """Record the lick detector's thresholds: the channel map set them."""
         if self.config.licks.source != "capacitive":
             return
         if self.dio is None:
             return
         licks = self.config.licks
-        threshold_requested = (
-            licks.cap_touch_min_high_threshold is not None
-            or licks.cap_touch_delta_high is not None
-            or licks.cap_touch_delta_low is not None
-        )
-        firmware_version = int(self.dio.raw.module_info.get("firmware_version", 0))
-        if (
-            not threshold_requested
-            and firmware_version < STREAMDIO_CAP_TOUCH_CONFIG_FIRMWARE_VERSION
-        ):
-            return
-        status = self.dio.configure_cap_touch_digitizer(
-            min_high_threshold=licks.cap_touch_min_high_threshold,
-            delta_high=licks.cap_touch_delta_high,
-            delta_low=licks.cap_touch_delta_low,
-        )
+        status = self.dio.get_cap_touch_status()
         if self.recorder is not None:
             self.recorder.log_event(
                 "cap_touch_digitizer_configured",

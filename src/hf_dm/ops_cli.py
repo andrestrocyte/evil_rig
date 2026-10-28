@@ -760,8 +760,7 @@ def _streamdio_module_status(session: HFDecisionSession) -> dict[str, object]:
     cached = getattr(session, "_latest_streamdio_module_status", None)
     if isinstance(cached, dict) and cached:
         return {"source": "cached_status_poll", **cached}
-    raw = getattr(dio, "raw", None)
-    module_info = getattr(raw, "module_info", None)
+    module_info = getattr(dio, "module_info", None)
     if isinstance(module_info, dict) and module_info:
         return {"source": "connection_metadata", "module_info": dict(module_info)}
     recorder = getattr(session, "recorder", None)

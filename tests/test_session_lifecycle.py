@@ -110,13 +110,20 @@ class FakeDIO:
 class PartialConnectDIO(FakeDIO):
     def __init__(self) -> None:
         super().__init__()
-        self.raw = SimpleNamespace(module_info={"firmware_version": 0})
+        self.module_info = {"firmware_version": 1}
 
-    def open(self, **_kwargs) -> None:
+    def open(self) -> None:
         self.ops.append("open")
 
-    def configure_rotary_and_force(self, **_kwargs) -> None:
+    def apply_map(self, channel_map) -> dict:
         self.ops.append("configure")
+        return {"source": "host", "n_channels": len(channel_map)}
+
+    def get_cap_touch_status(self) -> dict:
+        return {"enabled": True, "state": 0}
+
+    def map_info(self) -> dict:
+        return {"config_hash": 1}
 
 
 class FailingCleanupRelay(FakeRelay):

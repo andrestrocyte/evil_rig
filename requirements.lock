@@ -1,8 +1,10 @@
 # Cross-platform Python 3.12 acquisition/CI lock, regenerated from a clean install.
 # PySpin is vendor-distributed and intentionally absent; see README camera setup.
+# streamdio follows its development branch until the first release; the installed
+# commit is recorded in each session's runtime provenance.
 annotated-types==0.7.0
 ast_serialize==0.6.0
-bpod-core==0.1.0a12
+bpod-core==0.1.0a15
 cachetools==7.1.4
 colorama==0.4.6
 confapp==1.1.11
@@ -22,6 +24,7 @@ pluggy==1.6.0
 polars==1.42.1
 polars-runtime-32==1.42.1
 psutil==7.2.2
+pyarrow==26.0.0
 pydantic==2.13.4
 pydantic_core==2.46.4
 pydantic-extra-types==2.11.1
@@ -35,5 +38,7 @@ ruff==0.15.20
 types-PyYAML==6.0.12.20260518
 typing_extensions==4.16.0
 typing-inspection==0.4.2
+tzdata==2026.5
 xxhash==3.8.1
 zeroconf==0.150.0
+streamdio @ git+https://github.com/MathiasMahn/StreamDIO@development#subdirectory=software

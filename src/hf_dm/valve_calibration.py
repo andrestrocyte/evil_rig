@@ -17,7 +17,7 @@ import numpy as np
 
 from hf_dm.config import SessionConfig
 from hf_dm.durable_io import fsync_best_effort, fsync_directory_best_effort
-from hf_dm.hardware.discovery import resolve_bpod_port
+from hf_dm.streamdio.channel_map import session_channel_map
 from hf_dm.streamdio.client import StreamDIOClient
 from hf_dm.streamdio.outputs import StreamDIOOutputs
 
@@ -263,17 +263,6 @@ def run_guided_valve_calibration(
         raise FileExistsError(
             f"Calibration output already exists: {output_path}. Use --overwrite to replace it."
         )
-    excluded: set[str] = set()
-    try:
-        excluded.add(resolve_bpod_port(config.ports.bpod_port))
-    except Exception as exc:
-        if config.ports.bpod_port not in {"", "AUTO"}:
-            excluded.add(config.ports.bpod_port)
-        else:
-            raise RuntimeError(
-                "Cannot identify the Bpod serial port; refusing automatic StreamDIO discovery "
-                "for valve calibration"
-            ) from exc
     dio = StreamDIOClient(
         config_port=config.ports.dio_config_port,
         stream_port=config.ports.dio_stream_port,
@@ -281,12 +270,13 @@ def run_guided_valve_calibration(
     )
     relay: StreamDIOOutputs | None = None
     try:
-        dio.open(excluded_bpod_ports=excluded)
+        dio.open()
+        dio.apply_map(session_channel_map(config))
         dio.start_streaming()
         relay = StreamDIOOutputs(
             dio,
             cap_touch_power_channel=config.licks.power_output_channel,
-            speaker_sample_interval_us=config.speaker.sample_interval_us,
+            speaker_gate_active_high=config.speaker.gate_active_high,
         )
         relay.pump_off()
 
@@ -318,7 +308,7 @@ def run_guided_valve_calibration(
         payload["hardware"] = {
             "config_port": dio.config_port,
             "stream_port": dio.stream_port,
-            "module_info": _json_safe_dict(getattr(dio.raw, "module_info", {})),
+            "module_info": _json_safe_dict(dio.module_info),
         }
         loaded = save_valve_calibration(payload, output_path)
         return {
