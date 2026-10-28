@@ -173,8 +173,9 @@ flowchart TB
 | **StreamDIO** | timestamped input stream, physical outputs, state markers | decision logic |
 
 The task does **not** read rig parameters from a sister checkout — all pin/channel/timing defaults
-live in `src/hf_dm/hardware/bringup_constants.py` and `configs/*.yaml`. `MM_PyBpod2` is needed only
-as the installed driver package for `pybpod_streamDIO_module`.
+live in `src/hf_dm/hardware/bringup_constants.py` and `configs/*.yaml`. StreamDIO is driven by
+its host package, [`streamdio`](https://github.com/MathiasMahn/StreamDIO), which applies the rig's
+channel map (`src/hf_dm/streamdio/channel_map.py`) every time a session connects.
 
 ---
 
@@ -231,22 +232,30 @@ screen movement. This setting preserves CW force on pin 21 and CCW force on pin 
 and preserves the encoder's CW/CCW pulse labels. Choice and reward mapping follow
 the shape moved to the center. Set it to `false` for the original screen direction.
 
-All channels/pins match the `MM_PyBpod2` bringup notebooks. **Ports default to `AUTO`** with the
-same discovery logic as the screen task.
+StreamDIO runs a channel map that evil_rig applies at connect
+(`hf_dm.streamdio.channel_map`). Recordings, exports and the monitor keep evil_rig's own channel
+numbers (the "evil_rig channel" column, those of the fixed-layout firmware the rig started on);
+the client translates the module's numbers into them. **Ports default to `AUTO`**: `streamdio`
+finds the module's two USB interfaces by listening for their announcements.
 
-| Function | StreamDIO channel | Teensy pin | Source notebook |
-|----------|------------------|-----------|-----------------|
-| Wheel pulse | DI01 (input ch1) | pin 2 | `rotary_encoder_bringup.ipynb` |
-| Wheel direction | DI03 (input ch3) | pin 4 | `rotary_encoder_bringup.ipynb` |
-| Force ADC | AI13 (analog ch13) | pin 14 | `rotary_encoder_bringup.ipynb` |
-| Pump (reward) | output ch1 | pin 23 | `screen_bringup_shape_force_discount.ipynb` |
-| CW force | output ch3 | pin 21 | `screen_bringup_shape_force_discount.ipynb` |
-| CCW force | output ch5 | pin 19 | `screen_bringup_shape_force_discount.ipynb` |
-| Cap-touch power | output ch13 | pin 15 | `cap_touch_bringup_pin15_power_pin14_touch.ipynb` |
-| Lick (cap-touch) | input ch14 | pin 25 | `cap_touch_bringup_pin15_power_pin14_touch.ipynb` |
-| Camera TTL | StreamDIO 30 Hz, 10 ms | pin 32 | `camera_bringup_pin32_ttl.ipynb` |
-| Speaker gate | Bpod Serial1 action | pin 26 | `speaker_bringup_pin27_whitenoise.ipynb` (original pin 27, remapped in this firmware) |
-| Frame2TTL v3 | DI05 (input ch5) | pin 6 | `frame2ttl_v3_bringup_di05_pin6.ipynb` |
+| Function | evil_rig channel | Map channel | Terminal | Teensy pin |
+|----------|------------------|-------------|----------|-----------|
+| Wheel pulse | input ch1 | `wheel_a` (`digital_in`) | DI01 | pin 2 |
+| Wheel direction | input ch3 | `wheel_b` (`digital_in`) | DI03 | pin 4 |
+| Frame2TTL v3 | input ch5 | `f2ttl` (`digital_in`) | DI05 | pin 6 |
+| Lick (cap-touch) | input ch14 | `lick` (`analog_threshold`) | J27-15 | pin 25 |
+| Force ADC | analog ch13 | `force` (`analog_in`, 1 kHz) | J28-10 | pin 14 |
+| Pump (reward) | output ch1 | `pump` (`digital_out`) | DO01 | pin 23 |
+| CW force | output ch3 | `cwforce` (`digital_out`) | DO03 | pin 21 |
+| CCW force | output ch5 | `ccwforce` (`digital_out`) | DO05 | pin 19 |
+| Cap-touch power | output ch13 | `cap_pwr` (`digital_out`) | J28-9 | pin 15 |
+| Speaker gate | output ch14 | `speaker` (`digital_out`) | J27-14 | pin 26 |
+| Camera TTL | `camera` events | `camera` (`pulse_out`, 30 Hz, 10 ms) | J27-9 | pin 32 |
+
+The Bpod state machine switches outputs with `[n, level]` serial messages, where `n` is the
+output's number in the map (`MODULE_OUTPUT_NUMBERS`: pump 1, CW force 2, CCW force 3, cap-touch
+power 4, speaker 5). The map sends no input events to the Bpod: evil_rig reads every input from
+the stream.
 
 **Notes**
 
@@ -256,9 +265,10 @@ same discovery logic as the screen task.
   force calibration separate from digital output verification.
 - When capacitive touch is selected, its power is held high for the whole session; lick edges on input ch14 are stored both as
   raw module-timestamped events and as explicit `lick` session events.
-- The firmware streams **one** analog input at a time, so force stays on AI13 and the vendored
-  StreamDIO firmware (`firmware/`) digitizes cap-touch pin 25 locally into channel-14 high/low
-  events. Flash it if the detector LED changes but no lick events appear.
+- The lick detector runs on the module (`analog_threshold`): an excursion of `on_delta` above a
+  baseline it tracks while idle, released at `off_delta`, rising only. Switching `cap_pwr`
+  releases it and discards 100 ms of samples. Both analog channels sample at 10 bits, averaging 4,
+  so thresholds and the force calibration keep their fixed-layout-firmware counts.
 - The Sanworks `pybpod_rotaryencoder_module` is intentionally **not** used — the wheel is read via
   StreamDIO DI01/DI03.
 - Defaults: baudrate `1312500`, wheel radius `31.5 mm`, `1024` ticks/rev, gain `4.0 deg/mm`,
@@ -278,13 +288,21 @@ cd C:\path\to\evil_rig
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.lock
-python -m pip install --no-deps "MM-PybBod2 @ git+https://github.com/andrestrocyte/MM_PyBpod2.git@a176c0e38520a4f29554198ae30711a08546d75d"
 python -m pip install -e . --no-deps
 ```
 
-The MM commit above contains neutral, port-free settings and only its StreamDIO dependency is used;
-rig ports still come from `configs/*.yaml`. Deploy from this checkout with an editable install: the
-checkout remains the source of the rig profiles, firmware, and operator documentation.
+(`scripts\install_rig.ps1` does the same and adds a desktop shortcut.) The lock installs the
+StreamDIO host driver, `streamdio`, from the `development` branch of its repository until its
+first release; each session's runtime provenance records the exact commit. To try another
+version, pass `-StreamDio "-e C:\path\to\StreamDIO\software"` (or a git URL) to the install
+script. Deploy from this checkout with an editable install: the checkout remains the source of
+the rig profiles and operator documentation.
+
+**StreamDIO firmware.** `scripts\flash_streamdio_firmware.ps1` builds StreamDIO's firmware with
+PlatformIO from the commit the installed `streamdio` came from (or `-Ref <branch|tag|commit>`)
+and flashes it onto the StreamDIO alone, leaving the Bpod's Teensy untouched. A module still on
+the fixed-layout firmware does not announce itself: pass its Teensy `Serial` port, e.g.
+`-Port COM7`.
 
 **Optional extras**
 
@@ -295,8 +313,7 @@ pip install -e ".[sound]"   # pybpod soundcard module
 pip install -e ".[dev]"     # pytest, mypy, ruff, types-PyYAML
 ```
 
-**Live-hardware drivers** (`pybpod_streamDIO_module` from `MM_PyBpod2`, the Spinnaker SDK / `PySpin`,
-and the sound module) are imported lazily — they are only needed when connecting to a real rig, not
+**Live-hardware drivers** (the Spinnaker SDK / `PySpin` and the sound module) are imported lazily — they are only needed when connecting to a real rig, not
 for tests or simulation.
 
 ### Headless Spinnaker recording
@@ -421,7 +438,7 @@ hardware opens. Four profiles ship in `configs/`:
 | `display` | stimulus | `distance_mm` 100, `pixel_size_mm` 0.114, `choice_distance_deg` 35, `choice_center_threshold_deg` 1.0, `rotated_choice_axis` true, `display_index` 1, `fps` 60, `feedback_hold_s` 0.6, colors |
 | `frame2ttl` | screen sync | `enabled`, `input_channel` 5, `input_pin` 6, `patch_size_px` 64, `patch_corner` bottom_right, barcode frame counts, `choice_flash_enabled` |
 | `licks` | cap-touch | `channels` [14], `power_output_channel` 13, `power_required`, `cap_touch_min_high_threshold`, `cap_touch_delta_high`, `cap_touch_delta_low` |
-| `speaker` | white noise | `sample_interval_us` 100, `frequency_hz` 6000, `volume` 1.0, `gate_active_high`, `required` |
+| `speaker` | white noise | `frequency_hz` 6000, `volume` 1.0, `gate_active_high`, `required` |
 | `engagement` | auto-stop | `idle_timeout_s` 60, `max_consecutive_failures` 10 |
 | `camera` | Spinnaker | `frequency_hz` 30, `exposure_us` 10000, `record_video`, `required`, `backend`, `serial_number`, `pixel_format`, ROI fields, `save_dir` |
 | `video` | cold export | `export_spinnaker_summary`, `duplicate_preview_video`, `preview_video_codec` FFV1 |
@@ -492,7 +509,7 @@ Capacitive power is switched off for optical sessions. No StreamDIO firmware cha
 For unchanged wiring and a StreamDIO timestamp, select `streamdio` under **Optical timestamp
 clock** in session setup, or pass `--lick-source optical --lick-clock streamdio --lick-port 1`.
 Bpod records the physical edge; Python forwards one `['I', 'P', port, state]` marker through
-Bpod's existing module UART connection. StreamDIO firmware 5 already timestamps these
+Bpod's existing module UART connection. StreamDIO timestamps these
 markers as raw `port_input` events. The GUI and trial lick counts use the paired receipt.
 Only one marker is outstanding, and missing/mismatched receipts stop acquisition rather
 than silently substituting a timestamp from another clock. Reward, force and state timers
@@ -537,7 +554,7 @@ self-test) do not start Bpod trials.
 |---------|--------|
 | `--preflight [--preflight-duration N]` | Connect Bpod/StreamDIO/Spinnaker streams, hold N s, clean up. Turn the wheel and touch the lick sensor; `preflight_end` reports wheel/lick edges |
 | `--hardware-self-test` | **Activates real outputs.** Runs 3 production-FSM trials with synthetic choices; asserts force/pump events, choice→pump timing, pump error < 10 ms, force ADC + camera TTLs, timeout gate, frame saves, no loop stalls |
-| `--cap-touch-diagnostic [--cap-touch-duration N]` | StreamDIO-only: powers ch13/pin15, polls digitizer on ch14/pin25, reports ADC/baseline/threshold + hi/lo lick edges |
+| `--cap-touch-diagnostic [--cap-touch-duration N]` | StreamDIO-only: powers ch13/pin15, polls the lick detector on ch14/pin25, reports ADC/baseline/threshold + hi/lo lick edges |
 | `--frame2ttl-diagnostic [--frame2ttl-flips N]` | Flashes the sync square, counts DI05 edges |
 | `--frame2ttl-barcode-diagnostic` | Displays representative count barcodes, reports decode/match accuracy |
 | `--bpod-opcode-diagnostic` | Sends Bpod state-marker opcodes, reports `bpod_state` timestamps reaching StreamDIO |
@@ -552,10 +569,13 @@ python -m hf_dm.cli --config configs/dm_50.yaml --frame2ttl-barcode-diagnostic
 python -m hf_dm.cli --config configs/dm_50.yaml --bpod-opcode-diagnostic
 ```
 
-Cap-touch thresholds (firmware v4) can be tuned from YAML (`licks.cap_touch_*`) or per run
-(`--cap-touch-min-high-threshold`, `--cap-touch-delta-high`, `--cap-touch-delta-low`). Use
-`--cap-touch-raw-analog` to temporarily stream pin 25 as the single analog input for a bringup-style
-readout.
+Cap-touch thresholds go into the channel map from YAML (`licks.cap_touch_min_high_threshold`,
+`_delta_high`, `_delta_low`: the detector's `min_on_level`, `on_delta`, `off_delta`) or per run
+(`--cap-touch-min-high-threshold`, `--cap-touch-delta-high`, `--cap-touch-delta-low`); config
+validation refuses values the module would. Use `--cap-touch-raw-analog` to stream the detector's
+raw samples as well (analog ch14). **Retune after moving from the fixed-layout firmware:** its
+integer baseline sat 10–15 counts below the signal, StreamDIO's settles on its mean, so the same
+deltas are that much less sensitive.
 
 ### Animal-use release gate
 
@@ -697,8 +717,9 @@ triggers).
   count/timestamps, camera-TTL interval QC, Frame2TTL barcode/edge summary, choice-loop frame stats.
 - **Exact Bpod rows** for every trial (JSON + NPZ `bpod_trials_json`).
 - **Raw `streamdio_events`** (NPZ): every wheel/direction edge, force sample, camera TTL, lick,
-  timing heartbeat, module timestamp, and high-resolution host timestamp. Firmware v5 emits the
-  heartbeat every 100,000 us; the PC timestamps that same callback immediately.
+  timing heartbeat, module timestamp, and high-resolution host timestamp. StreamDIO emits its
+  delivery heartbeat (diagnostic 1012) every 100,000 us on its own clock; the PC timestamps that
+  same callback immediately.
 - **Semantic events:** `session_start`, `trial_start`, `stimulus_on`, `force_on`, `choice_detected`,
   `feedback_on`, `frame2ttl_*`, `pump_start`, `pump_end`, `output_actual`, `lick`, `white_noise_*`,
   cleanup, `trial_end`, `session_end`.
@@ -923,7 +944,7 @@ src/hf_dm/
 │   ├── builders.py         # production host-supervised decision FSM
 │   ├── reference/          # validation-only reference FSM templates
 │   ├── runtime.py, relay.py, softcodes.py
-├── streamdio/              # client, wheel, outputs
+├── streamdio/              # channel map, client, wheel, outputs
 ├── display/pygame_display.py
 ├── frame2ttl.py            # barcode encode/decode
 ├── camera/                 # Spinnaker recorder + ROI GUI
@@ -933,7 +954,7 @@ src/hf_dm/
 ├── session_qc.py, valve_calibration.py, subject_log.py, validation.py, durable_io.py
 └── hardware/               # bringup_constants, discovery
 configs/                    # centering_50, dm_50, dm_100, dm_200
-firmware/                   # vendored StreamDIO firmware + ArCOM
+scripts/                    # install_rig.ps1, flash_streamdio_firmware.ps1
 docs/                       # training & bpod-core curricula
 tests/                      # hardware-free pytest suite
 ```
@@ -946,8 +967,9 @@ tests/                      # hardware-free pytest suite
 |---------|-----|
 | `hf-dm-run` not found (Windows) | Use `python -m hf_dm.cli ...` |
 | bpod-core settings lock held | This task uses `data/runtime/bpod-core`; override with `HF_DM_BPOD_CORE_CONFIG_DIR`. Close the older `hf_dm.cli` process and rerun preflight |
-| StreamDIO `Access is denied` (COM7/COM8) | Another process owns the port — close notebooks/serial monitors/task processes; unplug/replug StreamDIO |
-| Detector LED changes but no licks | Flash the vendored `firmware/`; check cap-touch wiring/power, then thresholds |
+| StreamDIO not found | Firmware older than StreamDIO 1 does not announce itself: run `scripts\flash_streamdio_firmware.ps1 -Port <its Serial COM port>` |
+| StreamDIO `Access is denied` | Another process owns the port — close notebooks/serial monitors/task processes; unplug/replug StreamDIO |
+| Detector LED changes but no licks | Run `--cap-touch-diagnostic --cap-touch-raw-analog`; check cap-touch wiring/power, then thresholds |
 | Camera preview falls seconds behind | Both Mono8 backends now write raw PGM directly and preview from memory before saving, bypassing the slow SDK image encoder. The Video age indicator includes acquisition-to-GUI transit. See [rig bringup notes](docs/RIG_BRINGUP_2026_10.md) for measured results |
 | Frame2TTL sees no transitions | Run `--frame2ttl-diagnostic`; confirm the photodiode is over the lower-right patch |
 | No `bpod_state` markers | Run `--bpod-opcode-diagnostic` to verify state markers reach StreamDIO |

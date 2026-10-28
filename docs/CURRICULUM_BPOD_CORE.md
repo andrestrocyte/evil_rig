@@ -43,14 +43,16 @@ Exercise: Run the FSM template tests and inspect the generated graph, but rememb
 
 | File | Learn |
 |------|-------|
-| `hf_dm/hardware/bringup_constants.py` | Single source of pin truth |
-| `hf_dm/hardware/discovery.py` | AUTO COM discovery and firmware event allocation from bringups |
+| `hf_dm/hardware/bringup_constants.py` | Single source of pin truth: evil_rig's channel numbers |
+| `hf_dm/streamdio/channel_map.py` | The StreamDIO channel map, and how its channels map to those numbers |
+| `hf_dm/hardware/discovery.py` | AUTO Bpod port discovery and bpod-core setup |
 
-Exercise: Run the MM bringup notebooks and confirm constants match printed channel numbers.
+Exercise: run `streamdio-config show` and match the running map against the pin table in the README.
 
-The bringup step installs the same complete module/USB event allocation in firmware and bpod-core.
-This is required for host SoftCodes to trigger transitions and for completed Bpod state rows to
-decode without an event-index shift.
+bpod-core (0.1.0a15 and later) installs the module/USB serial event allocation on the state machine
+whenever it reads the modules (`Bpod()`, `update_modules()`). This is required for host SoftCodes
+to trigger transitions and for completed Bpod state rows to decode without an event-index shift.
+The session re-reads the modules after applying the StreamDIO map, whose event count it changes.
 
 ### Day 2: StreamDIO adapter
 

@@ -159,13 +159,15 @@ and accumulated relative clock drift; it does not replace independent Bpod/displ
 `bpod-core` is the correct low-level dependency: it is a lean, typed Bpod FSM interface whose own
 project page lists configuration, calibration, data management, GUI, and module support as non-goals.
 It remains an alpha and currently warns against production use. This repository supplies the missing
-task/rig layers while keeping critical timing on Bpod. The pin remains at 0.1.0a12 because 0.1.0a13
-changes remote-Bpod parity, serial struct helpers, and documentation rather than relevant local-rig
-safety or task behavior.
+task/rig layers while keeping critical timing on Bpod. The pin is 0.1.0a15, the first release
+that installs the serial event allocation on the state machine itself (earlier releases needed
+`hf_dm` to send it).
 
-MM_PyBpod2 is a broader PyBpod/Bpod2 adaptation and supplies the vendor StreamDIO driver. Its README
-reports Windows/Python 3.10 as the tested environment. `hf_dm` is narrower but adds an exact Python
-3.12 lock, task-specific recovery/QC, output-ownership checks, and a certificate-bound animal gate.
+StreamDIO's own host package, `streamdio`, drives the module: channel maps, the event stream,
+recording and the delivery heartbeat. `hf_dm` adds an exact Python 3.12 lock, task-specific
+recovery/QC, output-ownership checks, and a certificate-bound animal gate. Moving from the
+fixed-layout firmware to StreamDIO 1 changes the module's identity (firmware version, build ID,
+channel map), so rigs certified before need certifying again.
 
 IBLRIG remains the stronger reference for ecosystem maturity: multi-rig deployment, Alyx/ONE,
 standard experiment descriptions, distributed transfer, hardware validators, calibration, QC, and
@@ -174,7 +176,7 @@ breadth. For this force/wheel/StreamDIO experiment, its WAL, cleanup interlock, 
 checks, and independent-failsafe evidence gate are unusually stringent.
 
 References: [bpod-core](https://pypi.org/project/bpod-core/),
-[MM_PyBpod2](https://github.com/MathiasMahn/MM_PyBpod2), and
+[StreamDIO](https://github.com/MathiasMahn/StreamDIO), and
 [IBLRIG](https://int-brain-lab.github.io/iblrig/).
 
 Recommendation: stop changing task logic unless a real measurement or pilot exposes a defect.
